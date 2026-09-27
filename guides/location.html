@@ -1,0 +1,1378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Location &amp; Maps · React Native Interview Handbook</title>
+<meta name="description" content="How devices actually compute a position, the iOS and Android permission models, choosing libraries, foreground and background tracking, geofencing, maps, live-tracking…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Location &amp; Maps · React Native Interview Handbook">
+<meta property="og:description" content="How devices actually compute a position, the iOS and Android permission models, choosing libraries, foreground and background tracking, geofencing, maps, live-tracking…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/location.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Location & Maps
+
+How devices actually compute a position, the iOS and Android permission models, choosing libraries, foreground and background tracking, geofencing, maps, live-tracking architecture, store policy and testing. It is written both as interview preparation and as a reference you can implement from.
+
+## How it works
+
+A "location" is an **estimate** produced by the operating system by fusing several signals. Your app never talks to the GNSS chip directly: it tells the OS location service what accuracy and update cadence it wants, and the OS decides which radios to power and how to combine them. Almost every location bug (jumping markers, drained batteries, slow first fixes, "it stops in the background") comes from misunderstanding that contract.
+
+| Source | Typical accuracy | Time to first fix | Power cost | Indoors | Notes |
+|---|---|---|---|---|---|
+| GNSS (GPS, Galileo, GLONASS, BeiDou) | 3–10 m outdoors (better with dual-frequency chips) | 1–5 s warm, 30 s+ cold | High | Poor | Needs sky view. A-GNSS downloads orbit data over the network to cut first-fix time |
+| Wi-Fi positioning | 15–50 m | Under 1–2 s | Low–medium | Good | Matches visible access points against Google's / Apple's crowd-sourced databases |
+| Cell towers | 100 m to several km | Near instant | Very low | Good | City or neighbourhood level only |
+| Motion sensors (accelerometer, gyroscope, barometer) | Relative only | Instant | Very low | Good | Activity recognition (still / walking / driving), dead reckoning between fixes, floor hints |
+| Bluetooth beacons | 1–5 m inside venues | Fast | Low | Good | iBeacon / Eddystone, separate APIs from GPS location |
+
+**Android** has two stacks:
+
+- **Fused Location Provider (FLP)** in Google Play services (`com.google.android.gms:play-services-location`). It fuses GNSS, Wi-Fi, cell and sensors and exposes priorities (`PRIORITY_HIGH_ACCURACY`, `PRIORITY_BALANCED_POWER_ACCURACY`, `PRIORITY_LOW_POWER`, `PRIORITY_PASSIVE`), batching, geofencing and activity recognition. Use it wherever Play services exist.
+- **Platform `LocationManager`** (`GPS_PROVIDER`, `NETWORK_PROVIDER`, and `FUSED_PROVIDER` on API 31+). This is the fallback for devices without Google Play services (Huawei devices on HMS, some AOSP builds, many devices sold in China). Good libraries fall back to it automatically.
+
+**iOS** has **Core Location** (`CLLocationManager`), which fuses sources internally. You only express intent: `desiredAccuracy` (`kCLLocationAccuracyBestForNavigation`, `…Best`, `…NearestTenMeters`, `…HundredMeters`, `…Kilometer`, `…ThreeKilometers`, `kCLLocationAccuracyReduced`), `distanceFilter`, `activityType`, and *which service* you start: standard updates, significant-change monitoring, region monitoring, or visit monitoring. iOS 17 added Swift-concurrency APIs (`CLLocationUpdate.liveUpdates()`, `CLMonitor`, `CLBackgroundActivitySession`); React Native libraries are adopting them gradually.
+
+```mermaid
+flowchart TD
+    subgraph sources["Signal sources"]
+        GNSS["GNSS satellites"]
+        WIFI["Wi-Fi access points"]
+        CELL["Cell towers"]
+        SENS["Motion sensors"]
+    end
+    subgraph osLayer["OS location service"]
+        FLP["Android: Fused Location Provider<br/>(Google Play services)"]
+        LM["Android: LocationManager<br/>(no Play services fallback)"]
+        CL["iOS: Core Location<br/>(CLLocationManager)"]
+    end
+    subgraph rnLayer["React Native layer"]
+        LIB["Native module<br/>(expo-location, geolocation lib)"]
+        JSAPI["JS API<br/>getCurrentPosition / watchPosition"]
+    end
+    APP["App logic<br/>hooks, store, map, uploader"]
+    sources --> FLP
+    sources --> LM
+    sources --> CL
+    FLP --> LIB
+    LM --> LIB
+    CL --> LIB
+    LIB -->|"events via JSI / TurboModule"| JSAPI
+    JSAPI --> APP
+```
+*Figure: Signals are fused by the OS provider; the RN library only relays requests and events.*
+
+### Accuracy versus battery
+
+You buy accuracy with battery. The levers are the same on both platforms: **requested accuracy**, **time interval**, **distance filter**, **batching** (deferring delivery so the radio and CPU wake less often) and, most importantly, **stopping updates when you don't need them**.
+
+| Use case | expo-location `Accuracy` | Android FLP priority | iOS `desiredAccuracy` | Battery impact |
+|---|---|---|---|---|
+| Weather, content localisation | `Lowest` / `Low` | `PRIORITY_LOW_POWER` | `kCLLocationAccuracyKilometer` / `…ThreeKilometers` | Minimal |
+| Store locator, "near me" lists | `Balanced` | `PRIORITY_BALANCED_POWER_ACCURACY` | `kCLLocationAccuracyHundredMeters` | Low |
+| Check-in, delivery drop-off proof | `High` | `PRIORITY_HIGH_ACCURACY` | `kCLLocationAccuracyNearestTenMeters` / `…Best` | Medium |
+| Turn-by-turn, run or ride tracking | `BestForNavigation` | `PRIORITY_HIGH_ACCURACY` + short interval | `kCLLocationAccuracyBestForNavigation` | High |
+
+Read the location object critically:
+
+- `coords.accuracy` is a **radius in metres** (roughly a 68% confidence circle), not a precision guarantee. A 1,500 m accuracy means "somewhere in this neighbourhood".
+- `timestamp` matters: "last known" and `maximumAge` fixes can be minutes old.
+- `speed` and `heading` are only meaningful while moving and can be `-1` or `null`. For a stationary compass direction use the magnetometer (`Location.watchHeadingAsync` in expo-location).
+- Altitude reference differs: iOS `altitude` is above mean sea level, Android `getAltitude()` is above the WGS84 ellipsoid (Android 14 added `getMslAltitudeMeters()`).
+- Order conventions differ: RN maps use `{ latitude, longitude }`, but GeoJSON, Redis GEO and `adb emu geo fix` use **longitude first**. Mixing them up is a classic bug.
+
+> [!INTERVIEW]
+> "Why does the user's marker jump around?" A senior answer explains that the OS switches sources (GNSS outdoors, Wi-Fi indoors), that `accuracy` is a radius, and proposes filtering: drop fixes whose accuracy is worse than a threshold, reject implausible speeds between consecutive points, and smooth with a simple Kalman or moving-average filter before rendering.
+
+## Requirements & prerequisites
+
+| Item | iOS | Android | Notes |
+|---|---|---|---|
+| Purpose strings | `NSLocationWhenInUseUsageDescription`, `NSLocationAlwaysAndWhenInUseUsageDescription`, optionally `NSLocationTemporaryUsageDescriptionDictionary` | Not applicable (runtime dialogs are system text) | Missing iOS keys crash or silently fail the request |
+| Runtime permission | When In Use / Always, precise or approximate | `ACCESS_COARSE_LOCATION` + `ACCESS_FINE_LOCATION`, then `ACCESS_BACKGROUND_LOCATION` separately if needed | See [Permissions](permissions.html) for the general request pattern |
+| Continuous background tracking | `UIBackgroundModes` → `location` | Foreground service with `foregroundServiceType="location"` + `FOREGROUND_SERVICE_LOCATION` (API 34+) | Both show a visible indicator to the user |
+| Google Play services | Not applicable | Required for FLP, geofencing, activity recognition | Plan a fallback for devices without it |
+| Map provider keys | Apple Maps needs no key. Google Maps on iOS needs an iOS-restricted key | Google Maps SDK for Android key (package + SHA-1 restricted) | Google requires a billing account on the Cloud project |
+| Server-side APIs | Geocoding, Places, Routes keys live on your backend only | Same | Never ship server keys in the app |
+| Store declarations | Background mode justification in review notes, privacy labels | Location permissions declaration with a demo video, foreground service declaration, Data safety form | Required before release, not just before launch |
+| Devices | Simulator is fine for foreground location; background behaviour needs a real device | Emulator is fine for basics; OEM battery killers need real Samsung / Xiaomi / etc. devices | |
+| Commercial license | Only if using Transistorsoft background geolocation | Transistorsoft requires a license for Android release builds | Check current terms |
+
+## Permission model
+
+The general permission-request pattern (check, explain, request, handle "blocked") is covered in [Permissions](permissions.html). Location has the most complex model of any permission, so it deserves its own treatment.
+
+### iOS
+
+| Authorization | What the app gets | How it is obtained |
+|---|---|---|
+| Not determined | Nothing yet | Initial state |
+| When In Use | Location while the app is in the foreground. A session started in the foreground may continue in the background if you have the `location` background mode and set `allowsBackgroundLocationUpdates`; iOS shows a blue status-bar / Dynamic Island indicator | `requestWhenInUseAuthorization()` |
+| Allow Once | Temporary When In Use for the current session; resets to Not determined afterwards | User picks it in the When In Use prompt |
+| Always | Location in the background, region monitoring, significant-change service, visit monitoring, relaunch into background on events | `requestAlwaysAuthorization()` via the upgrade flow below |
+| Denied / Restricted | Nothing; only the user (or MDM / parental controls) can change it in Settings | User choice or device policy |
+| Precise vs approximate (iOS 14+) | `accuracyAuthorization` is `.fullAccuracy` or `.reducedAccuracy`. Reduced gives a position accurate to a few kilometres, delivered less often, and **region monitoring does not work** | Toggle in the prompt and in Settings. `NSLocationDefaultAccuracyReduced` in Info.plist makes approximate the default |
+| Temporary full accuracy | Precise location for the current session while the user stays on reduced accuracy | `requestTemporaryFullAccuracyAuthorization(withPurposeKey:)` with a purpose string from `NSLocationTemporaryUsageDescriptionDictionary` |
+
+**The Always upgrade flow (iOS 13+).** Apple deliberately makes Always a two-step decision:
+
+1. The first prompt only ever offers *Allow Once*, *Allow While Using App* and *Don't Allow*, even if you called `requestAlwaysAuthorization()`.
+2. If you requested Always and the user picked While Using, iOS grants a provisional form of Always and later, when a background location event would be delivered, asks the user whether to keep While Using or *Change to Always Allow*. Treat the app as When In Use until you observe Always.
+3. If you requested When In Use first, you can call `requestAlwaysAuthorization()` later at a moment of clear value ("Get notified when you arrive at the store"). The system shows the upgrade prompt **once**. If the user declines, the only path is Settings.
+4. iOS periodically reminds users that an app has used their location in the background, with a map of the points. Expect some users to downgrade, and handle it.
+
+```mermaid
+stateDiagram-v2
+    state "Not determined" as NotDetermined
+    state "When In Use" as WhenInUse
+    state "Allow Once (this session)" as Once
+    state "Always" as Always
+    state "Denied (Settings only)" as Denied
+    [*] --> NotDetermined
+    NotDetermined --> WhenInUse : user allows while using
+    NotDetermined --> Once : user allows once
+    NotDetermined --> Denied : user denies
+    Once --> NotDetermined : session ends
+    WhenInUse --> Always : upgrade prompt accepted
+    WhenInUse --> WhenInUse : upgrade declined, no second prompt
+    Always --> WhenInUse : downgraded in Settings or after reminder
+    WhenInUse --> Denied : revoked in Settings
+    Denied --> WhenInUse : re-enabled in Settings
+```
+*Figure: iOS location authorization states. Accuracy (precise or approximate) is an independent toggle on top of these.*
+
+### Android
+
+| Permission | Kind | Since | What it grants | How to request |
+|---|---|---|---|---|
+| `ACCESS_COARSE_LOCATION` | Runtime | API 23 | Approximate location (about 3 km) | Always request it, together with FINE |
+| `ACCESS_FINE_LOCATION` | Runtime | API 23 | Precise location | Request **together with COARSE**: on Android 12+ the user may grant only approximate, and a FINE-only request from an app targeting API 31+ is ignored |
+| `ACCESS_BACKGROUND_LOCATION` | Runtime | API 29 | Access while the app has no visible UI and no location foreground service started from the foreground | Separately, after foreground is granted. On Android 11+ the system sends the user to Settings to pick *Allow all the time* |
+| `FOREGROUND_SERVICE` | Normal | API 28 | Start any foreground service | Manifest only |
+| `FOREGROUND_SERVICE_LOCATION` | Normal | API 34 | Start a foreground service of type `location` | Manifest, plus `android:foregroundServiceType="location"` on the service; you must already hold a location runtime permission when calling `startForeground()` |
+| `POST_NOTIFICATIONS` | Runtime | API 33 | Show the service's notification in the drawer | Without it the service still runs but its notification is hidden from the shade (it still appears in the Task Manager) |
+
+| Android version | Location-relevant change |
+|---|---|
+| 8 (API 26) | Background location limits: apps without a foreground service receive updates only a few times per hour |
+| 10 (API 29) | `ACCESS_BACKGROUND_LOCATION` introduced. Foreground services need `foregroundServiceType="location"` to access location |
+| 11 (API 30) | Background must be requested separately (combined requests are ignored). One-time "Only this time" grants. Auto-reset of permissions for unused apps |
+| 12 (API 31) | Approximate location choice in the dialog. Starting foreground services from the background is restricted (with a few exemptions) |
+| 14 (API 34) | Foreground service types mandatory, with matching `FOREGROUND_SERVICE_*` permissions, and Play Console declarations |
+| 15–16 (API 35–36) | Further foreground service and background-start restrictions; read the behaviour-change pages for your `targetSdkVersion` |
+
+```ts title="src/location/androidPermissions.ts"
+import { PermissionsAndroid, Platform } from 'react-native';
+
+export type AndroidLocationGrant = 'precise' | 'approximate' | 'denied' | 'blocked';
+
+export async function requestAndroidForegroundLocation(): Promise<AndroidLocationGrant> {
+  if (Platform.OS !== 'android') throw new Error('Android only');
+
+  const result = await PermissionsAndroid.requestMultiple([
+    PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+    PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
+  ]);
+
+  const fine = result[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
+  const coarse = result[PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION];
+
+  if (fine === PermissionsAndroid.RESULTS.GRANTED) return 'precise';
+  if (coarse === PermissionsAndroid.RESULTS.GRANTED) return 'approximate';
+  if (coarse === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN) return 'blocked';
+  return 'denied';
+}
+
+/**
+ * Call only after foreground location is granted, and only after an in-app
+ * explanation screen (Google Play requires a prominent disclosure).
+ * On Android 11+ this navigates the user to the app's location settings page.
+ */
+export async function requestAndroidBackgroundLocation(): Promise<boolean> {
+  if (Platform.OS !== 'android' || Platform.Version < 29) return true;
+  const status = await PermissionsAndroid.request(
+    PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION,
+  );
+  return status === PermissionsAndroid.RESULTS.GRANTED;
+}
+```
+
+> [!IMPORTANT]
+> On **both** platforms, a user-initiated tracking session (start a run, start a delivery shift) that begins while the app is visible can keep receiving location in the background with only "while using" permission: iOS via the `location` background mode plus the blue indicator, Android via a `location`-type foreground service started from the foreground. You need **Always** or `ACCESS_BACKGROUND_LOCATION` only to *start* location access from the background: geofences, significant-change monitoring, automatic trip detection. Asking for it unnecessarily costs conversion and triggers the Play background location review.
+
+## Choosing a library / approach
+
+### Location libraries
+
+| Library | Scope | Background tracking | Geofencing | Expo / bare | Maintenance & license | Choose it when |
+|---|---|---|---|---|---|---|
+| `@react-native-community/geolocation` | W3C-style `getCurrentPosition` / `watchPosition`; Play services or platform provider on Android | Limited: iOS background updates via config, no Android foreground service | No | Bare; usable after prebuild with manual plist / manifest edits | Community maintained, MIT | Minimal foreground needs in a bare app that doesn't want Expo modules |
+| `react-native-geolocation-service` | FLP-based replacement for the old RN core geolocation | No built-in foreground service | No | Bare | Releases have been infrequent since around 2022, so verify activity and New Architecture status before adopting | Legacy projects already using it |
+| `expo-location` | Permissions, current / last known / watch position, heading, background updates via TaskManager, geofencing, geocoding | Yes (TaskManager, Android foreground service built in) | Yes, within OS limits | Expo and bare (after `npx install-expo-modules`); config plugin | Maintained by Expo, MIT | **Default choice** for most apps |
+| `react-native-background-geolocation` (Transistorsoft) | Motion-aware tracking engine: activity recognition, stop detection, SQLite persistence, HTTP batching with retries, headless mode, geofences beyond OS limits | Best in class across OEMs | Yes, with proximity-based rotation | Bare and Expo plugin | **Commercial license required for Android release builds** (debug is free); check current terms | Continuous tracking is the product (fleet, delivery, fitness) and reliability matters more than license cost |
+
+### Map libraries
+
+| Library | Renderer | Strengths | Costs / caveats |
+|---|---|---|---|
+| `react-native-maps` | Apple Maps (iOS default), Google Maps (Android default, optional on iOS) | Mature, huge ecosystem, markers / polylines / polygons / overlays, works with Expo | Custom-view markers are expensive; clustering is add-on; Google billing |
+| `@rnmapbox/maps` | Mapbox GL (vector tiles) | Custom styles, offline packs, data-driven layers that render thousands of features natively, 3D terrain | Mapbox usage-based pricing and token setup; larger binary |
+| `expo-maps` | Apple Maps (SwiftUI MapKit) on iOS, Google Maps (Compose) on Android | Modern native APIs, Expo-first | Newer and still maturing; requires a development build. Check its status before committing |
+
+> [!TIP] Recommendation
+> Use **expo-location + react-native-maps** as the default in both Expo and bare apps. Reach for **Transistorsoft** when continuous background tracking is core to the business: the license is cheaper than rebuilding its motion detection, persistence and OEM workarounds. Use **@rnmapbox/maps** when you need offline maps, custom cartography or large data layers. Keep all location access behind one app-level service so you can swap libraries without touching screens.
+
+## Setup — iOS
+
+### Step 1 — Purpose strings and background mode
+
+Add only the keys you actually use. App Review reads these strings, so make them specific.
+
+```xml title="ios/MyApp/Info.plist"
+<key>NSLocationWhenInUseUsageDescription</key>
+<string>We use your location to show nearby stores and estimate delivery times.</string>
+
+<!-- Only if you request Always -->
+<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+<string>Allow Always so we can notify you when you arrive at a pickup point, even if the app is closed.</string>
+
+<!-- Only if you request temporary full accuracy -->
+<key>NSLocationTemporaryUsageDescriptionDictionary</key>
+<dict>
+  <key>DeliveryDropoff</key>
+  <string>Precise location is needed to confirm the exact drop-off point.</string>
+</dict>
+
+<!-- Only if you track location in the background -->
+<key>UIBackgroundModes</key>
+<array>
+  <string>location</string>
+</array>
+```
+
+`NSLocationAlwaysUsageDescription` is only needed for iOS 10 and earlier and can be omitted for modern deployment targets. In Xcode the background mode lives under **Signing & Capabilities → Background Modes → Location updates**, which writes the same `UIBackgroundModes` entry.
+
+### Step 2 — Install the library
+
+```bash
+npx install-expo-modules@latest                      # bare app without Expo modules yet
+npx expo install expo-location expo-task-manager
+
+npm install @react-native-community/geolocation      # or the community module instead
+
+cd ios && pod install
+```
+
+### Step 3 — Precise vs approximate (bare apps)
+
+`react-native-permissions` exposes the iOS 14+ accuracy APIs, which is the simplest way to ask for temporary full accuracy in a bare app:
+
+```ts title="src/location/iosAccuracy.ts"
+import { Platform } from 'react-native';
+import { checkLocationAccuracy, requestLocationAccuracy } from 'react-native-permissions';
+
+/** Ask for precise location for this session only, e.g. at delivery drop-off. */
+export async function ensurePreciseForDropoff(): Promise<boolean> {
+  if (Platform.OS !== 'ios') return true;
+  const accuracy = await checkLocationAccuracy(); // 'full' | 'reduced'
+  if (accuracy === 'full') return true;
+  // purposeKey must exist in NSLocationTemporaryUsageDescriptionDictionary
+  const result = await requestLocationAccuracy({ purposeKey: 'DeliveryDropoff' });
+  return result === 'full';
+}
+```
+
+### Step 4 — Configure the community module (if used)
+
+```ts title="src/location/configureGeolocation.ts"
+import Geolocation from '@react-native-community/geolocation';
+
+Geolocation.setRNConfiguration({
+  skipPermissionRequests: false,     // let the module prompt, or true if you use react-native-permissions
+  authorizationLevel: 'whenInUse',   // 'always' | 'whenInUse' | 'auto'
+  enableBackgroundLocationUpdates: false,
+  locationProvider: 'auto',          // Android: 'playServices' | 'android' | 'auto'
+});
+```
+
+### Step 5 — Privacy declarations
+
+If location leaves the device (analytics, backend, third-party SDKs), declare **Precise Location** and/or **Coarse Location** in the App Store Connect privacy labels and in `PrivacyInfo.xcprivacy` under `NSPrivacyCollectedDataTypes`. Location APIs themselves are not "required reason" APIs, but third-party SDKs that collect location must ship their own privacy manifests.
+
+## Setup — Android
+
+### Step 1 — Manifest permissions and service
+
+```xml title="android/app/src/main/AndroidManifest.xml"
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+  <!-- Only if you start location access from the background (geofences, auto trip detection) -->
+  <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+  <!-- Continuous tracking via a foreground service -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+  <!-- Don't filter out devices without GPS hardware on Play -->
+  <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+
+  <application android:name=".MainApplication">
+    <!-- Google Maps key, injected from Gradle (see step 3) -->
+    <meta-data
+      android:name="com.google.android.geo.API_KEY"
+      android:value="${googleMapsApiKey}" />
+
+    <!-- Only if YOU implement the service; libraries declare their own -->
+    <service
+      android:name=".location.LocationTrackingService"
+      android:exported="false"
+      android:foregroundServiceType="location" />
+  </application>
+</manifest>
+```
+
+Libraries such as expo-location and Transistorsoft declare their own `<service>` elements in their library manifests, which Gradle merges automatically; you only add permissions. Inspect the result in Android Studio's **Merged Manifest** tab, because third-party SDKs sometimes add location permissions you didn't intend to ship (and then must declare on Play). Remove them with `tools:node="remove"`:
+
+```xml title="android/app/src/main/AndroidManifest.xml"
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+  xmlns:tools="http://schemas.android.com/tools">
+  <uses-permission
+    android:name="android.permission.ACCESS_BACKGROUND_LOCATION"
+    tools:node="remove" />
+</manifest>
+```
+
+### Step 2 — Play services dependency (community module)
+
+`@react-native-community/geolocation` uses the platform `LocationManager` unless you add Play services and select the `playServices` provider:
+
+```gradle title="android/app/build.gradle"
+dependencies {
+    // Use the current version from Google's Maven repository
+    implementation "com.google.android.gms:play-services-location:21.3.0"
+}
+```
+
+### Step 3 — Keep map keys out of git
+
+```gradle title="android/app/build.gradle"
+android {
+    defaultConfig {
+        // Value from ~/.gradle/gradle.properties, CI env, or -PGOOGLE_MAPS_API_KEY=...
+        manifestPlaceholders = [
+            googleMapsApiKey: project.findProperty("GOOGLE_MAPS_API_KEY") ?: ""
+        ]
+    }
+}
+```
+
+```properties title="~/.gradle/gradle.properties"
+GOOGLE_MAPS_API_KEY=AIza...your-android-restricted-key
+```
+
+### Step 4 — Request runtime permissions
+
+Use `requestAndroidForegroundLocation()` from the permission section (or `react-native-permissions` / `expo-location`), and request background location only in a separate, explained step.
+
+## Setup — Expo
+
+The `expo-location` config plugin writes the Info.plist keys, background mode and Android permissions for you during `npx expo prebuild` / EAS Build.
+
+```json title="app.json"
+{
+  "expo": {
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "We use your location to show nearby stores and estimate delivery times.",
+          "locationAlwaysAndWhenInUsePermission": "Allow Always so we can notify you when you arrive at a pickup point.",
+          "isIosBackgroundLocationEnabled": true,
+          "isAndroidBackgroundLocationEnabled": false,
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ]
+    ],
+    "ios": {
+      "infoPlist": {
+        "NSLocationTemporaryUsageDescriptionDictionary": {
+          "DeliveryDropoff": "Precise location is needed to confirm the exact drop-off point."
+        }
+      },
+      "config": {
+        "googleMapsApiKey": "AIza...ios-restricted-key"
+      }
+    },
+    "android": {
+      "config": {
+        "googleMaps": { "apiKey": "AIza...android-restricted-key" }
+      },
+      "blockedPermissions": ["android.permission.ACCESS_BACKGROUND_LOCATION"]
+    }
+  }
+}
+```
+
+| Plugin option | Effect |
+|---|---|
+| `locationWhenInUsePermission` / `locationAlwaysAndWhenInUsePermission` | iOS purpose strings |
+| `isIosBackgroundLocationEnabled` | Adds `location` to `UIBackgroundModes` |
+| `isAndroidBackgroundLocationEnabled` | Adds `ACCESS_BACKGROUND_LOCATION` (triggers the Play declaration, so enable only if needed) |
+| `isAndroidForegroundServiceEnabled` | Adds `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_LOCATION` for `startLocationUpdatesAsync` with a foreground service |
+
+> [!TIP]
+> Move keys into `app.config.ts` and read them from EAS environment variables (`process.env.GOOGLE_MAPS_ANDROID_KEY`) so they are not committed. `android.blockedPermissions` strips permissions merged in by any library. Recent `react-native-maps` versions also ship their own config plugin; check its docs for the current recommended key setup.
+
+> [!WARNING]
+> Background location and geofencing need a **development build** (`expo-dev-client`) or a store build. Don't evaluate background behaviour in Expo Go, and always test it on real devices.
+
+## Implementation
+
+The examples use `expo-location` (works in Expo and bare apps). Community-module equivalents are shown where the options differ.
+
+### Permission and services helper
+
+```ts title="src/location/access.ts"
+import * as Location from 'expo-location';
+import { Linking, Platform } from 'react-native';
+
+export type LocationAccess =
+  | { status: 'granted'; precise: boolean | null; background: boolean }
+  | { status: 'denied'; canAskAgain: boolean }
+  | { status: 'services-disabled' };
+
+export async function ensureForegroundLocation(): Promise<LocationAccess> {
+  if (!(await Location.hasServicesEnabledAsync())) return { status: 'services-disabled' };
+
+  let perm = await Location.getForegroundPermissionsAsync();
+  if (!perm.granted && perm.canAskAgain) {
+    perm = await Location.requestForegroundPermissionsAsync();
+  }
+  if (!perm.granted) return { status: 'denied', canAskAgain: perm.canAskAgain };
+
+  const background = (await Location.getBackgroundPermissionsAsync()).granted;
+  // Android reports fine vs coarse. On iOS, use react-native-permissions'
+  // checkLocationAccuracy() or infer from coords.accuracy (null = unknown).
+  const precise = Platform.OS === 'android' ? perm.android?.accuracy === 'fine' : null;
+  return { status: 'granted', precise, background };
+}
+
+/** Location services (the global toggle) are off. */
+export async function promptEnableLocationServices(): Promise<void> {
+  if (Platform.OS === 'android') {
+    try {
+      await Location.enableNetworkProviderAsync(); // Google Play "turn on location" dialog
+      return;
+    } catch {
+      await Linking.sendIntent('android.settings.LOCATION_SOURCE_SETTINGS');
+      return;
+    }
+  }
+  // iOS offers no public deep link to Location Services; open the app's settings page
+  await Linking.openSettings();
+}
+```
+
+### One-shot position: fast path first
+
+A cold GNSS fix can take tens of seconds indoors. Show something useful immediately from a recent cached fix, then refine.
+
+```ts title="src/location/getPosition.ts"
+import * as Location from 'expo-location';
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error('Location timeout')), ms)),
+  ]);
+}
+
+export async function getBestEffortPosition({
+  maxAgeMs = 60_000,
+  requiredAccuracyM = 100,
+  timeoutMs = 10_000,
+}: { maxAgeMs?: number; requiredAccuracyM?: number; timeoutMs?: number } = {}) {
+  const cached = await Location.getLastKnownPositionAsync({
+    maxAge: maxAgeMs,
+    requiredAccuracy: requiredAccuracyM,
+  });
+  if (cached) return cached;
+
+  try {
+    return await withTimeout(
+      Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }),
+      timeoutMs,
+    );
+  } catch {
+    // Indoors, a high-accuracy request may never converge: fall back to Wi-Fi / cell
+    return withTimeout(
+      Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+      timeoutMs,
+    );
+  }
+}
+```
+
+With `@react-native-community/geolocation` the same knobs are explicit options:
+
+```ts
+import Geolocation, { type GeolocationResponse } from '@react-native-community/geolocation';
+
+export function getPosition(): Promise<GeolocationResponse> {
+  return new Promise((resolve, reject) =>
+    Geolocation.getCurrentPosition(resolve, reject, {
+      enableHighAccuracy: true, // prefer GNSS
+      timeout: 10_000,          // max ms to wait for a fix before error code 3 (TIMEOUT)
+      maximumAge: 60_000,       // accept a cached fix up to 60 s old
+    }),
+  );
+}
+// Error codes: 1 PERMISSION_DENIED, 2 POSITION_UNAVAILABLE, 3 TIMEOUT
+```
+
+`watchPosition` takes the same options plus `distanceFilter` (metres the device must move before a new event) and, on Android, `interval` / `fastestInterval`. Always keep the watch id and call `Geolocation.clearWatch(id)` on cleanup.
+
+### A typed `useLocation` hook
+
+Requirements for a production hook: typed status, cleanup of the native subscription, no state updates after unmount, stop watching when the app is backgrounded (background tracking is a separate, explicit feature), and re-check permissions when the app returns to the foreground (the user may have changed them in Settings).
+
+```tsx title="src/location/useLocation.ts"
+import { useCallback, useEffect, useState } from 'react';
+import { AppState, type AppStateStatus } from 'react-native';
+import * as Location from 'expo-location';
+
+export type LocationStatus =
+  | 'idle' | 'requesting' | 'watching' | 'denied' | 'services-disabled' | 'error';
+
+export interface UseLocationOptions {
+  enabled?: boolean;
+  accuracy?: Location.Accuracy;
+  distanceInterval?: number;   // metres
+  timeInterval?: number;       // ms (Android)
+  maxAcceptableAccuracyM?: number;
+}
+
+export interface UseLocationResult {
+  location: Location.LocationObject | null;
+  status: LocationStatus;
+  error: Error | null;
+  retry: () => void;
+}
+
+export function useLocation({
+  enabled = true,
+  accuracy = Location.Accuracy.Balanced,
+  distanceInterval = 25,
+  timeInterval = 10_000,
+  maxAcceptableAccuracyM = 200,
+}: UseLocationOptions = {}): UseLocationResult {
+  const [location, setLocation] = useState<Location.LocationObject | null>(null);
+  const [status, setStatus] = useState<LocationStatus>('idle');
+  const [error, setError] = useState<Error | null>(null);
+  const [appState, setAppState] = useState<AppStateStatus>(AppState.currentState);
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', setAppState);
+    return () => sub.remove();
+  }, []);
+
+  // 'inactive' (iOS transitions, Control Center) should not restart the watch
+  const isForeground = appState !== 'background';
+
+  useEffect(() => {
+    if (!enabled || !isForeground) return;
+
+    let cancelled = false;
+    let subscription: Location.LocationSubscription | undefined;
+
+    (async () => {
+      try {
+        setStatus('requesting');
+        setError(null);
+        if (!(await Location.hasServicesEnabledAsync())) {
+          if (!cancelled) setStatus('services-disabled');
+          return;
+        }
+        // Resolves immediately if already granted or permanently denied
+        const perm = await Location.requestForegroundPermissionsAsync();
+        if (cancelled) return;
+        if (!perm.granted) {
+          setStatus('denied');
+          return;
+        }
+
+        const last = await Location.getLastKnownPositionAsync({ maxAge: 60_000 });
+        if (!cancelled && last) setLocation(last);
+
+        const sub = await Location.watchPositionAsync(
+          { accuracy, distanceInterval, timeInterval },
+          (next) => {
+            const acc = next.coords.accuracy;
+            if (acc != null && acc > maxAcceptableAccuracyM) return; // drop junk fixes
+            setLocation(next);
+          },
+        );
+        if (cancelled) {
+          sub.remove(); // unmounted while awaiting
+          return;
+        }
+        subscription = sub;
+        setStatus('watching');
+      } catch (e) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e : new Error(String(e)));
+          setStatus('error');
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      subscription?.remove();
+    };
+  }, [enabled, isForeground, accuracy, distanceInterval, timeInterval, maxAcceptableAccuracyM, attempt]);
+
+  const retry = useCallback(() => setAttempt((n) => n + 1), []);
+  return { location, status, error, retry };
+}
+```
+
+```tsx title="src/screens/NearbyScreen.tsx"
+import { Button, Linking, Text, View } from 'react-native';
+import { useLocation } from '../location/useLocation';
+import { promptEnableLocationServices } from '../location/access';
+
+export function NearbyScreen() {
+  const { location, status, retry } = useLocation({ distanceInterval: 50 });
+
+  if (status === 'services-disabled') {
+    return <Button title="Turn on location" onPress={() => promptEnableLocationServices().then(retry)} />;
+  }
+  if (status === 'denied') {
+    return (
+      <View>
+        <Text>Location is off for this app. You can still search by city.</Text>
+        <Button title="Open Settings" onPress={() => Linking.openSettings()} />
+      </View>
+    );
+  }
+  return <Text>{location ? `${location.coords.latitude}, ${location.coords.longitude}` : 'Locating...'}</Text>;
+}
+```
+
+> [!TIP]
+> Mount **one** location subscription per app (in a provider or a store such as Zustand) and let screens select from it. Several screens each calling `watchPositionAsync` multiply battery use and produce inconsistent positions.
+
+### Permission changes while the app is running
+
+| Change made in Settings | iOS | Android |
+|---|---|---|
+| Location revoked | App keeps running; `CLLocationManager` delegate is told, updates stop | **The process is killed** (any runtime permission revocation kills the app) |
+| Precise to approximate | App keeps running; subsequent fixes are coarse and region monitoring stops | Process killed; on relaunch you only hold COARSE |
+| Always / "Allow all the time" to While Using | Background delivery stops | Process killed; background access gone on relaunch |
+| One-time grant expires | "Allow Once" resets to Not determined next session | "Only this time" is revoked soon after the app leaves the foreground, unless a foreground service started while visible is running |
+| Unused app | Not applicable | Android 11+ auto-resets permissions of apps unused for months |
+
+The practical consequence: on Android re-check on every cold start; on iOS re-check on every return to `active` (the hook above does both), and treat an update stream that stops or degrades as a signal to re-read permission state.
+
+## Background location
+
+Background location is where most production incidents, battery complaints and store rejections come from. Decide first which of these you need:
+
+| Need | Permission | Mechanism |
+|---|---|---|
+| User-started session (shift, run, trip) that continues when the screen locks | While using | iOS `location` background mode + indicator; Android `location` foreground service started from the foreground |
+| Passive triggers while the app is not running (arrive at store, auto trip detection) | iOS Always, Android `ACCESS_BACKGROUND_LOCATION` | Region monitoring / significant-change / geofences |
+| Occasional coarse position (e.g. daily weather refresh) | Usually none extra | Last known location in a background fetch task (see [Background Tasks](background-tasks.html)) |
+
+### iOS specifics
+
+- Standard updates in the background require `UIBackgroundModes` → `location` **and** `allowsBackgroundLocationUpdates = true` (libraries set this for you). With When In Use authorization, iOS shows the blue indicator; `showsBackgroundLocationIndicator` makes it visible for Always too.
+- `pausesLocationUpdatesAutomatically` defaults to `true`: iOS pauses updates when it thinks the user is stationary, and paused updates do **not** resume until the app is foregrounded. Either set it to `false` (battery cost) or pair it with region monitoring around the stop point to wake up again, which is what Transistorsoft does. Set `activityType` (`fitness`, `automotiveNavigation`, `otherNavigation`) so the pause heuristics match your use case.
+- If the user swipes the app away, standard updates stop and are not restarted. **Significant-change monitoring** (roughly 500 m moves), **region monitoring** and **visit monitoring** can relaunch a terminated app into the background for a short window, during which you must restart your services quickly.
+- Background execution time is precious: do minimal JS work per update, persist to disk, and upload in batches.
+
+### Android specifics
+
+- Without a foreground service, background apps receive location only a few times per hour (since Android 8).
+- A `location`-type foreground service with a persistent notification is the only reliable way to track continuously. Start it while the app is visible: since Android 12, starting a foreground service from the background is blocked except for a few documented exemptions.
+- **Doze** and **App Standby Buckets** defer work, but a running foreground service keeps delivering location. OEM battery managers (Xiaomi, Huawei, Samsung, OnePlus and others) may still kill it. Mitigations: guide users to exempt the app from battery optimisation (`ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS`; Play restricts the direct `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` prompt to specific use cases), show OEM-specific instructions, and detect gaps server-side.
+- When the process dies, JS stops. Libraries restart work via headless JS (expo TaskManager, Transistorsoft `enableHeadless`) when the OS delivers the next event.
+
+### expo-location + TaskManager
+
+The task **must be defined at module top level** and imported from the app entry file. When the OS wakes the app headlessly to deliver locations, no React tree is mounted; only module-level code runs. A `defineTask` inside a component or effect will not be registered in time, and events are dropped with "task not defined" warnings.
+
+```ts title="src/location/backgroundTask.ts"
+import * as Location from 'expo-location';
+import * as TaskManager from 'expo-task-manager';
+import { enqueuePoints, flushQueue, type TrackPoint } from './trackQueue';
+
+export const LOCATION_TASK = 'delivery-location-task';
+
+const toPoint = (l: Location.LocationObject): TrackPoint => ({
+  lat: l.coords.latitude,
+  lng: l.coords.longitude,
+  accuracy: l.coords.accuracy ?? null,
+  speed: l.coords.speed ?? null,
+  heading: l.coords.heading ?? null,
+  recordedAt: l.timestamp,
+  mocked: l.mocked ?? false,
+});
+
+TaskManager.defineTask<{ locations: Location.LocationObject[] }>(
+  LOCATION_TASK,
+  async ({ data, error }) => {
+    if (error) {
+      console.warn('[location-task]', error.message);
+      return;
+    }
+    const points = (data?.locations ?? [])
+      .filter((l) => (l.coords.accuracy ?? Infinity) <= 50)
+      .map(toPoint);
+    if (points.length === 0) return;
+    enqueuePoints(points);        // synchronous write to MMKV / SQLite
+    await flushQueue().catch(() => undefined); // best effort; retried later
+  },
+);
+
+export async function startShiftTracking(): Promise<void> {
+  const fg = await Location.requestForegroundPermissionsAsync();
+  if (!fg.granted) throw new Error('Foreground location permission denied');
+
+  // Expo's background APIs expect background permission; check the docs for your SDK.
+  // Show an in-app disclosure screen BEFORE this call.
+  const bg = await Location.requestBackgroundPermissionsAsync();
+  if (!bg.granted) throw new Error('Background location permission denied');
+
+  if (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK)) return;
+
+  await Location.startLocationUpdatesAsync(LOCATION_TASK, {
+    accuracy: Location.Accuracy.High,
+    timeInterval: 5_000,             // Android: minimum ms between updates
+    distanceInterval: 20,            // metres
+    deferredUpdatesInterval: 30_000, // batch delivery to save battery
+    deferredUpdatesDistance: 100,
+    activityType: Location.ActivityType.AutomotiveNavigation, // iOS
+    pausesUpdatesAutomatically: false,                         // iOS
+    showsBackgroundLocationIndicator: true,                    // iOS
+    foregroundService: {                                       // Android
+      notificationTitle: 'Delivery in progress',
+      notificationBody: 'Sharing your location with the customer',
+      notificationColor: '#1E88E5',
+    },
+  });
+}
+
+export async function stopShiftTracking(): Promise<void> {
+  if (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK)) {
+    await Location.stopLocationUpdatesAsync(LOCATION_TASK);
+  }
+  await flushQueue();
+}
+```
+
+```ts title="index.ts"
+// Custom entry so the task is registered before anything else.
+// package.json: "main": "index.ts"
+import './src/location/backgroundTask';
+import 'expo-router/entry';
+```
+
+```ts title="src/location/trackQueue.ts"
+import { storage } from '../storage'; // your MMKV instance
+import { api } from '../api';
+
+export interface TrackPoint {
+  lat: number; lng: number; accuracy: number | null; speed: number | null;
+  heading: number | null; recordedAt: number; mocked: boolean;
+}
+
+const KEY = 'track-queue';
+const MAX_POINTS = 5_000;  // cap disk usage during long offline periods
+const BATCH = 100;
+let flushing = false;
+
+const read = (): TrackPoint[] => JSON.parse(storage.getString(KEY) ?? '[]');
+const write = (points: TrackPoint[]) => storage.set(KEY, JSON.stringify(points));
+
+export function enqueuePoints(points: TrackPoint[]): void {
+  write([...read(), ...points].slice(-MAX_POINTS));
+}
+
+export async function flushQueue(): Promise<void> {
+  if (flushing) return;
+  flushing = true;
+  try {
+    for (let queue = read(); queue.length > 0; queue = read()) {
+      const batch = queue.slice(0, BATCH);
+      await api.post('/tracking/points', { points: batch }); // server dedupes by recordedAt
+      write(read().slice(batch.length));
+    }
+  } finally {
+    flushing = false;
+  }
+}
+```
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant App as RN app (JS)
+    participant OS as OS location service
+    participant Task as Headless task
+    participant Q as Local queue
+    participant API as Backend
+    U->>App: Tap Start shift
+    App->>OS: startLocationUpdatesAsync(task, options)
+    OS-->>U: Persistent notification or blue indicator
+    U->>App: Locks phone or switches app
+    loop Each deferred batch
+        OS->>Task: locations array
+        Task->>Q: append filtered points
+        opt Network available
+            Task->>API: POST batch of points
+            API-->>Task: 200 OK
+            Task->>Q: remove sent points
+        end
+    end
+    Note over OS,Task: Process may be killed and relaunched headless
+    U->>App: Tap End shift
+    App->>OS: stopLocationUpdatesAsync(task)
+    App->>API: flush remaining points
+```
+*Figure: Background tracking with a headless task, local persistence and batched uploads.*
+
+### Battery playbook
+
+| Technique | Effect |
+|---|---|
+| Distance filter 10–50 m instead of pure time intervals | No updates while stationary |
+| Deferred / batched delivery | Fewer CPU and radio wake-ups |
+| Batch network uploads (every 30–60 s or N points) | Avoids the cellular radio "tail" energy of many small requests |
+| Adaptive accuracy: high while moving fast, balanced while slow, stop when still | Big savings on long shifts |
+| Stop tracking when the business state ends (shift over, trip delivered) | Most important of all; enforce it server-side too |
+| Activity recognition to detect "still" | What Transistorsoft-style engines do to switch GNSS off |
+
+## Geofencing
+
+| Property | iOS (region monitoring) | Android (Geofencing API) |
+|---|---|---|
+| Limit | **20 regions per app** (shared with beacon regions) | **100 geofences per app** per device user |
+| Permission | Always, with full accuracy | Fine + background (Android 10+) |
+| Practical minimum radius | About 100–200 m; smaller radii are accepted but unreliable | 100–150 m recommended |
+| Transitions | Enter, exit (implement dwell yourself) | Enter, exit, dwell (`loiteringDelay`) |
+| Latency | Seconds to a few minutes; depends on Wi-Fi / cell changes | Typically around a couple of minutes, longer in Doze; tune responsiveness |
+| Persistence | Survives relaunch and reboot | **Cleared** on reboot, app data clear, Play services data clear, or location being disabled: re-register (for example on `BOOT_COMPLETED`) |
+| Wakes a terminated app | Yes, relaunches into background | Yes, via a `PendingIntent` to a broadcast receiver / headless task |
+
+```ts title="src/location/geofencing.ts"
+import * as Location from 'expo-location';
+import * as TaskManager from 'expo-task-manager';
+import { showArrivalNotification } from '../notifications';
+
+export const GEOFENCE_TASK = 'store-geofence-task';
+
+interface GeofenceEvent {
+  eventType: Location.GeofencingEventType;
+  region: Location.LocationRegion;
+}
+
+TaskManager.defineTask<GeofenceEvent>(GEOFENCE_TASK, async ({ data, error }) => {
+  if (error || !data) return;
+  if (data.eventType === Location.GeofencingEventType.Enter && data.region.identifier) {
+    await showArrivalNotification(data.region.identifier);
+  }
+});
+
+export interface Store { id: string; lat: number; lng: number }
+
+/** Calling again with a new array replaces the monitored regions for this task. */
+export async function monitorNearestStores(nearest: Store[]): Promise<void> {
+  const regions: Location.LocationRegion[] = nearest.slice(0, 19).map((s) => ({
+    identifier: s.id,
+    latitude: s.lat,
+    longitude: s.lng,
+    radius: 150,
+    notifyOnEnter: true,
+    notifyOnExit: false,
+  }));
+  await Location.startGeofencingAsync(GEOFENCE_TASK, regions);
+}
+```
+
+To monitor more places than the OS allows, **rotate** regions: monitor the nearest N points of interest plus one large "boundary" region centred on the user whose radius reaches the Nth point. When the user exits the boundary, recompute. On iOS that means 19 POIs + 1 boundary.
+
+```mermaid
+flowchart TD
+    Start(["App launch or boundary exit"]) --> Fix["Get position (balanced accuracy)"]
+    Fix --> Rank["Rank all POIs by distance"]
+    Rank --> Pick["Take nearest N<br/>(iOS 19, Android 99)"]
+    Pick --> Boundary["Add boundary region centred on user<br/>radius = distance to Nth POI"]
+    Boundary --> Register["startGeofencingAsync(regions)"]
+    Register --> Wait{"Next geofence event"}
+    Wait -->|"enter POI"| Notify["Handle arrival"]
+    Wait -->|"exit boundary"| Fix
+    Notify --> Wait
+```
+*Figure: Rotating geofences to cover thousands of points of interest within OS limits.*
+
+## Maps
+
+### react-native-maps setup
+
+- **Providers:** iOS defaults to Apple Maps (free, no key). Android always uses Google Maps. Pass `provider={PROVIDER_GOOGLE}` to use Google on iOS too, which needs the Google Maps iOS SDK and an iOS key.
+- **Android key:** the `com.google.android.geo.API_KEY` meta-data shown in the Android setup.
+- **Google on iOS:** add the Google subspec to your Podfile as described in the react-native-maps install docs for your version (recent versions use `pod 'react-native-maps/Google', :path => '../node_modules/react-native-maps'`), then provide the key at launch:
+
+```diff title="ios/MyApp/AppDelegate.swift"
+ import UIKit
++import GoogleMaps
+
+ // inside application(_:didFinishLaunchingWithOptions:)
++    if let key = Bundle.main.object(forInfoDictionaryKey: "GMSApiKey") as? String {
++      GMSServices.provideAPIKey(key)
++    }
+```
+
+- **Expo:** `ios.config.googleMapsApiKey` and `android.config.googleMaps.apiKey` in app config (shown earlier), then rebuild.
+
+### Markers, polylines and camera
+
+```tsx title="src/maps/DeliveryMap.tsx"
+import { memo, useEffect, useRef } from 'react';
+import { StyleSheet } from 'react-native';
+import MapView, { Marker, Polyline, PROVIDER_DEFAULT, type LatLng } from 'react-native-maps';
+
+interface Stop { id: string; name: string; coordinate: LatLng }
+interface Props { route: LatLng[]; stops: Stop[] }
+
+const StopMarker = memo(({ stop }: { stop: Stop }) => (
+  <Marker
+    identifier={stop.id}
+    coordinate={stop.coordinate}
+    title={stop.name}
+    tracksViewChanges={false} // do not re-snapshot the marker every frame
+  />
+));
+
+export function DeliveryMap({ route, stops }: Props) {
+  const mapRef = useRef<MapView>(null);
+
+  useEffect(() => {
+    if (route.length < 2) return;
+    mapRef.current?.fitToCoordinates(route, {
+      edgePadding: { top: 80, right: 40, bottom: 260, left: 40 }, // leave room for the bottom sheet
+      animated: true,
+    });
+  }, [route]);
+
+  const focusStop = (stop: Stop) =>
+    mapRef.current?.animateCamera(
+      { center: stop.coordinate, zoom: 16, pitch: 0 }, // zoom: Google only; Apple Maps uses altitude
+      { duration: 600 },
+    );
+
+  return (
+    <MapView
+      ref={mapRef}
+      style={StyleSheet.absoluteFill}
+      provider={PROVIDER_DEFAULT}
+      showsUserLocation
+      showsMyLocationButton={false}
+      toolbarEnabled={false}
+      onMarkerPress={(e) => {
+        const stop = stops.find((s) => s.id === e.nativeEvent.id);
+        if (stop) focusStop(stop);
+      }}
+    >
+      <Polyline coordinates={route} strokeWidth={5} strokeColor="#1E88E5" />
+      {stops.map((s) => <StopMarker key={s.id} stop={s} />)}
+    </MapView>
+  );
+}
+```
+
+### Marker performance and clustering
+
+- Custom-view markers are rasterised to bitmaps. With `tracksViewChanges` left `true`, they are re-captured continuously, which burns CPU and causes jank with more than a handful of markers. Keep it `false`, flipping it to `true` briefly only while a remote image inside the marker loads.
+- Prefer the `image` prop or small static icons over complex React views inside markers.
+- Don't re-render `MapView` children on every GPS tick: memoise markers and animate the one moving marker separately.
+- Fetch data on `onRegionChangeComplete` (debounced), not `onRegionChange`.
+- **Hundreds** of points: cluster on the client with `supercluster` (or `react-native-map-clustering`). **Thousands and up**: render natively as a layer (Mapbox `ShapeSource` with built-in clustering, Google heatmaps / GeoJSON), or cluster server-side per tile.
+
+```ts title="src/maps/useClusters.ts"
+import { useMemo } from 'react';
+import Supercluster from 'supercluster';
+import type { Region } from 'react-native-maps';
+
+export interface Poi { id: string; lat: number; lng: number }
+
+export function useClusters(points: Poi[], region: Region) {
+  const index = useMemo(() => {
+    const sc = new Supercluster<{ id: string }>({ radius: 60, maxZoom: 17 });
+    sc.load(points.map((p) => ({
+      type: 'Feature' as const,
+      properties: { id: p.id },
+      geometry: { type: 'Point' as const, coordinates: [p.lng, p.lat] }, // lng first
+    })));
+    return sc;
+  }, [points]);
+
+  return useMemo(() => {
+    const west = region.longitude - region.longitudeDelta / 2;
+    const east = region.longitude + region.longitudeDelta / 2;
+    const south = region.latitude - region.latitudeDelta / 2;
+    const north = region.latitude + region.latitudeDelta / 2;
+    const zoom = Math.round(Math.log2(360 / region.longitudeDelta));
+    return index.getClusters([west, south, east, north], zoom);
+  }, [index, region]);
+}
+```
+
+### API keys, restriction and billing
+
+- Use **separate keys** per platform and environment. Restrict the Android key to your package name plus the SHA-1 fingerprints of the debug, upload **and Play App Signing** certificates; restrict the iOS key to your bundle ID; restrict both to the Maps SDK APIs only.
+- Mobile keys can be extracted from any binary. Restrictions, per-API quotas and budget alerts in Google Cloud are the real defence.
+- Geocoding, Places and Routes/Directions keys belong on your **backend** (IP-restricted), with the app calling your API.
+- Google Maps Platform requires a billing account. Pricing was restructured in 2025 (per-SKU free usage caps replaced the old monthly credit). Native mobile map loads have historically been free, while Places, Geocoding and Routes are billed per request. Check the current price sheet and set quotas before launch. Apple MapKit in native apps has no per-request billing.
+
+### Geocoding and reverse geocoding
+
+| Approach | Pros | Cons | Use for |
+|---|---|---|---|
+| On-device (`Location.geocodeAsync` / `reverseGeocodeAsync`, backed by `CLGeocoder` and Android `Geocoder`) | Free, no key | iOS rate-limits requests; Android `Geocoder` may be missing a backend on some devices; results differ by platform | Display strings ("Near Market St") |
+| Server-side (Google Geocoding, Places Autocomplete, Mapbox, HERE) | Consistent, cacheable within provider terms, key stays secret | Cost, latency | Address entry, billing or legal addresses, analytics |
+
+```ts
+const [place] = await Location.reverseGeocodeAsync({ latitude, longitude });
+const label = place ? [place.name, place.city].filter(Boolean).join(', ') : 'Unknown location';
+```
+
+For address entry, call Places Autocomplete through your backend and use session tokens so one search session is billed once.
+
+## Live tracking architecture (ride-hailing, delivery)
+
+```mermaid
+flowchart TD
+    subgraph driver["Driver app"]
+        Eng["Location engine<br/>foreground service / background mode"]
+        Filt["Filter and throttle<br/>accuracy, distance, heading"]
+        Buf[("Offline buffer<br/>MMKV or SQLite")]
+    end
+    subgraph backend["Backend"]
+        GW["WebSocket gateway<br/>auth, rate limit"]
+        Val["Tracking service<br/>validate, dedupe, map-match"]
+        Geo[("Redis GEO<br/>latest positions")]
+        Bus["Pub/Sub per trip channel"]
+        Hist[("Trip history store")]
+    end
+    subgraph rider["Rider app"]
+        Sub["Trip subscription"]
+        Anim["Interpolated marker"]
+    end
+    Eng --> Filt --> Buf
+    Buf -->|"batched updates"| GW
+    GW --> Val
+    Val --> Geo
+    Val --> Bus
+    Val --> Hist
+    Bus --> Sub
+    Sub --> Anim
+```
+*Figure: Driver updates flow through a validating tracking service into a geo index and a per-trip fan-out channel.*
+
+**Driver side.** Send when the driver moved more than about 20 m, turned more than about 30°, or 3–5 s elapsed on a trip (15–30 s when merely online). Payload stays compact: `{ tripId, seq, lat, lng, accuracy, speed, heading, recordedAt }`. Use a WebSocket (or MQTT) with reconnect, exponential backoff and resume-by-`seq`, and fall back to HTTP batches. Everything goes through the local buffer first, so offline periods are replayed in order when connectivity returns.
+
+**Backend.** Validate (auth, trip membership, plausibility), dedupe on `(driverId, seq)`, then:
+
+- `GEOADD drivers:<city> <lng> <lat> <driverId>` for "nearest available drivers" queries via `GEOSEARCH drivers:<city> FROMLONLAT <lng> <lat> BYRADIUS 3 km ASC COUNT 20`. Geo set members don't expire individually, so track last-seen timestamps in a separate sorted set and prune stale drivers.
+- Publish to the trip's channel for the rider; persist the full trail to a time-series store for disputes and ETAs. Late-arriving buffered points go to history but are skipped for the live channel.
+
+**Rider side.** Updates arrive every few seconds, so jumping the marker looks broken. Animate from the previous to the new coordinate over roughly the update interval, rotate by bearing, and ignore out-of-order `seq` values.
+
+```mermaid
+sequenceDiagram
+    participant D as Driver app
+    participant WS as WS gateway
+    participant S as Tracking service
+    participant R as Redis
+    participant RA as Rider app
+    RA->>WS: subscribe to trip 42
+    WS->>S: authorize rider for trip
+    S-->>WS: allowed
+    loop Every 3-5 s or 20 m on trip
+        D->>WS: points seq 118-120
+        WS->>S: validate and dedupe
+        S->>R: GEOADD and PUBLISH trip channel
+        R-->>WS: trip update
+        WS-->>RA: position, heading, ETA
+        RA->>RA: animate marker over interval
+    end
+    alt Driver loses connectivity
+        D->>D: buffer points locally
+        D->>WS: reconnect and flush in seq order
+        S->>S: store history, skip stale for live
+    end
+```
+*Figure: Live tracking round trip, including offline replay.*
+
+```tsx title="src/tracking/CourierMarker.tsx"
+import { useEffect, useRef } from 'react';
+import { AnimatedRegion, MarkerAnimated } from 'react-native-maps';
+
+interface Props { latitude: number; longitude: number; heading: number; intervalMs?: number }
+
+export function CourierMarker({ latitude, longitude, heading, intervalMs = 4000 }: Props) {
+  const coordinate = useRef(
+    new AnimatedRegion({ latitude, longitude, latitudeDelta: 0, longitudeDelta: 0 }),
+  ).current;
+
+  useEffect(() => {
+    coordinate
+      .timing({
+        latitude,
+        longitude,
+        latitudeDelta: 0,
+        longitudeDelta: 0,
+        duration: intervalMs * 0.9, // finish just before the next update arrives
+        useNativeDriver: false,
+      })
+      .start();
+  }, [coordinate, latitude, longitude, intervalMs]);
+
+  return (
+    <MarkerAnimated
+      coordinate={coordinate}
+      rotation={heading}
+      flat
+      anchor={{ x: 0.5, y: 0.5 }}
+      tracksViewChanges={false}
+      image={require('../assets/car.png')}
+    />
+  );
+}
+```
+
+**Privacy.** Share location only while a trip is active, reduce precision before pickup if the product allows, authorise every channel subscription against trip membership, set a retention period for trails, and keep raw coordinates out of logs and analytics.
+
+## Mock location detection
+
+Fake GPS apps are a real fraud vector for delivery, attendance, gig and location-gated apps.
+
+- **Android:** `Location.isMock()` (API 31+) or `isFromMockProvider()` (API 18–30) flags fixes from a mock provider selected in Developer options. expo-location surfaces this as `location.mocked`. Rooted devices with hooking frameworks can hide it, so the flag is a signal, not proof.
+- **iOS:** there is no mock flag before iOS 15. From iOS 15, `CLLocation.sourceInformation` exposes `isSimulatedBySoftware` and `isProducedByAccessory`, which most RN libraries don't expose, so you need a small native module. Jailbreak tweaks and Xcode location simulation on developer devices are the common sources.
+
+**Server-side plausibility checks** matter more than client flags:
+
+```ts title="server/tracking/plausibility.ts"
+interface Fix { lat: number; lng: number; accuracy: number | null; recordedAt: number; mocked?: boolean }
+
+const R = 6_371_000; // Earth radius, metres
+function haversine(a: Fix, b: Fix): number {
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+export function suspicionReasons(prev: Fix | undefined, next: Fix, now = Date.now()): string[] {
+  const reasons: string[] = [];
+  if (next.mocked) reasons.push('client-mock-flag');
+  if (next.recordedAt > now + 60_000) reasons.push('timestamp-in-future');
+  if (prev) {
+    const dt = (next.recordedAt - prev.recordedAt) / 1000;
+    if (dt <= 0) reasons.push('non-monotonic-time');
+    else if (haversine(prev, next) / dt > 70) reasons.push('impossible-speed'); // over ~250 km/h
+  }
+  if (next.accuracy !== null && Number.isInteger(next.accuracy) && next.accuracy <= 5) {
+    reasons.push('suspiciously-perfect-accuracy'); // weak signal, combine with others
+  }
+  return reasons;
+}
+```
+
+Combine these with IP geolocation versus GPS mismatch, perfectly straight or repeated trails, and app integrity attestation (Play Integrity, App Attest; see [Security](security.html)). Score and escalate (step-up verification, manual review) rather than hard-blocking on a single signal: urban-canyon GPS glitches produce "teleports" for honest users too.
+
+## Store policy
+
+**Google Play**
+
+- Background location is allowed only when it is core to the app and clearly benefits the user. You must complete the **location permissions declaration** in Play Console (App content) with a short **video** showing the in-app disclosure and the feature in use.
+- A **prominent in-app disclosure** must appear before the runtime prompt: what data, why, and that it is collected "even when the app is closed or not in use" if that is true.
+- Apps targeting Android 14+ also declare their **foreground service types** and justify them in Play Console.
+- The **Data safety** form must reflect approximate and precise location collection and sharing, including by third-party SDKs.
+
+**Apple**
+
+- Purpose strings must be specific; vague strings ("We need your location") are a common rejection. Location use must be directly relevant to features (Guideline 5.1.5).
+- If you ship `UIBackgroundModes` → `location`, reviewers expect a visible feature that needs it; explain it in the review notes, ideally with a demo account.
+- Request **Always only when essential**, after the user has seen value, and degrade gracefully when they choose While Using or approximate.
+
+Policies change yearly; re-read the current Play policy and App Review Guidelines before each major release.
+
+## Edge cases & gotchas
+
+- **Stale fixes:** cached and last-known positions can be old. Check `timestamp` before using them for anything that matters.
+- **Indoors:** high-accuracy requests with short timeouts fail indoors; fall back to balanced accuracy.
+- **No Play services:** FLP calls fail on Huawei / AOSP devices; make sure your library falls back to `LocationManager`.
+- **Emulator defaults:** the Android emulator reports a fixed location (Mountain View) until you set one; the iOS simulator reports nothing until you choose a location.
+- **Heading while stationary** is meaningless; use the compass.
+- **Approximate location** on iOS silently disables geofences; check accuracy authorization before relying on region monitoring.
+- **Coordinates precision:** 5 decimals is about 1 m. Don't store or display 15 decimals, and round before analytics.
+- **Clock skew:** device clocks lie. Store both device `recordedAt` and server `receivedAt`.
+- **Multiple watchers** from different screens or SDKs silently multiply battery use.
+- **Legacy native modules** may rely on the New Architecture interop layer; verify on RN 0.82+ where only the New Architecture exists.
+
+## Testing & debugging
+
+**iOS**
+
+- Simulator: **Features → Location** → Custom Location, City Run, City Bicycle Ride, Freeway Drive.
+- Command line:
+
+```bash
+xcrun simctl location booted set 37.3349,-122.0090
+xcrun simctl location booted start --speed=15 37.3349,-122.0090 37.3318,-122.0312
+xcrun simctl location booted clear
+xcrun simctl privacy booted grant location-always com.example.myapp
+```
+
+- GPX routes: **File → New → File → GPX File** in Xcode, then **Edit Scheme → Run → Options → Default Location**, or **Debug → Simulate Location** while running on a device.
+- Background behaviour, pausing and relaunch must be verified on a real device; watch the Energy Impact gauge in Xcode's Debug navigator and use Instruments for energy logs.
+
+**Android**
+
+- Emulator **Extended controls (…) → Location**: single point, **Routes** tab with playback speed, or import GPX/KML.
+
+```bash
+adb emu geo fix -122.0840 37.4220           # longitude first
+adb shell pm grant com.example.myapp android.permission.ACCESS_FINE_LOCATION
+adb shell pm revoke com.example.myapp android.permission.ACCESS_FINE_LOCATION  # kills the app
+adb shell dumpsys location                   # providers, active requests, last fixes
+adb shell dumpsys activity services com.example.myapp   # is the foreground service alive
+adb shell dumpsys deviceidle force-idle      # simulate Doze
+adb shell dumpsys deviceidle unforce
+```
+
+- On real devices, select a mock-location app in Developer options for route playback, and test on at least one aggressive OEM (Xiaomi, Samsung, Huawei) with the screen off for 30+ minutes.
+
+**Automated**
+
+- Unit-test hooks with `jest.mock('expo-location')` and assert every permission branch.
+- E2E: Detox `device.setLocation(lat, lon)`; Maestro offers location commands (`setLocation`, and route simulation). See [Testing Strategy](testing.html).
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| iOS permission prompt never appears | Missing `NSLocationWhenInUseUsageDescription` / Always key | Add the key; check the device log for the Core Location warning |
+| Android request returns denied instantly | FINE requested without COARSE on API 31+, or permanently denied | Request both; if `never_ask_again`, send the user to Settings |
+| Background permission request does nothing | Requested together with foreground on Android 11+ | Request background separately after foreground is granted |
+| `getCurrentPosition` times out | High accuracy indoors, cold GNSS, services off | Use last known first, fall back to balanced accuracy, check services |
+| Tracking stops after a few minutes in background (iOS) | `pausesLocationUpdatesAutomatically`, missing background mode, or app swiped away | Disable auto-pause or add region wake-up; verify `UIBackgroundModes`; use significant-change to relaunch |
+| Tracking stops in background (Android) | No foreground service, OEM battery killer, service started from background | Start a `location` foreground service while visible; battery-optimisation guidance; monitor gaps |
+| `startForeground` crash on Android 14 | Missing `FOREGROUND_SERVICE_LOCATION`, missing service type, or no location permission yet | Add permission and `foregroundServiceType="location"`; start only after grant |
+| Background task never fires | `defineTask` not at module top level / not imported from entry | Define in its own module and import it from `index.ts` |
+| Geofences stop working on Android | Device rebooted or location toggled off | Re-register on boot and on app start |
+| Geofences never fire on iOS | Approximate accuracy, When In Use only, radius too small | Require Always + precise, use 100 m+ radius |
+| Google map is blank / grey | Key missing, not restricted to the right SHA-1 (Play App Signing key), or Maps SDK not enabled | Fix key restrictions, add all certificate fingerprints, enable the SDK and billing |
+| Map janky with many markers | Custom-view markers with `tracksViewChanges`, re-rendering on every tick | `tracksViewChanges={false}`, memoise markers, cluster |
+| App killed when user changes permission (Android) | Expected OS behaviour | Re-check permission state on every cold start |
+
+## Production checklist
+
+- [ ] Only the permissions you need; merged manifest audited; unwanted background permission removed
+- [ ] Specific iOS purpose strings; temporary full-accuracy purpose keys where needed
+- [ ] Pre-permission explanation screens; graceful fallback (manual city / address entry) when denied or approximate
+- [ ] Location services disabled state handled with a clear prompt
+- [ ] Single app-wide location service; subscriptions cleaned up on unmount and background
+- [ ] Accuracy and timestamp filtering before using fixes
+- [ ] Background tracking starts from a user action, stops when the business state ends (enforced server-side too)
+- [ ] TaskManager tasks defined at module top level and imported from the entry file
+- [ ] Points persisted locally and uploaded in batches with dedupe keys
+- [ ] Android foreground service type and `FOREGROUND_SERVICE_LOCATION` declared; notification copy is clear
+- [ ] Geofences re-registered after reboot; rotation strategy if more than OS limits
+- [ ] Map keys restricted (package + all SHA-1s, bundle ID), quotas and budget alerts set; server keys only on backend
+- [ ] Markers memoised, `tracksViewChanges={false}`, clustering for large sets
+- [ ] Mock-location signals collected and scored server-side
+- [ ] Play location declaration, demo video, foreground service declaration and Data safety form complete
+- [ ] App Store privacy labels and review notes explain location and background use
+- [ ] Tested on real iOS and Android devices, screen off for 30+ minutes, including an aggressive OEM
+- [ ] Battery impact measured on a full-length session (shift, workout)
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [Expo Location](https://docs.expo.dev/versions/latest/sdk/location/)
+- [Android — Request location permissions](https://developer.android.com/develop/sensors-and-location/location/permissions)
+- [Apple — Core Location](https://developer.apple.com/documentation/corelocation)
+- [react-native-maps](https://github.com/react-native-maps/react-native-maps)
+- [Google Play — Background location policy](https://support.google.com/googleplay/android-developer/answer/9799150)
+
+## Interview questions
+
+### How would you implement reliable background tracking for a delivery driver app?
+
+Start tracking from an explicit user action ("Start shift") while the app is visible. On iOS use the `location` background mode with `allowsBackgroundLocationUpdates`, a suitable `activityType`, and handle auto-pausing. On Android run a `location`-type foreground service with a clear notification (`FOREGROUND_SERVICE_LOCATION` on API 34+). Write every point to a local queue first, upload in batches with sequence numbers for dedupe, and stop tracking when the shift ends, enforced server-side too. Use distance filters and adaptive accuracy for battery, test against OEM battery killers on real devices, and monitor tracking gaps in production. If reliability is the product, license Transistorsoft rather than rebuilding motion detection and persistence.
+
+### When do you actually need Always or ACCESS_BACKGROUND_LOCATION?
+
+Only to **start** location access while the app is not in use: geofences, significant-change monitoring, automatic trip detection. A session the user starts in the foreground can continue in the background with "while using" permission: iOS shows the blue indicator, Android keeps access through a foreground service started while visible. Asking for Always unnecessarily lowers opt-in rates, triggers Google Play's background location declaration and video, and draws App Review scrutiny. On Android 11+ background must be requested separately and the user grants it in Settings; on iOS the Always upgrade prompt appears only once.
+
+### How do you balance location accuracy against battery life?
+
+The OS fuses GNSS, Wi-Fi, cell and sensors; you pick an accuracy level (FLP priority or `desiredAccuracy`), interval, distance filter and batching. GNSS is accurate but costly; Wi-Fi and cell are cheap but coarse. Tune per feature: balanced accuracy for "near me" lists, high accuracy only during navigation or proof-of-delivery, distance filters so stationary devices produce no updates, deferred delivery and batched uploads to reduce wake-ups, and stop updates as soon as the feature is done. Measure on a full-length session rather than guessing.
+
+### Why must an expo-task-manager task be defined at module top level?
+
+Because the OS can wake the app headlessly to deliver locations or geofence events when no UI is mounted. In that launch only the JS bundle's module-level code runs; there is no component tree, so a `defineTask` inside a component or `useEffect` isn't registered when the event arrives and it is dropped. Define tasks in a dedicated module and import it from the entry file before the app registers. The same principle applies to FCM background handlers and headless JS tasks generally.
+
+### How would you geofence 2,000 store locations?
+
+Both OSes cap regions (20 per app on iOS, 100 on Android), so rotate: monitor the nearest N stores plus a boundary region centred on the user whose radius reaches the Nth store, and recompute when the user exits the boundary. Use radii of at least 100–150 m, require Always and precise accuracy on iOS (approximate disables region monitoring), re-register on Android after reboot or when location is re-enabled, and implement dwell yourself on iOS. Alternatively, Transistorsoft handles large geofence sets with the same proximity idea.
+
+### A map screen with 3,000 markers is janky. What do you do?
+
+First, stop rendering 3,000 React views: cluster with `supercluster` (or server-side per tile) so only visible clusters render. Keep `tracksViewChanges={false}` on custom markers, prefer the `image` prop, memoise markers so GPS ticks don't re-render the whole tree, and fetch on `onRegionChangeComplete` with a debounce. If the data is inherently large or dynamic, move to native layers, such as Mapbox `ShapeSource` + `SymbolLayer` with built-in clustering, where rendering happens on the GPU without per-marker React views.
+
+### How do you make a moving car marker look smooth on the rider's screen?
+
+Updates arrive every few seconds, so interpolate: animate from the previous to the new coordinate over roughly the update interval (`AnimatedRegion.timing` with `MarkerAnimated`, or a Reanimated-driven position), rotate by the bearing between points or the reported heading, and drop out-of-order updates by sequence number. Optionally snap to the route polyline and dead-reckon briefly if an update is late. Keep the marker flat, anchored at its centre and with `tracksViewChanges={false}`.
+
+### How would you detect location spoofing?
+
+Collect client signals (Android `isMock()` / `mocked`, iOS 15+ `sourceInformation.isSimulatedBySoftware` via a native module, app integrity from Play Integrity or App Attest) but treat them as hints, because rooted or jailbroken devices can hide them. The real defence is server-side: impossible speeds between consecutive fixes, non-monotonic or future timestamps, repeated identical trails, perfectly round accuracy values, and GPS versus IP mismatch. Score the signals and escalate with step-up checks or manual review instead of hard-blocking, because genuine GPS glitches cause false positives.
+
+### What changed for location permissions in Android 10, 11, 12 and 14?
+
+Android 10 introduced `ACCESS_BACKGROUND_LOCATION` and the `location` foreground service type. Android 11 required background location to be requested separately (granted through Settings via "Allow all the time"), added one-time permissions and auto-reset for unused apps. Android 12 let users choose approximate location, so you must request FINE and COARSE together and handle approximate-only grants, and it restricted starting foreground services from the background. Android 14 made foreground service types mandatory with `FOREGROUND_SERVICE_LOCATION` and requires holding a location permission before starting that service, plus Play Console declarations.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

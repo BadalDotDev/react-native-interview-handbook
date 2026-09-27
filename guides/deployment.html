@@ -1,0 +1,1597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deployment, Signing &amp; CI/CD · React Native Interview Handbook</title>
+<meta name="description" content="This guide takes a React Native app from git push to a staged production rollout on both stores: accounts and store requirements, versioning, environments, Android and iOS code…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Deployment, Signing &amp; CI/CD · React Native Interview Handbook">
+<meta property="og:description" content="This guide takes a React Native app from git push to a staged production rollout on both stores: accounts and store requirements, versioning, environments, Android and iOS code…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/deployment.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Deployment, Signing & CI/CD
+
+This guide takes a React Native app from `git push` to a staged production rollout on both stores: accounts and store requirements, versioning, environments, Android and iOS code signing, Play Console and App Store Connect, automation with Fastlane, GitHub Actions and EAS, and what to do after release when things go wrong. It covers bare React Native CLI and Expo projects side by side.
+
+## How it works
+
+A React Native release is really **two artifacts shipped through two very different pipelines**:
+
+- A **native binary** (Android App Bundle `.aab`, iOS archive exported as `.ipa`) that contains the native code, the Hermes bytecode bundle and assets. It must be **signed** with an identity the store trusts, it goes through **store review**, and it reaches users through the store's update mechanism (slow, gated, but able to change anything).
+- Optionally, **over-the-air (OTA) JS updates** layered on top of an installed binary. These skip review but can only change JS and assets. They are covered in the [OTA Updates guide](ota-updates.html).
+
+Everything in this guide exists to make the first pipeline **reproducible** (same inputs, same binary), **traceable** (every build maps to a commit and a version), **safe** (secrets never in git, staged rollouts, fast halts) and **boring** (nobody clicks through Xcode on release day).
+
+```mermaid
+flowchart TD
+    Commit["Commit / merge to main or release branch"] --> CI["CI: install, lint, typecheck, unit tests"]
+    CI --> Build["Build release binaries<br/>AAB via Gradle + IPA via xcodebuild"]
+    Build --> Sign["Sign<br/>upload key / Apple Distribution cert"]
+    Sign --> Beta["Internal and beta tracks<br/>Play internal/closed + TestFlight"]
+    Beta --> QA{"QA and beta sign-off?"}
+    QA -->|"no"| Commit
+    QA -->|"yes"| Review["Store review<br/>App Review + Play review"]
+    Review --> Rollout["Staged rollout<br/>Play percentage + iOS phased release"]
+    Rollout --> Monitor["Monitor crash-free rate,<br/>ANRs, reviews, business KPIs"]
+    Monitor --> Healthy{"Healthy?"}
+    Healthy -->|"yes"| Full["Ramp to 100 percent"]
+    Healthy -->|"no"| Halt["Halt / pause rollout"]
+    Halt --> Fix{"JS-only fix?"}
+    Fix -->|"yes"| OTA["OTA update to the affected runtime"]
+    Fix -->|"no"| Hotfix["Hotfix binary<br/>expedited review"]
+    Hotfix --> Build
+```
+*Figure: The end-to-end release pipeline. The loop back from "Halt" is what separates a mature pipeline from a manual one.*
+
+A few mental models that make the rest of the guide click:
+
+| Concept | Android | iOS |
+|---|---|---|
+| Who ultimately signs what users install | **Google** (Play App Signing) re-signs with the app signing key | **Apple** re-signs App Store builds; your Distribution certificate proves the upload came from your team |
+| What you sign with | Upload key (a keystore you own) | Apple Distribution certificate + App Store provisioning profile |
+| Upload format | `.aab` (App Bundle); APKs are generated per device by Play | `.ipa` exported from an `.xcarchive` |
+| Identity of the app | `applicationId` (e.g. `com.mycompany.myapp`) — permanent | Bundle ID / App ID (e.g. `com.mycompany.myapp`) — permanent |
+| Pre-release channel | Internal / closed / open testing tracks | TestFlight (internal / external) |
+| Gradual release | Staged rollout (any percentage, halt/resume) | Phased release (fixed 7-day schedule, pause/resume) |
+| Rollback | None — ship a higher `versionCode` | None — ship a higher build |
+| Typical review time | Hours to a few days (longer for new apps/accounts) | Most within 24–48 hours |
+
+> [!IMPORTANT]
+> Neither store supports rolling a binary back. "Rollback" in mobile means *halting* a rollout (users who already updated keep the bad version) and shipping a new, higher-numbered build or an OTA fix. Design your pipeline so that shipping a fix is fast, not so that you never need one.
+
+## Requirements & prerequisites
+
+Store requirements change every year. The table below reflects the state of play in late 2026 — verify against the current [App Store Review Guidelines](https://developer.apple.com/app-store/review/guidelines/) and Play Console Policy Center before a first submission.
+
+| Requirement | Platform | Details |
+|---|---|---|
+| Apple Developer Program | iOS | $99/year (individual or organisation). **Organisations need a D-U-N-S number** and legal entity verification, which can take days to weeks — start early. |
+| Google Play Console account | Android | $25 one-time registration. Identity verification is mandatory; organisation accounts need a D-U-N-S number too. New **personal** accounts must run a closed test (12+ testers, 14 days) before production access. |
+| Mac + Xcode | iOS | Building and signing iOS requires macOS + Xcode. Apple raises the minimum SDK every spring (Xcode 26 / iOS 26 SDK required for uploads since April 2026). Alternatives: cloud macOS CI (GitHub Actions macOS runners, Bitrise, Codemagic, Xcode Cloud) or **EAS Build**. |
+| JDK 17 + Android SDK | Android | Current RN versions build with JDK 17. Android Studio or command-line tools; SDK platform matching `compileSdkVersion`. |
+| Privacy policy URL | Both | Publicly reachable, describes data collected, used and shared. Required by both stores (Play requires it for virtually all apps). |
+| Support URL / contact | Both | App Store requires a support URL; Play requires a contact email. Broken links are a rejection reason. |
+| Screenshots | Both | App Store: iPhone 6.9" set is required (smaller sizes can be scaled from it); a 13" iPad set if you support iPad. Play: at least 2 phone screenshots; tablet/Chromebook screenshots recommended for large-screen visibility. |
+| App icon (store) | Both | App Store: **1024×1024 PNG, no alpha/transparency** (lives in the asset catalog). Play: **512×512 32-bit PNG** hi-res icon plus a 1024×500 feature graphic. See [App Icon & Splash Screen](app-icon-splash.html). |
+| Content rating | Both | Play: IARC content rating questionnaire. App Store: age rating questionnaire (Apple revised its tiers in 2025, adding 13+, 16+ and 18+ — answer the updated questionnaire). |
+| Play Data safety form | Android | Declares data collected/shared, encryption in transit, deletion. Must match what your code **and your SDKs** actually do. |
+| App Privacy details ("nutrition labels") | iOS | Declared in App Store Connect. Same rule: include third-party SDK collection (analytics, crash reporting, ads). |
+| Privacy manifests | iOS | `PrivacyInfo.xcprivacy` declaring required-reason API usage and tracking domains, for your app and for third-party SDKs. Mandatory since May 2024. |
+| Export compliance | iOS | Set `ITSAppUsesNonExemptEncryption` in `Info.plist` (usually `false` if you only use HTTPS/OS crypto). Otherwise every build shows "Missing Compliance" in TestFlight. |
+| In-app account deletion | Both | If users can create an account, they must be able to **initiate deletion in the app** (Apple 5.1.1(v)); Play also requires a web link for deletion requests in the Data safety section. |
+| Reviewer demo account | Both | If content is behind login, provide working credentials (and any OTP bypass) in review notes. The #1 cause of avoidable 2.1 rejections. |
+| EU trader status | iOS (EU) | Under the EU Digital Services Act you must declare trader/non-trader status to distribute in the EU; traders' contact details are shown on the product page. |
+| Target API level | Android | New apps and updates must target a recent API level (raised every August — API 35 from Aug 2025, API 36 expected now). |
+| 16 KB page size | Android | Apps targeting Android 15+ must ship 16 KB-aligned native libraries (enforced for new apps and updates since November 2025). |
+
+> [!TIP] Start the slow things first
+> D-U-N-S registration, Apple organisation enrolment, Play identity verification and the 14-day closed test for new personal Play accounts are all calendar-time problems that no amount of engineering accelerates. Kick them off in week one of a greenfield project.
+
+## Versioning
+
+Every binary carries **two** version identifiers. Confusing them is a classic interview tell.
+
+| | Marketing version (user-facing) | Build number (machine-facing) |
+|---|---|---|
+| Purpose | What users and support see: `1.4.2` | Unique, monotonically increasing ID the store uses to order builds |
+| Android | `versionName` (any string) | `versionCode` (positive integer, max 2,100,000,000; must strictly increase for every upload) |
+| iOS build setting | `MARKETING_VERSION` | `CURRENT_PROJECT_VERSION` |
+| iOS `Info.plist` key | `CFBundleShortVersionString` (`$(MARKETING_VERSION)`) | `CFBundleVersion` (`$(CURRENT_PROJECT_VERSION)`) |
+| Expo config | `version` | `ios.buildNumber` / `android.versionCode` (or remote, see below) |
+| Store rule | iOS: must be higher than the last **approved** version for a new App Store version | Android: unique per app, forever. iOS: unique per marketing version (just make it globally increasing) |
+
+### Android: `versionCode` and `versionName`
+
+In the RN template these are hard-coded in `android/app/build.gradle`. Make them inputs instead, so CI owns them:
+
+```gradle title="android/app/build.gradle"
+// Injected by CI: ./gradlew bundleProdRelease -PAPP_VERSION_CODE=10423 -PAPP_VERSION_NAME=1.4.2
+def appVersionCode = (findProperty("APP_VERSION_CODE") ?: "1").toInteger()
+def appVersionName = (findProperty("APP_VERSION_NAME") ?: "0.0.0-local").toString()
+
+android {
+    defaultConfig {
+        applicationId "com.mycompany.myapp"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode appVersionCode
+        versionName appVersionName
+    }
+}
+```
+
+### iOS: `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION`
+
+Modern Xcode projects store both as build settings and reference them from `Info.plist`. Check that your `ios/MyApp/Info.plist` uses the variables rather than literal strings:
+
+```xml title="ios/MyApp/Info.plist"
+<key>CFBundleShortVersionString</key>
+<string>$(MARKETING_VERSION)</string>
+<key>CFBundleVersion</key>
+<string>$(CURRENT_PROJECT_VERSION)</string>
+```
+
+CI can then override them on the command line without editing the project file:
+
+```bash
+xcodebuild -workspace ios/MyApp.xcworkspace -scheme MyApp -configuration Release \
+  -destination 'generic/platform=iOS' -archivePath build/MyApp.xcarchive \
+  MARKETING_VERSION=1.4.2 CURRENT_PROJECT_VERSION=10423 archive
+```
+
+Alternatively, `agvtool new-version -all 10423` (requires *Versioning System = Apple Generic*) or Fastlane's `increment_build_number` / `increment_version_number` rewrite the project file.
+
+### CI-driven build numbers
+
+Never let humans pick build numbers. Pick one strategy and apply it to both platforms:
+
+| Strategy | Example | Pros | Cons |
+|---|---|---|---|
+| CI run number + offset | `10000 + GITHUB_RUN_NUMBER` | Trivial, monotonic per workflow | Resets if you rename/recreate the workflow; offset must stay above old codes |
+| Timestamp | `yyMMddHHmm` → too big; `yyMMddHH` = `26092514` | No state needed, sortable | Collisions within the hour; wastes the integer range |
+| Query the store, add 1 | Fastlane `latest_testflight_build_number + 1`, `google_play_track_version_codes` | Always valid against the store | Race between parallel builds; needs API credentials at build time |
+| Remote counter (EAS) | `"appVersionSource": "remote"` + `autoIncrement` | Managed for you, per platform | Tied to EAS |
+| Derived from semver | `1.4.2` → `10402` + build digit(s) | Human-readable | Breaks for hotfix chains and when you need more than 9 or 99 builds per version |
+
+> [!TIP]
+> Use **one** build number for both platforms from the same CI run. When a crash report says "1.4.2 (10423)" you instantly know the commit, the pipeline run and that the iOS and Android builds came from identical JS.
+
+For Expo, let EAS own versioning:
+
+```json title="eas.json (excerpt)"
+{
+  "cli": { "appVersionSource": "remote" },
+  "build": {
+    "production": { "autoIncrement": true }
+  }
+}
+```
+
+With `appVersionSource: "remote"`, EAS stores the current `versionCode`/`buildNumber` server-side and increments it per build; `version` (the marketing version) still comes from `app.config.ts`. Seed it once with `eas build:version:set` when migrating an existing app.
+
+## Environments & build variants
+
+Most teams need at least **dev**, **staging** and **prod** builds that can be installed side by side, point at different backends and are visually distinguishable.
+
+| | Dev | Staging | Prod |
+|---|---|---|---|
+| Bundle ID / applicationId | `com.mycompany.myapp.dev` | `com.mycompany.myapp.staging` | `com.mycompany.myapp` |
+| Display name | MyApp Dev | MyApp Staging | MyApp |
+| Icon | Icon with "DEV" ribbon | Icon with "STG" ribbon | Real icon |
+| API base URL | `https://dev-api.example.com` | `https://staging-api.example.com` | `https://api.example.com` |
+| Firebase / Sentry project | dev | staging | prod |
+| Signing | Debug / development | Ad hoc / internal | Distribution / upload key |
+| Distribution | Local, dev client | TestFlight internal, Play internal, Firebase App Distribution | Stores |
+
+> [!NOTE]
+> Different bundle IDs mean different apps as far as the OS is concerned: separate push tokens, keychains, deep link domains (each needs its own AASA/assetlinks entry), IAP products and Firebase config files. That isolation is the point — a staging build can never corrupt production data on a tester's phone.
+
+### Android: product flavors
+
+```gradle title="android/app/build.gradle"
+react {
+    autolinkLibrariesWithApp()
+    // With flavors, variant names change (devDebug, stagingDebug, ...).
+    // The default list is just ["debug"]. Any variant NOT listed here is treated as
+    // a release variant: JS is bundled and compiled to Hermes bytecode at build time.
+    debuggableVariants = ["devDebug", "stagingDebug", "prodDebug"]
+}
+
+android {
+    flavorDimensions "environment"
+    productFlavors {
+        dev {
+            dimension "environment"
+            applicationIdSuffix ".dev"
+            versionNameSuffix "-dev"
+        }
+        staging {
+            dimension "environment"
+            applicationIdSuffix ".staging"
+            versionNameSuffix "-staging"
+        }
+        prod {
+            dimension "environment"
+        }
+    }
+}
+```
+
+Per-flavor resources override `main` through source sets — no Gradle code needed:
+
+```plaintext
+android/app/src/
+├── main/                     # shared code, manifest, default res
+├── dev/
+│   ├── res/values/strings.xml          # <string name="app_name">MyApp Dev</string>
+│   ├── res/mipmap-*/ic_launcher*.png   # ribboned icons
+│   └── google-services.json            # dev Firebase project
+├── staging/
+│   ├── res/values/strings.xml
+│   ├── res/mipmap-*/ic_launcher*.png
+│   └── google-services.json
+└── prod/
+    └── google-services.json
+```
+
+Run and build specific variants:
+
+```bash
+npx react-native run-android --mode stagingDebug --appIdSuffix staging
+cd android && ./gradlew bundleProdRelease     # -> app/build/outputs/bundle/prodRelease/app-prod-release.aab
+cd android && ./gradlew assembleStagingRelease
+```
+
+> [!WARNING]
+> Don't define `app_name` via `resValue` in a flavor **and** in `src/main/res/values/strings.xml` — Gradle fails with a duplicate resource error. Use source-set overrides as above, or remove it from `main`.
+
+### iOS: build configurations, schemes and xcconfig
+
+iOS has no "flavors". The idiomatic equivalent is three pieces working together:
+
+1. **Build configurations** (Project → Info → Configurations): duplicate `Debug` → `Debug-Staging` and `Release` → `Release-Staging` (repeat for Dev if needed).
+2. **xcconfig files** assigned to each configuration, holding the per-environment settings.
+3. **Schemes**: `MyApp` (Debug/Release), `MyApp-Staging` (Debug-Staging for Run, Release-Staging for Archive). Tick **Shared** in *Manage Schemes* so the scheme lives in `xcshareddata/` and CI can see it.
+
+```plaintext title="ios/Config/Staging.xcconfig"
+// CocoaPods can only set its own base config if none is set, so include it explicitly.
+// File names are the configuration name lowercased.
+#include? "../Pods/Target Support Files/Pods-MyApp/Pods-MyApp.release-staging.xcconfig"
+
+APP_DISPLAY_NAME = MyApp Staging
+PRODUCT_BUNDLE_IDENTIFIER = com.mycompany.myapp.staging
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon-Staging
+// '//' starts a comment in xcconfig, so URLs need the $() trick
+API_URL = https:/$()/staging-api.example.com
+```
+
+Reference the variables in `Info.plist` (`CFBundleDisplayName` → `$(APP_DISPLAY_NAME)`), and add an `AppIcon-Staging` icon set to `Images.xcassets`. Then tell CocoaPods how to treat the new configurations — otherwise Pods default custom configurations to **release** optimisation and your `Debug-Staging` build loses dev tooling:
+
+```ruby title="ios/Podfile"
+project 'MyApp',
+  'Debug' => :debug,
+  'Debug-Staging' => :debug,
+  'Release' => :release,
+  'Release-Staging' => :release
+```
+
+```bash
+cd ios && bundle exec pod install
+npx react-native run-ios --scheme MyApp-Staging --mode Debug-Staging
+```
+
+### Reading environment values in JS: react-native-config
+
+[react-native-config](https://github.com/lugg/react-native-config) exposes `.env` values to JS, Gradle (`BuildConfig`, resources) and Xcode (build settings, `Info.plist`):
+
+```properties title=".env.staging"
+API_URL=https://staging-api.example.com
+SENTRY_ENVIRONMENT=staging
+FEATURE_NEW_CHECKOUT=true
+```
+
+```gradle title="android/app/build.gradle (top of file)"
+project.ext.envConfigFiles = [
+    devdebug: ".env.dev",
+    devrelease: ".env.dev",
+    stagingdebug: ".env.staging",
+    stagingrelease: ".env.staging",
+    proddebug: ".env.production",
+    prodrelease: ".env.production",
+]
+apply from: project(':react-native-config').projectDir.getPath() + "/dotenv.gradle"
+```
+
+On iOS, select the file per scheme with a scheme **Build → Pre-action** script (see the library README), then read values in TypeScript:
+
+```ts title="src/config/env.ts"
+import Config from 'react-native-config';
+
+function required(name: keyof typeof Config): string {
+  const value = Config[name];
+  if (!value) throw new Error(`Missing env var ${String(name)}`);
+  return value;
+}
+
+export const env = {
+  apiUrl: required('API_URL'),
+  sentryEnvironment: required('SENTRY_ENVIRONMENT'),
+  newCheckout: Config.FEATURE_NEW_CHECKOUT === 'true',
+} as const;
+```
+
+> [!CAUTION]
+> Anything in `.env`, `BuildConfig`, `Info.plist` or the JS bundle **ships inside the binary** and can be extracted in minutes. Environment files are for configuration (URLs, public keys, feature defaults), never for secrets like API secret keys or signing credentials. See [Security](security.html).
+
+### Expo: `app.config.ts` with `APP_VARIANT`
+
+In Expo (CNG), variants are just different inputs to the config function. `npx expo prebuild` / EAS Build generate the native projects accordingly:
+
+```ts title="app.config.ts"
+import type { ConfigContext, ExpoConfig } from 'expo/config';
+
+type Variant = 'development' | 'preview' | 'production';
+
+const VARIANT: Variant = (process.env.APP_VARIANT as Variant | undefined) ?? 'production';
+
+const VARIANTS: Record<Variant, { name: string; id: string; icon: string; apiUrl: string }> = {
+  development: {
+    name: 'MyApp Dev',
+    id: 'com.mycompany.myapp.dev',
+    icon: './assets/icon-dev.png',
+    apiUrl: 'https://dev-api.example.com',
+  },
+  preview: {
+    name: 'MyApp Preview',
+    id: 'com.mycompany.myapp.preview',
+    icon: './assets/icon-preview.png',
+    apiUrl: 'https://staging-api.example.com',
+  },
+  production: {
+    name: 'MyApp',
+    id: 'com.mycompany.myapp',
+    icon: './assets/icon.png',
+    apiUrl: 'https://api.example.com',
+  },
+};
+
+export default ({ config }: ConfigContext): ExpoConfig => {
+  const v = VARIANTS[VARIANT];
+  return {
+    ...config,
+    name: v.name,
+    slug: 'myapp',
+    scheme: VARIANT === 'production' ? 'myapp' : `myapp-${VARIANT}`,
+    version: '1.4.2',
+    icon: v.icon,
+    ios: {
+      ...config.ios,
+      bundleIdentifier: v.id,
+      config: { usesNonExemptEncryption: false },
+    },
+    android: {
+      ...config.android,
+      package: v.id,
+    },
+    extra: {
+      ...config.extra,
+      variant: VARIANT,
+      apiUrl: v.apiUrl,
+      eas: { projectId: '5b0c6d1e-7f7a-4c1e-9a55-2f3c8e6d9a10' },
+    },
+  };
+};
+```
+
+Set `APP_VARIANT` per EAS build profile (`"env": { "APP_VARIANT": "preview" }` in `eas.json`) and locally with `APP_VARIANT=development npx expo start`. For simple public values you can also use `EXPO_PUBLIC_*` environment variables, which Metro inlines into the bundle at build time — same "not a secret" caveat applies.
+
+## Choosing a build & release approach
+
+| Approach | Best for | Pros | Cons |
+|---|---|---|---|
+| Manual (Android Studio / Xcode Organizer) | First release, learning, emergencies | No setup, visual feedback | Not reproducible, keys live on laptops, bus factor of one |
+| **Fastlane + GitHub Actions** (or GitLab CI, CircleCI, Azure) | Bare RN teams wanting full control | Free/cheap, everything in git, huge plugin ecosystem, works with any native customisation | You maintain macOS runners, Ruby, Xcode versions, caching; signing setup takes a day |
+| **EAS Build + EAS Submit** (+ EAS Workflows) | Expo/CNG projects; teams without Mac infra | Managed credentials, macOS workers with the right Xcode, remote versioning, integrates with EAS Update | Paid at scale, build queue times on the free tier, less control over the build machine |
+| Bitrise | Mobile-focused teams wanting a hosted CI with UI | Mobile-specific steps, managed macOS stacks, good signing UX | Pricing, vendor-specific config (`bitrise.yml`) |
+| Codemagic | RN/Flutter teams, fast setup | Mobile-first, `codemagic.yaml`, automatic code signing, Apple Silicon machines | Pricing, smaller ecosystem than GitHub Actions |
+| Xcode Cloud | iOS-only, Apple-centric teams | Native App Store Connect integration | iOS only, awkward for RN (Node install in custom scripts), no Android |
+
+**Recommendation:** Expo projects should default to **EAS Build + Submit** (optionally triggered from GitHub Actions or EAS Workflows). Bare RN projects with significant native code usually land on **Fastlane driven by GitHub Actions**, because it keeps the whole pipeline in the repo and runs the same lanes locally and in CI. Whatever you pick, the lanes/profiles should be the only way a release binary is produced.
+
+## Android release
+
+### Step 1 — Understand Play App Signing
+
+Since 2021, new apps must publish as App Bundles and use **Play App Signing**. There are two keys:
+
+- **App signing key** — the key that signs the APKs installed on devices. Google generates (or you upload) it and keeps it in Google's key management. It never needs to leave Google again, and it is the key whose SHA-256 goes into `assetlinks.json` for App Links and into Firebase/Google Sign-In configs for production.
+- **Upload key** — a key **you** hold and use to sign the `.aab` you upload. Google verifies the upload signature, strips it, and re-signs with the app signing key.
+
+```mermaid
+flowchart TD
+    subgraph you["You / CI"]
+        Keystore[("upload-key.keystore")]
+        Gradle["./gradlew bundleProdRelease"]
+    end
+    subgraph google["Google Play"]
+        Verify["Verify upload certificate"]
+        Vault[("App signing key<br/>held by Google")]
+        Split["Generate optimized split APKs<br/>and sign with app signing key"]
+    end
+    Keystore --> Gradle
+    Gradle -->|"AAB signed with upload key"| Verify
+    Verify --> Split
+    Vault --> Split
+    Split --> Devices["User devices"]
+    Verify -.->|"upload key lost or leaked"| Reset["Request upload key reset<br/>in Play Console"]
+```
+*Figure: Play App Signing separates the key you can lose from the key that identifies your app forever.*
+
+Why this matters: with legacy self-signing, losing your keystore meant you could **never update the app again** — you had to publish a new listing. With Play App Signing, a lost or leaked upload key is an inconvenience: an account owner requests an upload key reset in Play Console (*Test and release → App integrity → App signing*), registers a new upload certificate, and continues after a short waiting period.
+
+> [!WARNING]
+> Firebase, Google Sign-In, Maps API key restrictions and `assetlinks.json` need the SHA-1/SHA-256 of the **app signing key** (copy it from Play Console → App integrity) for production, and of the upload/debug keys for local and internal builds. "Google Sign-In works in debug but fails from the Play Store" is almost always this.
+
+### Step 2 — Generate an upload key
+
+```bash
+keytool -genkeypair -v -storetype PKCS12 \
+  -keystore myapp-upload.keystore \
+  -alias myapp-upload \
+  -keyalg RSA -keysize 2048 -validity 10000
+```
+
+- `-validity 10000` (about 27 years) — the key should outlive the app.
+- With PKCS12, the store password and key password are the same; keytool will not prompt separately.
+- Store the keystore and passwords in a password manager/secret store **immediately**, with at least two people having access.
+- Print the fingerprints you'll need later: `keytool -list -v -keystore myapp-upload.keystore -alias myapp-upload`.
+
+Expo users: `eas credentials` generates and stores an upload keystore for you (or you can upload your own), and EAS Build signs with it.
+
+### Step 3 — Keep signing secrets out of git
+
+Gradle reads properties from `~/.gradle/gradle.properties` (per machine) as well as `android/gradle.properties` (committed). Put secrets in the former:
+
+```properties title="~/.gradle/gradle.properties"
+MYAPP_UPLOAD_STORE_FILE=/Users/alex/keys/myapp-upload.keystore
+MYAPP_UPLOAD_KEY_ALIAS=myapp-upload
+MYAPP_UPLOAD_STORE_PASSWORD=use-your-password-manager
+MYAPP_UPLOAD_KEY_PASSWORD=use-your-password-manager
+```
+
+In CI, don't write that file at all. Gradle maps environment variables named `ORG_GRADLE_PROJECT_<name>` to project properties, so `ORG_GRADLE_PROJECT_MYAPP_UPLOAD_STORE_PASSWORD` set from a CI secret is picked up automatically. Store the keystore itself as a base64-encoded secret and decode it at build time.
+
+```diff title=".gitignore"
++ *.keystore
++ !android/app/debug.keystore
++ *.jks
++ android/keystore.properties
++ *.p8
++ *.mobileprovision
++ secrets/
+```
+
+### Step 4 — Configure `signingConfigs`
+
+The RN template signs **release builds with the debug keystore** so `run-android --mode release` works out of the box. Play rejects debug-signed bundles, so replace it:
+
+```gradle title="android/app/build.gradle"
+android {
+    signingConfigs {
+        debug {
+            storeFile file('debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+        release {
+            if (project.hasProperty('MYAPP_UPLOAD_STORE_FILE')) {
+                storeFile file(MYAPP_UPLOAD_STORE_FILE)
+                storePassword MYAPP_UPLOAD_STORE_PASSWORD
+                keyAlias MYAPP_UPLOAD_KEY_ALIAS
+                keyPassword MYAPP_UPLOAD_KEY_PASSWORD
+            }
+        }
+    }
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled enableProguardInReleaseBuilds
+            shrinkResources enableProguardInReleaseBuilds
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+}
+```
+
+`file(...)` resolves relative paths against `android/app/`, so in CI you can decode the keystore to `android/app/upload.keystore` and set `MYAPP_UPLOAD_STORE_FILE=upload.keystore`.
+
+> [!TIP]
+> Fail loudly: add a check that throws when a release task runs without `MYAPP_UPLOAD_STORE_FILE`, e.g. `gradle.taskGraph.whenReady { graph -> if (graph.allTasks.any { it.name.contains("Release") } && !project.hasProperty('MYAPP_UPLOAD_STORE_FILE')) throw new GradleException("Upload keystore not configured") }`. Otherwise an unsigned release build silently fails later at upload time.
+
+### Step 5 — Shrink and obfuscate with R8
+
+R8 (the successor to ProGuard) removes unused code, optimises and obfuscates Java/Kotlin bytecode. It does **not** touch your JS bundle (Hermes bytecode is already compact and not obfuscated by R8).
+
+```gradle title="android/app/build.gradle"
+def enableProguardInReleaseBuilds = true
+```
+
+- `minifyEnabled true` enables R8 code shrinking/obfuscation.
+- `shrinkResources true` removes unreferenced resources (requires `minifyEnabled`).
+- Prefer `proguard-android-optimize.txt`; newer Android Gradle Plugin versions are phasing out the non-optimising default file.
+
+React Native and most libraries ship **consumer keep rules** inside their AARs, so you rarely need many rules yourself. Add rules for anything accessed by reflection or JNI by name:
+
+```plaintext title="android/app/proguard-rules.pro"
+# react-native-config reads BuildConfig fields reflectively
+-keep class com.mycompany.myapp.BuildConfig { *; }
+
+# Models serialised by Gson/Moshi-reflect in your own native modules
+-keep class com.mycompany.myapp.models.** { *; }
+
+# Keep line numbers for readable native stack traces; rename the source file attribute
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
+```
+
+R8 writes `android/app/build/outputs/mapping/<variant>/mapping.txt`. The AAB embeds it and Play Console uses it to deobfuscate Java/Kotlin crashes in Android vitals; upload it to Crashlytics/Sentry as well (see [Monitoring](monitoring.html)).
+
+> [!WARNING]
+> R8 bugs only appear in release builds: `ClassNotFoundException`, `NoSuchMethodError`, or a native module that "doesn't exist" at runtime. Always smoke-test a **release** build before uploading — debug builds don't run R8.
+
+### Step 6 — Build the App Bundle
+
+```bash
+cd android
+./gradlew clean
+./gradlew bundleRelease          # no flavors -> app/build/outputs/bundle/release/app-release.aab
+./gradlew bundleProdRelease      # with flavors -> app/build/outputs/bundle/prodRelease/app-prod-release.aab
+```
+
+The release variant runs the RN Gradle plugin's `createBundleReleaseJsAndAssets` task: Metro bundles JS, Hermes compiles it to bytecode, and assets are copied into `res/`. Verify the signature before uploading:
+
+```bash
+jarsigner -verify -verbose -certs app/build/outputs/bundle/prodRelease/app-prod-release.aab | tail -5
+keytool -printcert -jarfile app/build/outputs/bundle/prodRelease/app-prod-release.aab
+```
+
+Expo: `eas build --platform android --profile production` produces a signed `.aab` in the cloud; `eas build --local` runs the same build on your machine.
+
+### Step 7 — Test the release build locally
+
+```bash
+# Build, install and launch a release variant on a connected device/emulator
+npx react-native run-android --mode release            # or --mode prodRelease with flavors
+
+# Expo (CNG) equivalent
+npx expo run:android --variant release
+```
+
+To test what Play will actually deliver (split APKs from your AAB), use [bundletool](https://developer.android.com/tools/bundletool):
+
+```bash
+bundletool build-apks \
+  --bundle=app/build/outputs/bundle/prodRelease/app-prod-release.aab \
+  --output=/tmp/myapp.apks \
+  --ks=myapp-upload.keystore --ks-key-alias=myapp-upload \
+  --ks-pass=pass:"$MYAPP_UPLOAD_STORE_PASSWORD" \
+  --connected-device
+
+bundletool install-apks --apks=/tmp/myapp.apks
+
+# A single universal APK to hand to QA
+bundletool build-apks --bundle=app-prod-release.aab --output=/tmp/universal.apks --mode=universal \
+  --ks=myapp-upload.keystore --ks-key-alias=myapp-upload --ks-pass=pass:"$MYAPP_UPLOAD_STORE_PASSWORD"
+```
+
+For sharing builds with testers without the track machinery, Play's **internal app sharing** accepts any AAB/APK (no version code rules) and gives you an install link.
+
+### Step 8 — Target SDK and the 16 KB page size requirement
+
+**Target API level policy.** Every year (around August 31) Google Play requires new apps and updates to target an API level within roughly a year of the latest Android release — API 35 from August 2025, with API 36 expected for 2026. Existing apps that fall behind become unavailable to new users on newer Android versions. Bumping `targetSdkVersion` opts you into behaviour changes, so read the Android behaviour-change notes each year: edge-to-edge enforcement for API 35/36, predictive back, foreground service types (API 34), notification permission (API 33).
+
+```gradle title="android/build.gradle"
+buildscript {
+    ext {
+        minSdkVersion = 24
+        compileSdkVersion = 36
+        targetSdkVersion = 36
+        buildToolsVersion = "36.0.0"
+    }
+}
+```
+
+Expo manages these per SDK; override with `expo-build-properties` (`"android": { "targetSdkVersion": 36 }`) only when you must.
+
+**16 KB memory pages.** Android 15+ devices may use 16 KB memory pages instead of 4 KB. Native libraries (`.so`) must be built with 16 KB ELF segment alignment, and uncompressed libraries must be 16 KB zip-aligned in the package. Google Play enforces this for new apps and updates targeting Android 15+ since November 2025.
+
+- React Native 0.77+ ships 16 KB-compatible binaries (Hermes, Yoga, core `.so` files). Upgrade RN first.
+- Use AGP 8.5.1+ (aligns uncompressed libs automatically) and NDK r28+ (16 KB by default) for your own C++.
+- The usual offenders are **third-party libraries with prebuilt `.so` files** (older video, ML, crypto, PDF or payment SDKs). Update them or replace them.
+- Check an APK: `zipalign -c -P 16 -v 4 app-release.apk` (build-tools 35+), the APK Analyzer in Android Studio (flags misaligned libraries), or Android's `check_elf_alignment.sh` script. Play Console's bundle explorer also reports compliance.
+- Test on an Android 15+ emulator using a **16 KB page size** system image.
+
+> [!IMPORTANT]
+> Both requirements change on a schedule. Put a recurring calendar reminder in June each year to check the new target API deadline and Apple's spring SDK requirement, and budget an upgrade sprint.
+
+## Google Play Console
+
+### Create the app and complete "App content"
+
+1. **Create app**: name, default language, app or game, free or paid (free → paid is not allowed later), declarations.
+2. **Store listing** (*Grow users → Store presence*): short description (80 chars), full description (4,000 chars), 512×512 icon, 1024×500 feature graphic, screenshots, category, contact email, privacy policy URL.
+3. **App content** (*Policy and programs → App content*) — all must be complete before you can publish to production:
+   - Privacy policy
+   - App access (reviewer credentials for gated content)
+   - Ads declaration
+   - Content rating (IARC questionnaire)
+   - Target audience and content (declaring children as a target audience pulls in the Families policy)
+   - **Data safety** form
+   - Account deletion URL (if accounts can be created)
+   - Special declarations where relevant: financial features, health, government, news, foreground service types, exact alarm / full-screen intent use, photo and video permissions
+4. **Service account for automation**: create a service account in Google Cloud, create a JSON key, then invite the service account email in Play Console *Users and permissions* with release permissions for the app. Fastlane `supply` and EAS Submit use it.
+
+> [!IMPORTANT]
+> Google's Publishing API cannot create the very first release of a brand-new app. Upload the first AAB **manually** in Play Console (any track), then automate. EAS Submit documents the same limitation.
+
+### Testing tracks
+
+| Track | Audience | Review | Typical use |
+|---|---|---|---|
+| Internal testing | Up to 100 testers by email list | Minimal; available within minutes | Every CI build from `main`/release branch for the team |
+| Closed testing | Email lists or Google Groups (can have multiple closed tracks) | Reviewed | Beta group, client UAT, the mandatory 12-tester test for new personal accounts |
+| Open testing | Anyone can join from the store listing | Reviewed | Public beta, large-scale validation |
+| Production | Everyone in selected countries | Reviewed | Staged rollout to users |
+| Internal app sharing | Anyone with the link (allow-listed uploaders) | None | Quick one-off builds for QA, no version code rules |
+
+Builds are promoted between tracks rather than rebuilt — the same signed artifact that passed QA is what goes to production.
+
+**New personal accounts: the 12 testers / 14 days rule.** Personal developer accounts created after November 2023 must run a closed test with at least **12 testers who stay opted in for 14 consecutive days** before they can apply for production access, then answer questions about the test. Organisation accounts are exempt. Plan this into launch timelines; recruiting a dozen *engaged* testers is harder than it sounds.
+
+### Pre-launch report
+
+When you publish to a testing track, Play can run your app on a fleet of real devices (Firebase Test Lab under the hood) and produce a **pre-launch report**: crashes, ANRs, accessibility issues, security warnings, screenshots across devices, and performance. Provide test credentials in *Pre-launch report → Settings* or the robot gets stuck on your login screen. Treat new crashes there as release blockers.
+
+### Staged rollouts, halting, and review timing
+
+- **Staged rollout**: release to production at a percentage (e.g. 1% → 5% → 20% → 50% → 100%). Users are selected randomly; Play reports vitals for the new version so you can compare before widening.
+- **Halt**: *Release → Production → Halt rollout* stops new users from receiving the version. Users who already updated keep it. You can resume a halted rollout or supersede it with a new release (higher `versionCode`).
+- **No rollback**: you cannot "reinstate" the previous version for users who updated. Ship a fix as a new build.
+- **Managed publishing**: turn it on to control exactly when approved changes go live (useful for coordinated launches and to decouple review approval from release).
+- **Review timing**: updates usually clear review within hours to a couple of days; new apps, new accounts, and apps in sensitive categories (finance, health, kids) can take a week or more. Policy declarations (permissions, data safety changes) can add time.
+- **Country and device targeting**: you can restrict production by country and exclude device models (Device catalog) — useful for emergency mitigation of a device-specific crash.
+
+> [!TIP]
+> Android vitals "bad behaviour" thresholds affect store visibility: roughly **1.09% user-perceived crash rate** and **0.47% user-perceived ANR rate** overall (and 8% on any single device model). Watch these per version during a staged rollout, not just your crash reporter's numbers.
+
+## iOS release
+
+### Step 1 — Understand the signing objects
+
+iOS code signing answers three questions at install time: *who built this* (certificate), *what app is it and what may it do* (App ID + entitlements), and *where may it run* (provisioning profile).
+
+| Object | What it is | Where it lives | Notes |
+|---|---|---|---|
+| **Certificate** | Public cert issued by Apple for a key pair you generated | Private key in your Keychain (or a match repo); cert in the Developer portal | *Apple Development* for running on devices; *Apple Distribution* for TestFlight/App Store/ad hoc. Valid one year. Losing the private key means revoking and re-issuing. |
+| **App ID (Identifier)** | Your bundle ID registered with capabilities | Developer portal → Identifiers | Explicit IDs (`com.mycompany.myapp`) are required for push, Sign in with Apple, associated domains, App Groups, IAP. Each variant (dev/staging) is a separate App ID. |
+| **Device** | A registered UDID | Developer portal → Devices | Only for development and ad hoc profiles; limited to 100 devices per device family per membership year. |
+| **Provisioning profile** | Signed bundle of App ID + certificate(s) + (devices) + entitlements | `.mobileprovision` embedded in the app | *Development*, *Ad Hoc* (registered devices), *App Store* (TestFlight + App Store; no device list). Enterprise *In-House* requires the Enterprise program. |
+| **Entitlements** | The capabilities the binary claims | `ios/MyApp/MyApp.entitlements` | Must be a subset of what the profile grants — mismatches are the most common signing error. |
+| **APNs key / ASC API key** | `.p8` keys for push and App Store Connect automation | Developer portal → Keys / App Store Connect → Users and Access → Integrations | Not part of code signing, but managed alongside it. |
+
+```mermaid
+flowchart TD
+    Team["Apple Developer team<br/>(Team ID)"] --> Cert["Certificate<br/>Apple Development / Apple Distribution"]
+    Team --> AppID["App ID<br/>com.mycompany.myapp + capabilities"]
+    Team --> Devices["Registered devices<br/>(development and ad hoc only)"]
+    PK[("Private key<br/>Keychain or match repo")] --> Cert
+    Cert --> Profile["Provisioning profile<br/>Development / Ad Hoc / App Store"]
+    AppID --> Profile
+    Devices -.-> Profile
+    Ent["Entitlements file<br/>must match App ID capabilities"] --> Sign["codesign during archive/export"]
+    Profile --> Sign
+    Sign --> IPA["Signed .ipa with embedded profile"]
+    IPA --> ASC["App Store Connect<br/>Apple re-signs for distribution"]
+```
+*Figure: How certificates, identifiers, devices and profiles combine into a signed build.*
+
+> [!NOTE]
+> An expired or revoked **Apple Distribution** certificate does not affect apps already live on the App Store or installed from TestFlight — it only stops you signing new builds. (Enterprise in-house apps are the exception: revoking their certificate kills installed copies.) Push certificates are separate; prefer a token-based APNs `.p8` key, which never expires.
+
+### Step 2 — Automatic vs manual signing
+
+| | Automatic signing | Manual signing |
+|---|---|---|
+| How | Xcode creates/refreshes certs and profiles using your logged-in Apple account | You (or Fastlane match) create them; Xcode references specific profiles |
+| Good for | Solo devs, local development, small teams | CI, teams, multiple targets/extensions, reproducibility |
+| CI story | Possible with `xcodebuild -allowProvisioningUpdates` plus an App Store Connect API key | Standard — install certs/profiles into a temporary keychain, build with fixed settings |
+| Risk | Each developer can mint new distribution certs, hitting limits and creating chaos | More setup; profiles must be regenerated when capabilities change |
+
+A common, sane split: **automatic signing for the Debug configuration** (developers just press Run) and **manual signing with match-managed profiles for Release** (CI is the only producer of distribution builds). Remember that app extensions (notification service extension, widgets, share extensions) are separate targets with their own bundle IDs and profiles.
+
+### Step 3 — Prepare the Xcode project
+
+1. Open `ios/MyApp.xcworkspace` (not `.xcodeproj` — CocoaPods lives in the workspace).
+2. Target → *Signing & Capabilities*: set Team, bundle identifier per configuration, add capabilities (Push Notifications, Associated Domains, Sign in with Apple, Background Modes). Each capability updates `MyApp.entitlements` and must also be enabled on the App ID.
+3. Target → *General*: set Version (`MARKETING_VERSION`) and Build (`CURRENT_PROJECT_VERSION`), deployment target, supported destinations (disable iPad if you don't design for it — otherwise you need iPad screenshots and iPad-quality layouts).
+4. Add export compliance and privacy files:
+
+```xml title="ios/MyApp/Info.plist"
+<!-- Only standard HTTPS / OS-provided encryption -> exempt -->
+<key>ITSAppUsesNonExemptEncryption</key>
+<false/>
+```
+
+Confirm `ios/MyApp/PrivacyInfo.xcprivacy` exists (recent RN templates include one) and declares the required-reason APIs you and your pods use. Expo: set `ios.config.usesNonExemptEncryption` and `ios.privacyManifests` in `app.config.ts`.
+
+5. Make sure the *Bundle React Native code and images* build phase can find Node in CI and on machines using nvm/fnm/volta. Put the path in `ios/.xcode.env.local` (git-ignored) or rely on `ios/.xcode.env`:
+
+```bash title="ios/.xcode.env"
+export NODE_BINARY=$(command -v node)
+# Emit a source map for release builds so crashes can be symbolicated
+export SOURCEMAP_FILE="$DERIVED_FILE_DIR/main.jsbundle.map"
+```
+
+### Step 4 — Archive and upload with Xcode
+
+1. Select the *Any iOS Device (arm64)* destination and the production scheme.
+2. *Product → Archive*. Xcode builds with the scheme's Archive configuration (Release), bundles JS, and opens the **Organizer**.
+3. In Organizer: *Validate App* (catches many ITMS errors before upload), then *Distribute App → App Store Connect → Upload*.
+4. The build appears in App Store Connect → TestFlight after processing (typically 5–30 minutes). You'll get an email if processing fails.
+
+### Step 5 — Archive and upload from the command line
+
+This is what CI does, with or without Fastlane:
+
+```bash
+# 1. Archive
+xcodebuild -workspace ios/MyApp.xcworkspace \
+  -scheme MyApp -configuration Release \
+  -destination 'generic/platform=iOS' \
+  -archivePath build/MyApp.xcarchive \
+  MARKETING_VERSION=1.4.2 CURRENT_PROJECT_VERSION=10423 \
+  clean archive
+
+# 2. Export an .ipa (or upload directly, see destination below)
+xcodebuild -exportArchive \
+  -archivePath build/MyApp.xcarchive \
+  -exportOptionsPlist ios/ExportOptions.plist \
+  -exportPath build/ipa \
+  -authenticationKeyPath "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8" \
+  -authenticationKeyID "$ASC_KEY_ID" \
+  -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+```
+
+```xml title="ios/ExportOptions.plist"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- 'app-store-connect' in recent Xcode; older versions use 'app-store' -->
+  <key>method</key>
+  <string>app-store-connect</string>
+  <!-- 'upload' sends the build straight to App Store Connect; 'export' writes an .ipa -->
+  <key>destination</key>
+  <string>upload</string>
+  <key>teamID</key>
+  <string>ABCDE12345</string>
+  <key>signingStyle</key>
+  <string>manual</string>
+  <key>provisioningProfiles</key>
+  <dict>
+    <key>com.mycompany.myapp</key>
+    <string>match AppStore com.mycompany.myapp</string>
+    <key>com.mycompany.myapp.NotificationService</key>
+    <string>match AppStore com.mycompany.myapp.NotificationService</string>
+  </dict>
+  <key>uploadSymbols</key>
+  <true/>
+  <key>manageAppVersionAndBuildNumber</key>
+  <false/>
+</dict>
+</plist>
+```
+
+Set `manageAppVersionAndBuildNumber` to `false` so Xcode doesn't silently rewrite the build number you set in CI.
+
+### Upload options compared
+
+| Tool | How | Best for |
+|---|---|---|
+| Xcode Organizer | GUI, after Archive | Manual releases |
+| Transporter (Mac App Store app) | Drag an `.ipa` in, sign in | Uploading an IPA built elsewhere (e.g. downloaded from CI) |
+| `xcodebuild -exportArchive` with `destination=upload` | CLI with an App Store Connect API key | Scripted CI without Fastlane |
+| Fastlane `pilot` / `upload_to_testflight`, `deliver` | Ruby lanes, API key auth | Full automation incl. metadata, screenshots, submission |
+| EAS Submit | `eas submit -p ios` | Expo projects, or any IPA |
+| App Store Connect API | REST + JWT signed with a `.p8` key | Custom tooling (the above tools are built on it) |
+
+> [!TIP]
+> Use an **App Store Connect API key** (Users and Access → Integrations → App Store Connect API, role *App Manager*) for all automation. It avoids Apple ID passwords, 2FA prompts and app-specific passwords, and it can be revoked independently. Store the `.p8` content, Key ID and Issuer ID as CI secrets.
+
+## App Store Connect
+
+### App record and metadata
+
+1. *Apps → + → New App*: platform, name (must be unique on the store, 30 chars), primary language, bundle ID (must already exist as an App ID), SKU.
+2. **App Information**: category, content rights, age rating questionnaire, privacy policy URL.
+3. **App Privacy**: data types collected, linked to identity or not, used for tracking or not. Include SDKs.
+4. **Pricing and Availability**: price tier, countries/regions, EU trader status.
+5. **Version page**: screenshots, promotional text (editable without review), description, keywords (100 chars), support URL, marketing URL, "What's New", build selection, review notes and demo account, release option (manual, automatic, or scheduled) and phased release toggle.
+
+### TestFlight
+
+| | Internal testing | External testing |
+|---|---|---|
+| Who | Members of your App Store Connect team (up to **100**) | Anyone with an email invite or public link (up to **10,000**) |
+| Review | None — available as soon as processing finishes | First build of each version needs **TestFlight Beta App Review** (usually fast); later builds of the same version often skip it |
+| Groups | Internal groups, optionally auto-distribute every build | Multiple groups, public links with tester limits and criteria |
+| Build lifetime | 90 days | 90 days |
+
+Builds sit in "Missing Compliance" until export compliance is answered — which is why `ITSAppUsesNonExemptEncryption` belongs in `Info.plist`. Use "What to Test" notes per build and TestFlight feedback (screenshots + comments from testers) as part of QA.
+
+### Submission, review and release
+
+```mermaid
+stateDiagram-v2
+    state "Prepare for Submission" as Prepare
+    state "Waiting for Review" as Waiting
+    state "In Review" as InReview
+    state "Rejected" as Rejected
+    state "Pending Developer Release" as Pending
+    state "Ready for Distribution" as Ready
+    state "Phased release (7 days)" as Phased
+    [*] --> Prepare
+    Prepare --> Waiting : add build and submit
+    Waiting --> InReview : reviewer picks it up
+    InReview --> Rejected : guideline issue
+    Rejected --> Waiting : fix or reply, resubmit
+    InReview --> Pending : approved, manual release
+    InReview --> Ready : approved, automatic release
+    Pending --> Ready : release this version
+    Ready --> Phased : phased release enabled
+    Phased --> Ready : all users after day 7
+    Ready --> [*]
+```
+*Figure: App Store version states from submission to release.*
+
+- **Review time**: Apple states most submissions are reviewed within 24 hours; plan for 24–48 hours and longer around holidays and major iOS launches (September).
+- **Release options**: *Manually release* (recommended — you choose the moment, e.g. after the Android review too), *Automatically release*, or *automatically release no earlier than* a date.
+- **Phased release for automatic updates**: over **7 days** the version is offered via automatic updates to 1%, 2%, 5%, 10%, 20%, 50%, then 100% of users. You can **pause** (up to 30 days total) or release to everyone immediately. Anyone can still manually update from the App Store during a phased release, and new installs always get the latest version — so phased release reduces blast radius, it doesn't eliminate it.
+- **Expedited review**: request via *Contact Us → Request an Expedited App Review* for critical bug fixes or time-sensitive events. Granted at Apple's discretion; don't burn it on routine releases.
+- **Remove from sale / pull a version**: you can remove the app from sale, but you cannot revert users to an earlier build.
+
+### Common rejection reasons
+
+| Guideline | What triggers it | How to avoid |
+|---|---|---|
+| 2.1 App Completeness | Crashes or hangs during review, broken flows, missing demo account, features that need hardware/regions the reviewer can't reach | Test release builds on the latest iOS and oldest supported iOS; provide a working demo account and notes; explain special hardware or regional flows (video helps) |
+| 2.1 / 2.3 Placeholder content | "Lorem ipsum", test data, empty states, "coming soon" screens, screenshots that don't match the app | Seed realistic content for the reviewer account; screenshots must reflect the submitted build |
+| 1.5 / 2.1 Broken links | Support URL, privacy policy or in-app links 404 or require login | Monitor these URLs; keep them public |
+| 2.3 Accurate Metadata | Keywords stuffing, competitor names, mentioning other platforms, pricing not disclosed | Keep metadata factual and platform-specific |
+| 4.2 Minimum Functionality | Thin WebView wrappers, apps that are just a website or a single feature with little native value | Add genuine native value (offline, push, device integration) and a polished native UX |
+| 4.3 Spam | Many near-identical apps (white-label clones) | Consolidate into one app with configuration or use the proper multi-tenant approach |
+| 5.1.1 Data Collection | Missing or vague purpose strings (`NSCameraUsageDescription` "camera"), requiring login for non-account features, collecting data not needed | Write specific purpose strings that explain the user benefit; let users browse before forcing sign-up; match App Privacy labels |
+| 5.1.1(v) Account deletion | Account creation without in-app deletion (or deletion that only deactivates) | Add a discoverable in-app "Delete account" flow that actually deletes (or explains legal retention) |
+| 3.1.1 In-App Purchase | Selling digital content/subscriptions with Stripe/PayPal or linking out where not permitted | Use IAP for digital goods; follow current regional link-out rules (see [Payments](payments.html)) |
+| 4.8 Login Services | Offering Google/Facebook login without Sign in with Apple or an equivalent privacy-preserving option | Add Sign in with Apple (see [Authentication](authentication.html)) |
+| 2.5.1 / private APIs | A library calling non-public APIs | Keep dependencies current; check rejection text for the offending symbol |
+| 5.1.2 / ATT | Tracking (IDFA, cross-app fingerprinting) without the App Tracking Transparency prompt | Show ATT before tracking; declare tracking domains in the privacy manifest |
+
+**Responding in the Resolution Center.** Rejections arrive as a message on the submission in App Store Connect (App Review). Options:
+
+1. **Fix and resubmit** — the usual path. Reply briefly describing what you changed so the reviewer can verify quickly.
+2. **Reply with clarification** — if the reviewer misunderstood (e.g. couldn't find the account deletion flow), reply with exact steps, screenshots or a screen recording. Many rejections are resolved this way *without a new build*.
+3. **Metadata-only rejections** — fix the metadata and resubmit; no new binary needed.
+4. **Appeal** to the App Review Board if you believe the guideline was misapplied. Stay factual and cite the guideline.
+
+> [!TIP]
+> Write review notes as if the reviewer has 5 minutes and no context: demo credentials, how to reach gated features, why each sensitive permission is needed, and anything region- or hardware-specific. It pays for itself in avoided round-trips.
+
+## Automation with Fastlane
+
+[Fastlane](https://github.com/fastlane/fastlane) wraps `xcodebuild`, Gradle, and the App Store Connect / Google Play APIs in Ruby "lanes". The same lane runs on a laptop and in CI, which is its main value.
+
+### Setup
+
+```ruby title="Gemfile"
+source "https://rubygems.org"
+
+gem "fastlane"
+gem "cocoapods", ">= 1.13", "!= 1.15.0", "!= 1.15.1"
+```
+
+```bash
+bundle install
+bundle exec fastlane init      # creates fastlane/Appfile and fastlane/Fastfile
+```
+
+```ruby title="fastlane/Appfile"
+app_identifier("com.mycompany.myapp")   # iOS bundle ID
+team_id("ABCDE12345")                   # Apple Developer team
+package_name("com.mycompany.myapp")     # Android applicationId
+```
+
+### Code signing with match
+
+`match` stores **one shared set** of certificates and profiles, encrypted, in a private git repo (or S3/GCS). Every developer and CI machine pulls the same identity instead of minting their own.
+
+```ruby title="fastlane/Matchfile"
+git_url("git@github.com:mycompany/ios-signing.git")
+storage_mode("git")
+type("appstore")
+app_identifier([
+  "com.mycompany.myapp",
+  "com.mycompany.myapp.NotificationService"
+])
+team_id("ABCDE12345")
+```
+
+- Run `bundle exec fastlane match appstore` (and `match development`) **once** from an admin machine to create the certs/profiles.
+- Everywhere else, and always in CI, run with `readonly: true` so nothing new is created accidentally.
+- `MATCH_PASSWORD` decrypts the repo; in CI, `MATCH_GIT_BASIC_AUTHORIZATION` (base64 of `user:token`) or a deploy key gives access.
+- When you add a capability, run `match` with `force_for_new_devices`/`force` from the admin machine to regenerate profiles.
+
+### Fastfile
+
+```ruby title="fastlane/Fastfile"
+default_platform(:ios)
+
+IOS_WORKSPACE = "ios/MyApp.xcworkspace"
+
+def asc_api_key
+  app_store_connect_api_key(
+    key_id: ENV.fetch("ASC_KEY_ID"),
+    issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+    key_content: ENV.fetch("ASC_KEY_P8_BASE64"),
+    is_key_content_base64: true
+  )
+end
+
+def build_number
+  # One number for both platforms, provided by CI; fall back for local runs
+  ENV.fetch("BUILD_NUMBER") { Time.now.strftime("%y%m%d%H") }.to_i
+end
+
+platform :ios do
+  before_all do
+    setup_ci if is_ci   # temporary keychain so match can install certs non-interactively
+  end
+
+  desc "Build and upload a Release build to TestFlight"
+  lane :beta do
+    api_key = asc_api_key
+    match(type: "appstore", readonly: is_ci, api_key: api_key)
+    build_app(
+      workspace: IOS_WORKSPACE,
+      scheme: "MyApp",
+      configuration: "Release",
+      export_method: "app-store",
+      output_directory: "build/ios",
+      include_symbols: true,
+      # Override build settings instead of rewriting the project file
+      xcargs: "MARKETING_VERSION=#{ENV.fetch('APP_VERSION_NAME')} CURRENT_PROJECT_VERSION=#{build_number}",
+      export_options: { manageAppVersionAndBuildNumber: false }
+    )
+    upload_to_testflight(
+      api_key: api_key,
+      skip_waiting_for_build_processing: true,
+      changelog: ENV.fetch("RELEASE_NOTES", "Bug fixes and performance improvements")
+    )
+  end
+
+  desc "Submit an already-uploaded TestFlight build for App Store review"
+  lane :release do |options|
+    upload_to_app_store(
+      api_key: asc_api_key,
+      app_version: ENV.fetch("APP_VERSION_NAME"),
+      build_number: options.fetch(:build).to_s,
+      skip_binary_upload: true,
+      skip_screenshots: true,
+      submit_for_review: true,
+      automatic_release: false,
+      phased_release: true,
+      force: true,
+      precheck_include_in_app_purchases: false,
+      submission_information: { add_id_info_uses_idfa: false }
+    )
+  end
+end
+
+platform :android do
+  desc "Build a signed AAB and upload it to the internal track"
+  lane :internal do
+    gradle(
+      project_dir: "android",
+      task: "bundle",
+      flavor: "prod",
+      build_type: "Release",
+      properties: {
+        "APP_VERSION_CODE" => build_number,
+        "APP_VERSION_NAME" => ENV.fetch("APP_VERSION_NAME")
+      }
+    )
+    upload_to_play_store(
+      track: "internal",
+      aab: lane_context[SharedValues::GRADLE_AAB_OUTPUT_PATH],
+      json_key_data: ENV.fetch("PLAY_SERVICE_ACCOUNT_JSON"),
+      release_status: "completed",
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    )
+  end
+
+  desc "Promote a build from internal to production as a staged rollout"
+  lane :production do |options|
+    upload_to_play_store(
+      track: "internal",
+      track_promote_to: "production",
+      version_code: options.fetch(:version_code).to_i,
+      rollout: options.fetch(:rollout, "0.05").to_s,
+      release_status: "inProgress",
+      json_key_data: ENV.fetch("PLAY_SERVICE_ACCOUNT_JSON"),
+      skip_upload_aab: true,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    )
+  end
+
+  desc "Change the production rollout fraction, e.g. rollout:0.5, or halt with rollout:halt"
+  lane :rollout do |options|
+    halt = options[:rollout].to_s == "halt"
+    upload_to_play_store(
+      track: "production",
+      rollout: halt ? nil : options.fetch(:rollout).to_s,
+      release_status: halt ? "halted" : "inProgress",
+      json_key_data: ENV.fetch("PLAY_SERVICE_ACCOUNT_JSON"),
+      skip_upload_aab: true,
+      skip_upload_metadata: true,
+      skip_upload_changelogs: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    )
+  end
+end
+```
+
+Usage:
+
+```bash
+bundle exec fastlane ios beta
+bundle exec fastlane ios release build:10423
+bundle exec fastlane android internal
+bundle exec fastlane android production version_code:10423 rollout:0.05
+bundle exec fastlane android rollout rollout:0.5
+```
+
+`supply` (the tool behind `upload_to_play_store`) can also manage store listing text, changelogs (`fastlane/metadata/android/<locale>/changelogs/<versionCode>.txt`) and images from files in git; `deliver` does the same for App Store metadata and screenshots. Keeping store metadata in the repo makes it reviewable in PRs.
+
+## GitHub Actions
+
+### Secrets
+
+| Secret | Used for |
+|---|---|
+| `ANDROID_UPLOAD_KEYSTORE_BASE64` | `base64 -i myapp-upload.keystore` |
+| `ANDROID_UPLOAD_KEY_ALIAS`, `ANDROID_UPLOAD_STORE_PASSWORD`, `ANDROID_UPLOAD_KEY_PASSWORD` | Gradle signing config |
+| `PLAY_SERVICE_ACCOUNT_JSON` | Play Developer API (upload, promote) |
+| `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8_BASE64` | App Store Connect API key |
+| `MATCH_PASSWORD`, `MATCH_GIT_BASIC_AUTHORIZATION` | Decrypt and fetch the match repo |
+| `SENTRY_AUTH_TOKEN` | Upload source maps / dSYMs / mapping files |
+
+Put release secrets in a GitHub **Environment** (e.g. `production`) with required reviewers and branch/tag restrictions, so a PR from a fork or a random branch can't trigger a signed build.
+
+### Android workflow
+
+```yaml title=".github/workflows/android-release.yml"
+name: Android release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cache node_modules
+        id: node-cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install JS dependencies
+        if: steps.node-cache.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+
+      # Caches ~/.gradle (dependencies, wrapper, build cache) keyed on Gradle files
+      - uses: gradle/actions/setup-gradle@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Derive version
+        run: |
+          echo "APP_VERSION_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$((10000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+
+      - name: Decode upload keystore
+        run: echo "$KEYSTORE_B64" | base64 --decode > android/app/upload.keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+
+      - name: Build AAB and upload to internal track
+        run: bundle exec fastlane android internal
+        env:
+          ORG_GRADLE_PROJECT_MYAPP_UPLOAD_STORE_FILE: upload.keystore
+          ORG_GRADLE_PROJECT_MYAPP_UPLOAD_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_MYAPP_UPLOAD_STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_STORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_MYAPP_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-release-${{ env.BUILD_NUMBER }}
+          path: |
+            android/app/build/outputs/bundle/prodRelease/*.aab
+            android/app/build/outputs/mapping/prodRelease/mapping.txt
+          retention-days: 30
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f android/app/upload.keystore
+```
+
+### iOS workflow
+
+```yaml title=".github/workflows/ios-release.yml"
+name: iOS release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: ios-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ios:
+    # Pick a runner image that ships the Xcode version Apple currently requires for uploads
+    runs-on: macos-15
+    timeout-minutes: 75
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cache node_modules
+        id: node-cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install JS dependencies
+        if: steps.node-cache.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: pods-${{ runner.os }}-${{ hashFiles('ios/Podfile.lock') }}
+
+      - name: Install pods
+        working-directory: ios
+        run: bundle exec pod install
+
+      - name: Derive version
+        run: |
+          echo "APP_VERSION_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$((10000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+
+      - name: Build and upload to TestFlight
+        run: bundle exec fastlane ios beta
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-release-${{ env.BUILD_NUMBER }}
+          path: |
+            build/ios/*.ipa
+            build/ios/*.dSYM.zip
+          retention-days: 30
+```
+
+Notes on this setup:
+
+- Both workflows compute `BUILD_NUMBER` the same way, so a tag produces matching build numbers on both platforms.
+- macOS minutes are several times more expensive than Linux minutes: run lint, typecheck and Jest on `ubuntu-latest` in a separate PR workflow, and reserve macOS for the build.
+- Cache keys are content hashes of lockfiles; a lockfile change invalidates the cache. Don't cache `ios/build` or `DerivedData` for release builds — stale derived data causes heisenbugs and saves little.
+- If you drop Fastlane, replace the `fastlane ios beta` step with the `xcodebuild archive` / `-exportArchive` commands from the iOS section, after installing the certificate and profile into a temporary keychain.
+
+## EAS Build & EAS Submit
+
+For Expo projects (and bare projects that opt in), EAS replaces most of the above: it manages credentials, provides macOS/Linux workers with the right toolchains, versions builds, and submits to both stores.
+
+```json title="eas.json"
+{
+  "cli": {
+    "version": ">= 16.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "base": {
+      "node": "22.11.0"
+    },
+    "development": {
+      "extends": "base",
+      "developmentClient": true,
+      "distribution": "internal",
+      "channel": "development",
+      "env": { "APP_VARIANT": "development" }
+    },
+    "preview": {
+      "extends": "base",
+      "distribution": "internal",
+      "channel": "preview",
+      "env": { "APP_VARIANT": "preview" },
+      "android": { "buildType": "apk" }
+    },
+    "production": {
+      "extends": "base",
+      "channel": "production",
+      "autoIncrement": true,
+      "env": { "APP_VARIANT": "production" }
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "ascAppId": "6478123456",
+        "appleTeamId": "ABCDE12345"
+      },
+      "android": {
+        "serviceAccountKeyPath": "./secrets/play-service-account.json",
+        "track": "internal",
+        "releaseStatus": "completed"
+      }
+    }
+  }
+}
+```
+
+```bash
+npm install -g eas-cli
+eas login
+eas build:configure                                  # creates eas.json, links the project
+eas credentials                                      # inspect/generate keystore, certs, profiles, ASC API key
+eas build --platform all --profile production        # cloud builds, signed
+eas submit --platform ios --latest --profile production
+eas build --platform all --profile production --auto-submit   # build then submit in one go
+eas build --platform android --profile production --local     # same build on your own machine/CI runner
+```
+
+- `distribution: "internal"` produces ad hoc (iOS, registered devices via `eas device:create`) and APK (Android) builds you can install from a link — ideal for QA of preview builds.
+- The `channel` on each profile ties builds to EAS Update channels (see [OTA Updates](ota-updates.html)).
+- Secrets for the build go into **EAS environment variables** (`eas env:create`) with visibility levels, not into `eas.json`.
+- **EAS Workflows** (`.eas/workflows/*.yml`) can orchestrate build → submit → update on git events, or you can trigger EAS from GitHub Actions with `expo/expo-github-action` and an `EXPO_TOKEN` secret.
+
+### Other hosted CI options
+
+Bitrise (`bitrise.yml`, mobile step library, managed signing) and Codemagic (`codemagic.yaml`, automatic iOS signing via App Store Connect API keys, Apple Silicon machines) are the main mobile-first alternatives; both publish to the stores directly. **Firebase App Distribution** isn't CI but is a common way to push ad hoc IPAs and APKs of staging variants to testers outside TestFlight and Play tracks.
+
+## Branching & release trains
+
+Mobile releases can't be deployed continuously like a web app — every binary costs a review cycle and users update slowly. Most mature teams run a **release train**: a fixed cadence (weekly or bi-weekly) where whatever is on `main` and ready ships, and unfinished work waits behind feature flags.
+
+```mermaid
+flowchart TD
+    Main["main: always releasable<br/>unfinished work behind feature flags"] -->|"cut on schedule"| RB["release/1.5 branch"]
+    RB --> RC["RC builds 1.5.0 (10451, 10452, ...)<br/>TestFlight + Play internal"]
+    RC --> Stab{"Release blockers?"}
+    Stab -->|"yes: fix on main, cherry-pick"| RB
+    Stab -->|"no"| Tag["Tag v1.5.0<br/>submit to both stores"]
+    Tag --> Ship["Phased / staged rollout"]
+    Ship --> Bug{"Critical production bug?"}
+    Bug -->|"none"| NextTrain["Next train: release/1.6"]
+    Bug -->|"native fix needed"| HF["Hotfix on release/1.5<br/>tag v1.5.1, expedited review"]
+    Bug -->|"JS-only fix"| OTA["OTA update to runtime 1.5.x"]
+    HF --> Back["Cherry-pick fix back to main"]
+    OTA --> Back
+```
+*Figure: A release train with a stabilisation branch, hotfix path and OTA path.*
+
+Practical rules:
+
+- **Fix on `main` first, cherry-pick to the release branch** — never the other way round, or fixes get lost in the next train.
+- **Tag every submitted build** (`v1.5.0`, `v1.5.1`); the tag is what you branch hotfixes from and what OTA runtimes are keyed to.
+- **Freeze strings and assets** a few days before the cut if you have translations.
+- **Feature flags + remote config** decouple *deploy* from *release*: code ships dark in the binary and is enabled server-side, which also gives you an instant kill switch.
+- **Release captain rotation**: one person owns the train each cycle (monitoring, go/no-go, rollout percentages).
+
+## Post-release: monitoring, rollouts & hotfixes
+
+### What to watch during a rollout
+
+| Signal | Where | Typical gate before widening |
+|---|---|---|
+| Crash-free users / sessions for the new version | Crashlytics, Sentry release health | No regression vs previous version (e.g. crash-free users at or above 99.5 percent) |
+| User-perceived crash and ANR rate | Play Console → Android vitals | Below the bad-behaviour thresholds (about 1.09 / 0.47 percent) |
+| Crashes, hangs, launch time, terminations | Xcode Organizer, App Store Connect metrics, MetricKit | No new top crashers |
+| Top new issues | Crash reporter "new in this release" view | Each triaged with an owner |
+| Business KPIs | Analytics (login success, checkout conversion, API error rate by app version) | No drop vs control cohort |
+| Store ratings and reviews | Both consoles, review alerts | No spike of 1-star reviews mentioning the new version |
+
+A reasonable Android cadence is 1% → 5% → 20% → 50% → 100% over 3–7 days, widening only when metrics for each step have had enough sessions to be meaningful. iOS phased release follows Apple's fixed 7-day curve; your lever is pause/resume.
+
+### Halting and hotfixing
+
+```mermaid
+flowchart TD
+    Alert["Alert: crash-free users drop<br/>or ANR spike on the new version"] --> Scope{"Only the new version affected?"}
+    Scope -->|"no"| Backend["Likely backend or config issue<br/>fix server-side or flip a flag"]
+    Scope -->|"yes"| Halt["Halt Play rollout<br/>pause iOS phased release"]
+    Halt --> Flag{"Behind a feature flag?"}
+    Flag -->|"yes"| Kill["Disable the flag remotely"]
+    Flag -->|"no"| JSOnly{"Root cause in JS or assets only?"}
+    JSOnly -->|"yes"| OTA["Ship OTA to that runtime<br/>staged, watch by update ID"]
+    JSOnly -->|"no"| Binary["Hotfix binary x.y.z+1<br/>request expedited review"]
+    Kill --> Verify["Verify metrics recover"]
+    OTA --> Verify
+    Binary --> Verify
+    Backend --> Verify
+    Verify --> PM["Post-mortem: add test, alert or flag"]
+```
+*Figure: Incident response for a bad release. Halting first limits blast radius while you pick the fastest safe fix.*
+
+Hotfix process, concretely:
+
+1. **Halt/pause** the rollout immediately — it's reversible and costs nothing.
+2. **Communicate**: incident channel, support team macro, status page if user-visible.
+3. **Pick the lever**: feature flag (seconds) → server-side fix (minutes) → OTA update (minutes to hours, JS only) → hotfix binary (hours to days).
+4. For a binary hotfix: branch from the release tag, apply the minimal fix (already merged to `main`), bump the patch version and build number, run the same pipeline, and submit with an **expedited review** request on iOS. On Android, release the hotfix to the same percentage the broken version reached, then widen quickly — it supersedes the halted release.
+5. **Verify** with the same metrics, then write a blameless post-mortem that adds the missing test, alert or flag.
+
+### OTA vs binary
+
+An OTA update can fix JS logic, styles, copy and bundled images within minutes and without review, **as long as the fix doesn't need native changes** (new native module, native dependency upgrade, permission, `Info.plist`/manifest change, icon, SDK bump). OTA updates must target the exact native runtime they are compatible with. Details, tooling and policy limits are in the [OTA Updates guide](ota-updates.html).
+
+### Source maps, dSYMs and mapping files
+
+Crash reports are useless if you can't symbolicate them. Every release pipeline should upload, **per build**:
+
+| Artifact | Platform | Produced by | Upload |
+|---|---|---|---|
+| JS source map (Hermes-composed) | Both | RN Gradle plugin / Xcode bundle phase (`SOURCEMAP_FILE`) | Sentry Gradle plugin / Xcode build phase, or `sentry-cli sourcemaps upload`; Crashlytics does not symbolicate JS |
+| dSYM | iOS | Release builds with `DEBUG_INFORMATION_FORMAT = dwarf-with-dsym` | Crashlytics run script / `upload-symbols`, `sentry-cli debug-files upload`, and App Store Connect (`uploadSymbols`) |
+| R8 `mapping.txt` | Android | R8 in release builds | Embedded in AAB for Play Console; Crashlytics Gradle plugin; Sentry Gradle plugin |
+| Native debug symbols | Android | `android.defaultConfig.ndk.debugSymbolLevel "SYMBOL_TABLE"` or `"FULL"` | Embedded in AAB for Play Console; Crashlytics/Sentry |
+
+Tag every event with release (`com.mycompany.myapp@1.4.2+10423`), dist (build number) and, if you use OTA, the update ID. See [Monitoring, Crash Reporting & Analytics](monitoring.html) for setup.
+
+## Edge cases & gotchas
+
+- **Release builds behave differently.** No Metro, no dev warnings, Hermes bytecode, R8, `__DEV__ === false`, different signing (so different key hashes for Google Sign-In/Firebase). Build and smoke-test a release variant locally before every release.
+- **Bundle ID and applicationId are forever.** Changing them creates a new app with no reviews, no users and no update path. Pick carefully; use suffixes for variants.
+- **iOS marketing version must increase after approval.** Once 1.4.2 is approved, the next submission needs 1.4.3+; builds for an unreleased version can reuse the marketing version with higher build numbers.
+- **App extensions need their own everything.** Notification service extensions, widgets and share extensions each have a bundle ID, App ID, profile, and must share the parent's version and build numbers — mismatches produce upload warnings or errors.
+- **Xcode upgrades on CI.** Runner images update Xcode; pin a version (`setup-xcode`) and upgrade deliberately, especially around September.
+- **Apple Silicon vs Intel differences** in CocoaPods/Ruby environments. Use Bundler (`bundle exec pod install`) so everyone uses the same CocoaPods version.
+- **Expo CNG.** Don't hand-edit `ios/`/`android/` in a CNG project — `prebuild --clean` wipes it. Put native changes in config plugins.
+- **TestFlight builds expire after 90 days.** Long-running betas need periodic fresh builds.
+- **Store metadata is part of the release.** Screenshots showing features behind a disabled flag, or "What's New" text promising unreleased features, can trigger rejections.
+
+## Testing & debugging
+
+```bash
+# Android: inspect what's inside an AAB / APK
+bundletool dump manifest --bundle=app-prod-release.aab
+aapt2 dump badging app-release.apk | head -5          # package, versionCode, versionName, sdk levels
+apksigner verify --print-certs app-release.apk          # which key signed it
+adb logcat '*:E' ReactNativeJS:V                        # release-build JS errors and native crashes
+
+# iOS: inspect a signed app
+unzip -q build/ipa/MyApp.ipa -d /tmp/ipa
+codesign -dv --verbose=4 /tmp/ipa/Payload/MyApp.app
+codesign -d --entitlements :- /tmp/ipa/Payload/MyApp.app
+security cms -D -i /tmp/ipa/Payload/MyApp.app/embedded.mobileprovision   # profile contents
+security find-identity -v -p codesigning                                  # signing identities in keychain
+xcrun simctl install booted build/Release-iphonesimulator/MyApp.app       # simulator release build smoke test
+```
+
+- Run the app from Xcode with the **Release** configuration (Edit Scheme → Run → Build Configuration) to reproduce release-only bugs with a debugger attached.
+- Use Play's pre-launch report and TestFlight on a range of real devices, including the oldest supported OS versions.
+- Validate in Xcode Organizer before uploading to catch ITMS errors early.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Xcode: "No signing certificate 'iOS Distribution' found" / "No profiles for 'com.x.y' were found" | Distribution cert/private key not in keychain, or profile missing | Run `match appstore --readonly`; or enable automatic signing with `-allowProvisioningUpdates` and an ASC API key |
+| "Provisioning profile doesn't include the aps-environment entitlement" (or associated domains) | Capability added in Xcode but not on the App ID/profile | Enable the capability on the App ID, regenerate profiles (`match --force`), re-download |
+| "Provisioning profile doesn't include signing certificate" | Profile was generated with a different/revoked cert | Regenerate the profile against the current Apple Distribution cert |
+| ITMS-90189 Redundant Binary Upload | Build number already used for this version | Increment `CURRENT_PROJECT_VERSION`; make CI own build numbers |
+| ITMS-90062 version must be higher | `CFBundleShortVersionString` not greater than the last approved version | Bump `MARKETING_VERSION` |
+| ITMS-90683 Missing purpose string | A linked SDK references a privacy-sensitive API without a usage description | Add the `NS...UsageDescription` key with a real explanation, even if the feature is rarely used |
+| ITMS-91053 Missing API declaration | Required-reason API used without declaration in a privacy manifest | Update `PrivacyInfo.xcprivacy`; update SDKs that ship their own manifests |
+| Upload rejected for SDK version | Built with an Xcode/SDK older than Apple's current minimum | Upgrade Xcode on CI (and RN if needed) |
+| ITMS-90717 Invalid App Store icon | 1024 icon has an alpha channel | Export the icon without transparency |
+| TestFlight shows "Missing Compliance" | Export compliance not declared | Add `ITSAppUsesNonExemptEncryption` to `Info.plist` (`usesNonExemptEncryption` in Expo) |
+| Xcode "PhaseScriptExecution failed" in *Bundle React Native code and images* | Node not found (nvm/volta), or a JS bundling error | Set `NODE_BINARY` in `ios/.xcode.env.local`; run `npx react-native bundle` locally to see the real error |
+| Play: "Version code X has already been used" | `versionCode` reused (any track, ever) | Increment; derive from CI; check `google_play_track_version_codes` |
+| Play: "You uploaded an APK or Android App Bundle that was signed in debug mode" | Release build using the debug signing config | Configure `signingConfigs.release` and verify with `keytool -printcert -jarfile` |
+| Play: "signed with the wrong key" | AAB signed with a key other than the registered upload key | Use the correct keystore; if lost, request an upload key reset |
+| Play: target API level error on upload | `targetSdkVersion` below the current Play requirement | Raise `targetSdkVersion`/`compileSdkVersion`, test behaviour changes |
+| Play: "does not support 16 KB memory page sizes" | Native `.so` files not 16 KB aligned (often a third-party SDK) | Upgrade RN (0.77+), AGP 8.5.1+, NDK r28+; update or replace libraries with prebuilt `.so`; verify with `zipalign -c -P 16` |
+| Release APK crashes on launch, debug works | R8 removed reflected classes, or JS bundle not embedded | Check logcat for `ClassNotFoundException` and add keep rules; check `debuggableVariants` with flavors |
+| "Unable to load script" in a release build | Variant treated as debuggable so no bundle was embedded | Fix `debuggableVariants`; confirm `index.android.bundle` exists in the APK assets |
+| Pod install errors for new configurations | CocoaPods doesn't know `Debug-Staging` etc. | Map configurations in the `Podfile` `project` line; include the Pods xcconfig in custom xcconfigs |
+| Google Sign-In / App Links fail only in the Play build | SHA-256 of the Play app signing key not registered | Add the app signing key fingerprint from Play Console to Firebase/Google Cloud and `assetlinks.json` |
+| Gradle daemon killed / OOM on CI | Default JVM heap too small | Set `org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g` in `android/gradle.properties` |
+
+## Production checklist
+
+- [ ] Developer accounts active; organisation D-U-N-S and Play identity verification complete; account access shared with at least two admins
+- [ ] Bundle ID / applicationId final; variants use suffixes and separate backend/Firebase/Sentry projects
+- [ ] Upload keystore and passwords stored in a secret manager with backup; nothing signing-related in git
+- [ ] Play App Signing enabled; app signing key SHA-256 registered with Firebase, Google Sign-In, Maps and `assetlinks.json`
+- [ ] iOS certificates/profiles managed centrally (match or EAS credentials); capabilities match entitlements for app and extensions
+- [ ] Marketing version and build numbers come from CI; one build number shared by both platforms
+- [ ] `targetSdkVersion` meets the current Play requirement; 16 KB alignment verified
+- [ ] Built with the Xcode/SDK version Apple currently requires
+- [ ] R8 enabled with tested keep rules; release build smoke-tested on real devices
+- [ ] `ITSAppUsesNonExemptEncryption`, privacy manifest, purpose strings, App Privacy labels and Play Data safety form are accurate, including SDKs
+- [ ] In-app account deletion implemented; privacy policy and support URLs live
+- [ ] Reviewer demo account and review notes prepared; content rating / age rating questionnaires answered
+- [ ] Store listings, screenshots (6.9" iPhone, iPad if supported, Play phone) and icons (1024 no-alpha, 512 Play) uploaded
+- [ ] CI builds signed artifacts from tags only, with secrets in protected environments
+- [ ] Source maps, dSYMs, R8 mapping and native symbols uploaded per build
+- [ ] Staged rollout plan and gates agreed; alerting on crash-free rate and ANR rate per version
+- [ ] Hotfix runbook written: who halts, how to OTA, how to request expedited review
+- [ ] Feature flags / kill switches for risky features in this release
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [React Native — Publishing to Google Play](https://reactnative.dev/docs/signed-apk-android)
+- [React Native — Publishing to the App Store](https://reactnative.dev/docs/publishing-to-app-store)
+- [Android — Sign your app (Play App Signing)](https://developer.android.com/studio/publish/app-signing)
+- [App Store Connect Help](https://developer.apple.com/help/app-store-connect/)
+- [fastlane docs](https://docs.fastlane.tools/)
+- [EAS Build](https://docs.expo.dev/build/introduction/)
+- [Google Play — Target API level requirements](https://support.google.com/googleplay/android-developer/answer/11926878)
+
+## Interview questions
+
+### What is Play App Signing, and what happens if you lose your upload key?
+
+**Short answer:** Play App Signing splits Android signing into an **app signing key** held by Google, which signs what users install, and an **upload key** you hold, which only authenticates your uploads. Losing the upload key is recoverable: an account owner requests an upload key reset in Play Console and registers a new certificate.
+
+Before Play App Signing, the key you signed with *was* the app's identity — lose it and you could never update the app. Now Google re-signs the device-specific APKs it generates from your AAB. Consequences worth mentioning: production SHA-256 fingerprints for Firebase, Google Sign-In and `assetlinks.json` must come from the **app signing key** in Play Console, not your upload keystore; and the upload key should still be treated as a secret (stored in a secret manager, injected into CI via `ORG_GRADLE_PROJECT_*` variables, never committed).
+
+> [!INTERVIEW]
+> Strong answers mention the fingerprint gotcha and how the keystore gets into CI. Red flag: "we keep the keystore in the repo so CI can use it."
+
+### Walk me through iOS code signing. Why does a build that signs fine on your Mac fail in CI?
+
+**Short answer:** A signed iOS app needs a **certificate** (private key proving team identity), an **App ID** with capabilities, and a **provisioning profile** tying them together (plus devices for dev/ad hoc). CI fails because it doesn't have the private key or profile, or because automatic signing needs an interactive Apple ID.
+
+Locally, Xcode's automatic signing quietly created a development certificate in your keychain and fetched profiles. In CI there's no keychain entry and no logged-in account. The fix is a shared, reproducible identity: Fastlane `match` (encrypted certs/profiles in a repo, `readonly` in CI, `setup_ci` for a temp keychain) or EAS credentials, and an **App Store Connect API key** instead of Apple ID auth. Also check entitlements vs profile capabilities — adding push or associated domains without regenerating profiles is the other classic failure — and remember each app extension needs its own profile.
+
+### How do you manage version numbers and build numbers across platforms and CI?
+
+**Short answer:** Keep the marketing version (`versionName` / `MARKETING_VERSION`) human-controlled per release, and make the build number (`versionCode` / `CURRENT_PROJECT_VERSION`) a CI-generated, strictly increasing integer shared by both platforms.
+
+Details: `versionCode` must be unique forever across all Play tracks; iOS build numbers must be unique per marketing version and the marketing version must exceed the last approved one. Inject values at build time (`-PAPP_VERSION_CODE=...`, `xcodebuild ... CURRENT_PROJECT_VERSION=...`) rather than committing bumps, which cause merge conflicts on release branches. Options for the number itself: CI run number plus an offset, querying the store for the latest and adding one, or EAS remote versioning with `autoIncrement`. Sharing one number means a crash report's "1.4.2 (10423)" maps to one commit and one pipeline run.
+
+### How would you set up dev, staging and production variants of an RN app?
+
+**Short answer:** Separate bundle IDs/application IDs per environment so they install side by side, with distinct names, icons, backends and Firebase/Sentry projects — Android product flavors, iOS build configurations + schemes + xcconfig, and `app.config.ts` driven by `APP_VARIANT` in Expo.
+
+On Android, flavors with `applicationIdSuffix`, source-set overrides for `strings.xml`, icons and `google-services.json`, and `debuggableVariants` updated in the `react {}` block. On iOS, duplicated configurations (`Release-Staging`), xcconfig files setting `PRODUCT_BUNDLE_IDENTIFIER`, display name and icon set, shared schemes, and the Podfile `project` mapping so Pods know which configurations are debug. JS reads config through react-native-config or Expo `extra`/`EXPO_PUBLIC_*`. Stress that these values ship in the binary and are not secrets.
+
+### Design a CI/CD pipeline for a React Native app.
+
+**Short answer:** PR checks on Linux (lint, typecheck, unit tests); on merge, build internal builds for both platforms; on a release tag, build signed AAB/IPA with CI-owned version numbers, upload to Play internal and TestFlight, promote the *same* artifacts to production with staged rollouts, and upload symbols for every build.
+
+Talking points: secrets in protected CI environments restricted to tags; Fastlane lanes or EAS profiles as the single way to build; caching (Gradle, CocoaPods keyed on `Podfile.lock`, node_modules keyed on the lockfile); macOS minutes are expensive, so only build there; artifact retention; OTA channel wiring for JS-only fixes; release trains with feature flags; automated rollout gates based on crash-free rate. Mention the one-time manual steps: first Play upload, closed testing for new personal accounts, App Store record creation.
+
+> [!INTERVIEW]
+> Senior signal: talking about *promotion* of a single tested artifact rather than rebuilding per environment, and about how the pipeline supports a fast hotfix. Likely follow-up: "How long from merge to a fix in users' hands?"
+
+### Your new version reaches 10 percent of Android users and the crash rate triples. What do you do?
+
+**Short answer:** Halt the staged rollout immediately, confirm the crashes are specific to the new version, then use the fastest safe lever — kill the feature flag, fix server-side, ship an OTA if the cause is JS-only, or ship a hotfix binary with a higher `versionCode` (and expedited review on iOS if affected).
+
+Halting stops new users getting the build but doesn't revert the 10 percent who have it — there's no rollback on either store — so the fix must reach them too. Check whether the crash is device- or OS-specific (Play lets you exclude device models), look at symbolicated stack traces (source maps, mapping files), and pause the iOS phased release in parallel if the same code shipped there. Afterwards: post-mortem, a test or alert that would have caught it, and possibly tighter rollout gates.
+
+### What's the difference between Android staged rollouts and iOS phased releases?
+
+**Short answer:** Android staged rollouts use any percentage you choose, can be halted, resumed and changed at will, and apply to all users receiving the update. iOS phased release follows a fixed 7-day schedule (1, 2, 5, 10, 20, 50, 100 percent) that only affects **automatic updates** — users can still update manually and new installs get the new version — and you can only pause (up to 30 days) or release to everyone.
+
+So iOS gives you less control over blast radius; compensate with feature flags, longer TestFlight external testing and OTA readiness. Neither platform supports rolling back a binary.
+
+### What are the most common App Store rejections and how do you prevent them?
+
+**Short answer:** Crashes and incomplete flows during review (2.1), missing demo credentials, thin WebView apps (4.2), privacy problems such as vague purpose strings or missing account deletion (5.1.1), selling digital goods outside IAP (3.1.1), and third-party login without Sign in with Apple or an equivalent (4.8).
+
+Prevention is procedural: test the exact release build on current and oldest supported iOS, give reviewers a working account and clear notes, write specific purpose strings, keep App Privacy labels and privacy manifests accurate for all SDKs, and follow the current regional IAP/link-out rules. When rejected, read the cited guideline, reply in the Resolution Center with clarification or screenshots when the reviewer missed something (often no new build is needed), and appeal only when the guideline is genuinely misapplied.
+
+### How do you keep secrets safe in the build pipeline and in the app?
+
+**Short answer:** Signing material and API credentials live only in a secret manager and CI secrets scoped to protected environments; they're injected at build time and never committed. Anything bundled into the app — `.env`, `BuildConfig`, `Info.plist`, JS — is public, so real secrets stay on the server.
+
+Specifics: base64 keystore decoded at build time and deleted afterwards, `ORG_GRADLE_PROJECT_*` for Gradle passwords, match repo encrypted with `MATCH_PASSWORD`, App Store Connect API keys with least-privilege roles, Play service account limited to release permissions, EAS environment variables with secret visibility, required reviewers on production deployments, and no signed builds from fork PRs. In the app, use short-lived tokens from your backend instead of embedded keys, and restrict public keys (Maps, etc.) by package name/bundle ID and signing fingerprint. See [Security](security.html).
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

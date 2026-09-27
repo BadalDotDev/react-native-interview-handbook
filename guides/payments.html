@@ -1,0 +1,1673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Payments &amp; In-App Purchases · React Native Interview Handbook</title>
+<meta name="description" content="How to take money in a React Native app without getting rejected, defrauded or double-charging: deciding between a payment gateway and store billing, building Stripe…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Payments &amp; In-App Purchases · React Native Interview Handbook">
+<meta property="og:description" content="How to take money in a React Native app without getting rejected, defrauded or double-charging: deciding between a payment gateway and store billing, building Stripe…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/payments.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Payments & In-App Purchases
+
+How to take money in a React Native app without getting rejected, defrauded or double-charging: deciding between a payment gateway and store billing, building Stripe PaymentSheet (plus Apple Pay, Google Pay and Razorpay) the PCI-safe way, and implementing StoreKit / Google Play Billing purchases and subscriptions with server-side verification, store notifications and one entitlement model across iOS, Android and web.
+
+## How it works
+
+Every payments integration has three parties, and a senior engineer keeps their responsibilities strictly separated:
+
+| Party | Trusted? | Responsibilities |
+|---|---|---|
+| **The app** | No: it runs on a device the user controls, and its JS bundle can be patched, replayed or OTA-updated | Shows prices and paywalls, collects intent, hands sensitive input to a provider SDK, displays results |
+| **Your backend** | Yes | Computes amounts, creates payment sessions, verifies store transactions, owns order and entitlement state |
+| **The provider** (Stripe, Razorpay, Apple, Google) | Yes | Moves money, runs authentication (3DS, Face ID), sends **signed** webhooks / server notifications |
+
+The one rule that underlies everything else in this guide: **a success callback in the app is a UX hint; a verified server-side event from the provider is the fact.** Fulfillment, entitlement grants and refunds are all driven by the backend.
+
+### The first decision: what are you selling?
+
+This is a policy decision before it is a technical one. Apple (App Store Review Guideline 3.1.1) and Google (Play Payments policy) require their own billing systems for **digital goods and services consumed in the app**. Just as firmly, physical goods and real-world services **must not** use IAP (Apple 3.1.3(e)). Putting a pizza order through StoreKit gets rejected just as surely as unlocking premium filters with Stripe does.
+
+```mermaid
+flowchart TD
+    Start(["What does the user pay for?"]) --> Q1{"Consumed outside the app?<br/>goods, rides, food, bookings, tickets"}
+    Q1 -->|"yes"| GW["Payment gateway<br/>Stripe, Braintree, Adyen, Razorpay<br/>plus Apple Pay / Google Pay"]
+    Q1 -->|"no, digital content,<br/>features, subscriptions"| Q2{"Does an exception apply?"}
+    Q2 -->|"real-time one-to-one<br/>person service"| GW
+    Q2 -->|"enterprise seats sold<br/>to organisations"| B2B["Sell outside the app<br/>no purchase UI in app"]
+    Q2 -->|"reader app"| Reader["IAP optional, may link to web<br/>account management via entitlement"]
+    Q2 -->|"none"| Q3{"Does the storefront allow<br/>alternatives? US, EU, JP, KR"}
+    Q3 -->|"no"| IAP["Apple IAP and<br/>Google Play Billing"]
+    Q3 -->|"yes"| Mixed["IAP plus optional external link<br/>or alternative billing, under<br/>that region's terms and fees"]
+```
+*Figure: Choosing the payment mechanism. Get this decision right before you write any code.*
+
+| What you sell | Examples | Mechanism | Platform fee |
+|---|---|---|---|
+| Physical goods | E-commerce, groceries, merch | Gateway + Apple Pay / Google Pay | None (you pay gateway processing fees) |
+| Real-world services | Rides, food delivery, hotel and flight bookings, event tickets | Gateway | None |
+| Digital content or features used in the app | Premium features, coins, lives, courses, ad removal | Apple IAP / Google Play Billing | 15–30% (15% for small-business programs and for subscriptions after year one on Apple; check the current programs) |
+| Subscriptions to a digital service | Streaming, premium tier of a SaaS product | IAP (with the exceptions below) | 15–30% |
+| Real-time one-to-one services | Tutoring, telehealth consults, personal training sessions | Gateway allowed (Apple 3.1.3(d)) | None |
+| Enterprise / B2B | Seat licences sold to companies or schools | Sold outside the app (Apple 3.1.3(c)) | None |
+| Charitable donations | Registered nonprofits | Apple Pay for approved nonprofits, otherwise out-of-app | None |
+
+### Exceptions worth knowing
+
+Apple's guideline 3.1.3 lists the cases where you may use something other than IAP. Know these by name, because interviewers love them:
+
+- **Reader apps (3.1.3(a))**: apps whose main function is content purchased elsewhere (magazines, newspapers, books, audio, music, video) need not offer IAP, and can apply for the **External Link Account Entitlement** to link out to a website for account creation and management.
+- **Multiplatform services (3.1.3(b))**: users may access content or subscriptions they bought on your website or another platform, **as long as those items are also available as IAP in the app**. This is the "sign in to your existing account" pattern.
+- **Enterprise services (3.1.3(c))**: apps sold directly to organisations for their employees or students.
+- **Person-to-person services (3.1.3(d))**: real-time services between two individuals. One-to-few and one-to-many (group classes, pre-recorded courses) must use IAP.
+- **Goods and services outside the app (3.1.3(e))**: must use non-IAP methods.
+- **Free stand-alone apps (3.1.3(f))** that companion a paid web tool (email, cloud storage, VoIP), provided they contain no purchasing or calls to action inside the app.
+
+Google's Payments policy has the same broad split: Play Billing applies to digital goods and services, while physical goods, real-world services and certain other categories are exempt.
+
+> [!NOTE]
+> Guideline numbering is occasionally reshuffled. Quote the principle ("digital goods consumed in-app use IAP") rather than relying on a section number from memory.
+
+### Regional rules are a moving target
+
+Anti-steering rules (whether you may tell users about cheaper web prices, link out, or use a third-party processor for digital goods) now differ by storefront:
+
+| Storefront | Apple | Google Play |
+|---|---|---|
+| **United States** | After the **April 30, 2025** contempt ruling in *Epic v. Apple*, Apple updated its guidelines so US-storefront apps may include buttons, external links and other calls to action to web purchases. In December 2025 the Ninth Circuit upheld the contempt finding but said Apple may charge a commission that is not prohibitive, and litigation continued into 2026. Expect terms (and possibly a fee on linked purchases) to keep evolving. | Following the *Epic v. Google* injunction (in effect from late 2025), Google allows US developers to link out and to offer alternative billing, with program details and fees still evolving. |
+| **European Union (DMA)** | Alternative payment service providers in the app and link-outs are allowed under Apple's EU terms and entitlements, with their own fee structure. | Alternative billing and external offers programs for EEA users, with a reduced service fee. |
+| **Japan** | The Mobile Software Competition Act (in force from December 2025) requires alternative payments and link-outs, and Apple published Japan-specific terms. | The same law applies to Google. |
+| **South Korea** | StoreKit External Purchase Entitlement (South Korea) allows alternative PSPs at a reduced commission. | Alternative billing is available, as required by Korean law. |
+| **Everywhere else** | IAP is required for digital goods, apart from the worldwide reader-app link entitlement. | Play Billing is required, with user choice billing available in some countries. |
+
+> [!CAUTION] Verify current guidelines for your storefronts
+> This is the fastest-changing area in mobile. Before you design a paywall or a link-out, read the current **App Store Review Guidelines §3.1**, the relevant StoreKit External Purchase / alternative payment entitlement pages, and the **Google Play Payments policy** (including the alternative billing / external offers programs) for **every storefront you ship to**. Entitlements often need an application, a separate binary configuration, specific disclosure sheets and their own reporting. Unverified legal assumptions are expensive: they cost you rejections, back-payments of commission or removal from the store.
+
+> [!TIP] A pragmatic architecture
+> Implement IAP for digital goods, because it works in every storefront. Add web checkout (Stripe) as an **optional, storefront-gated** path, and unify entitlements on the backend. Decide eligibility from the **store storefront country** (StoreKit `Storefront.current`, the Play Billing `BillingConfig` country code), not from device locale or IP. The server should decide which purchase options a given user sees, so you can react to rule changes without an app release.
+
+> [!INTERVIEW]
+> A senior answer starts with "What are we selling, and in which storefronts?" before naming any library. Red flag: "we'll use Stripe for the premium subscription to avoid Apple's 30%" with no mention of guideline 3.1.1 or regional entitlements. Likely follow-ups: reader-app rules, what changed in the US in 2025, and how you'd make payment options configurable server-side.
+
+## Part A — Payment gateways: how it works
+
+Part A covers **physical goods and real-world services**. Stripe is the primary example; the same architecture applies to Braintree, Adyen, Razorpay and others.
+
+### Architecture and PCI scope
+
+PCI DSS applies to anyone who stores, processes or transmits cardholder data. The cheapest way to comply is to **never touch raw card data at all**. The provider's SDK collects the card number in its own native UI, sends it straight to the provider over TLS, and hands you back only tokens and IDs. Your app and servers never see a PAN, which keeps you in the lightest self-assessment scope (typically SAQ A; Stripe pre-fills it for eligible integrations).
+
+The rules that follow from this:
+
+1. **Never build your own card `TextInput`** that sends card numbers to your backend. Use PaymentSheet, CardField or the provider's hosted UI.
+2. **The publishable key (`pk_…`) lives in the app; the secret key (`sk_…`) never leaves the server.** On the server, prefer restricted keys (`rk_…`) scoped to the endpoints you actually call.
+3. **The server computes amounts.** The client sends cart or product IDs and quantities, never prices or totals. A jailbroken device or a proxy such as mitmproxy can rewrite any request.
+4. **Fulfill only from webhooks** (or from a server-side retrieval of the PaymentIntent), never because the client said "payment succeeded".
+5. **Log IDs, not data.** Log `pi_…`, `cus_…` and order IDs. Never log card data, `client_secret`s, full addresses or other PII.
+
+```mermaid
+flowchart TD
+    subgraph device["Device (untrusted)"]
+        UI["Checkout screen"] --> SDK["Stripe SDK<br/>PaymentSheet UI"]
+    end
+    subgraph backend["Your backend (trusted)"]
+        API["Checkout API<br/>prices and totals"] --> DB[("Orders DB")]
+        WH["Webhook handler<br/>signature check"] --> DB
+    end
+    subgraph provider["Stripe (PCI Level 1)"]
+        PI["PaymentIntents API"]
+        Vault["Card vault and 3DS"]
+    end
+    UI -->|"cart id only"| API
+    API -->|"create PaymentIntent<br/>with secret key"| PI
+    PI -->|"client_secret"| API
+    SDK -->|"card data goes<br/>directly to Stripe"| Vault
+    PI -.->|"signed webhook events"| WH
+```
+*Figure: Trust boundaries. Card data flows device → Stripe only, and money decisions stay on your server.*
+
+### The PaymentSheet flow end to end
+
+1. The user taps **Checkout**. The app calls your backend with the cart ID and an **idempotency key**.
+2. The backend loads the cart from its DB, **recomputes the total**, creates or reuses a Stripe **Customer**, an **Ephemeral Key** (so PaymentSheet can list and save that customer's cards) and a **PaymentIntent**, then returns the PaymentIntent's `client_secret`. Newer Stripe integrations can use a **CustomerSession** client secret instead of an ephemeral key; check which your SDK version supports.
+3. The app calls `initPaymentSheet(...)` and then `presentPaymentSheet()`.
+4. The SDK confirms the PaymentIntent with Stripe. If the issuer requires **Strong Customer Authentication** (3D Secure), the SDK presents the challenge in-app or in a browser, and returns to your app via your **URL scheme / `returnURL`**. Without that scheme, bank redirects can strand the user in Safari.
+5. `presentPaymentSheet()` resolves. No error means the payment was confirmed. It may still be **`processing`** for delayed methods such as SEPA Debit or ACH, if you enabled `allowsDelayedPaymentMethods`.
+6. Stripe sends `payment_intent.succeeded` to your webhook. You **verify the signature**, **dedupe by event ID**, mark the order paid and fulfill it. The app polls or subscribes to the order status to show the confirmation screen.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as RN App
+    participant SDK as Stripe SDK
+    participant BE as Backend
+    participant ST as Stripe API
+    participant Bank as Issuer 3DS
+    App->>BE: POST /checkout (cartId, Idempotency-Key)
+    BE->>BE: Load cart, recompute total from DB prices
+    BE->>ST: Create Customer, EphemeralKey, PaymentIntent
+    ST-->>BE: PaymentIntent with client_secret
+    BE-->>App: clientSecret, customerId, ephemeralKey
+    App->>SDK: initPaymentSheet then presentPaymentSheet
+    SDK->>ST: Confirm PaymentIntent with card
+    alt SCA required
+        ST-->>SDK: status requires_action
+        SDK->>Bank: 3DS challenge in-app or browser
+        Bank-->>SDK: Authenticated, return via urlScheme
+        SDK->>ST: Complete confirmation
+    end
+    ST-->>SDK: succeeded or processing
+    SDK-->>App: Resolves without error
+    ST->>BE: Webhook payment_intent.succeeded (signed)
+    BE->>BE: Verify signature, dedupe event id, fulfill order
+    BE-->>ST: 200 OK
+    App->>BE: GET /orders/id (poll or push)
+    BE-->>App: status PAID
+```
+*Figure: Stripe PaymentSheet with 3D Secure and webhook-driven fulfillment.*
+
+> [!IMPORTANT] Webhooks are the source of truth
+> The app can crash, lose network or be killed by the OS between steps 5 and 6. Users also close the app during a 3DS redirect. If fulfillment depends on the client reporting success, you will ship paid orders late or never, or fulfil unpaid ones. Stripe retries undelivered webhooks with exponential backoff (for up to three days in live mode) and does **not** guarantee ordering, so handlers must be idempotent and order-independent.
+
+### Order and payment state machine
+
+Keep **your own order state** separate from the provider's PaymentIntent status. One order can involve several payment attempts (a declined card, then a retry), and after payment it goes through fulfillment, refunds and disputes that the PaymentIntent knows nothing about.
+
+```mermaid
+stateDiagram-v2
+    state "Created" as Created
+    state "Requires payment" as RequiresPayment
+    state "Requires action (3DS)" as RequiresAction
+    state "Processing" as Processing
+    state "Paid" as Paid
+    state "Fulfilled" as Fulfilled
+    state "Partially refunded" as PartRefunded
+    state "Refunded" as Refunded
+    state "Disputed" as Disputed
+    state "Canceled" as Canceled
+    [*] --> Created : cart checked out
+    Created --> RequiresPayment : PaymentIntent created
+    RequiresPayment --> RequiresAction : SCA challenge
+    RequiresAction --> RequiresPayment : auth failed, retry
+    RequiresAction --> Processing : authenticated
+    RequiresPayment --> Processing : confirmed
+    Processing --> RequiresPayment : payment_failed, try again
+    Processing --> Paid : payment_intent.succeeded
+    RequiresPayment --> Canceled : abandoned or expired
+    Paid --> Fulfilled : shipped or service delivered
+    Paid --> Refunded : canceled before fulfillment
+    Fulfilled --> PartRefunded : partial refund
+    PartRefunded --> Refunded : remainder refunded
+    Fulfilled --> Refunded : full refund
+    Fulfilled --> Disputed : chargeback opened
+    Disputed --> Fulfilled : dispute won
+    Disputed --> Refunded : dispute lost
+    Refunded --> [*]
+    Canceled --> [*]
+```
+*Figure: Order lifecycle. Webhooks drive transitions, and every transition is idempotent.*
+
+| Stripe PaymentIntent status | Meaning | Typical order state |
+|---|---|---|
+| `requires_payment_method` | New, or the last attempt failed | `awaiting_payment` |
+| `requires_confirmation` | Payment method attached, not confirmed yet | `awaiting_payment` |
+| `requires_action` | 3DS or a redirect is needed | `awaiting_payment` (show "authenticating") |
+| `processing` | Asynchronous method in flight (bank debits, some wallets) | `processing` |
+| `requires_capture` | Authorised only (`capture_method: 'manual'`, used for rides and hotels) | `authorized` |
+| `succeeded` | Funds captured | `paid`, then fulfill |
+| `canceled` | Canceled by you or expired | `canceled` |
+
+**Reconciliation** is the safety net for everything the webhooks miss. A scheduled job should:
+
+- list orders stuck in `awaiting_payment` / `processing` for longer than N minutes, retrieve their PaymentIntents from Stripe and repair the state;
+- cancel stale PaymentIntents so abandoned carts don't leave dangling authorisations;
+- compare your paid orders against Stripe **balance transactions** and **payouts** daily, and alert on any mismatch in count or amount.
+
+Manual capture is the model for **rides, hotels and car rental**. You authorise an estimate up front, capture the final amount later (up to the authorised amount; authorisations expire after about 7 days for most cards), and cancel the authorisation if the service never happens.
+
+## Part A — Requirements & prerequisites
+
+| Item | Details |
+|---|---|
+| Stripe account | Test mode works immediately. Live mode requires activation: business details, bank account for payouts, identity verification. |
+| API keys | `pk_test_…` / `pk_live_…` (publishable, safe in the app). `sk_…` or restricted `rk_…` (server only, in a secret manager). A separate **webhook signing secret** `whsec_…` for each endpoint. Test and live keys are fully separate environments. |
+| Backend | An HTTPS server with an authenticated checkout endpoint and a **raw-body** webhook endpoint. |
+| RN library | `@stripe/stripe-react-native` (official). It wraps the native Stripe iOS and Android SDKs. |
+| iOS | The deployment target required by your SDK version (see the README; recent versions need iOS 13+), and an Xcode that meets Apple's current upload minimum. |
+| Android | `minSdkVersion` 21+ and a recent `compileSdkVersion` / Kotlin as the README specifies. The app theme must descend from `Theme.AppCompat` or `Theme.MaterialComponents`. |
+| Expo | The `@stripe/stripe-react-native` config plugin and a **development build**. Expo Go bundles a Stripe version for quick card prototyping, but Apple Pay, Google Pay and custom URL-scheme redirects need a dev build. |
+| Apple Pay | Apple Developer Program membership, a Merchant ID and a payment processing certificate (steps below). |
+| Google Pay | Google Pay enabled in Stripe. For production, a Google Pay & Wallet Console business profile and approval. |
+| Tooling | Stripe CLI (`stripe listen`, `stripe trigger`) for local webhooks. |
+
+### Choosing a gateway
+
+| Gateway | Strengths | RN integration | Pick it when |
+|---|---|---|---|
+| **Stripe** | Best developer experience, PaymentSheet, many local payment methods, Radar fraud tools, Billing, Tax, Connect for marketplaces | `@stripe/stripe-react-native` (official) | It's the default for most startups and global consumer apps |
+| **Braintree** (PayPal) | PayPal and Venmo built in, Drop-in UI | Native SDKs, with community RN wrappers | PayPal and Venmo matter to your users (US-heavy) |
+| **Adyen** | Enterprise acquiring in many countries, unified online and in-store payments | `@adyen/react-native` (official) | You're a large merchant with multi-region acquiring and POS |
+| **Razorpay** | India: UPI, netbanking, cards, wallets, EMI | `react-native-razorpay` (official) | India-domiciled business, where UPI is the dominant method |
+| PayPal / Checkout.com / Mollie and others | Regional or enterprise strengths | Native SDKs or web checkout | Local payment method coverage requires them |
+
+> [!TIP]
+> For marketplaces where you pay out third parties (drivers, restaurants, hosts), you need a **payments-for-platforms** product (Stripe Connect, Adyen for Platforms, Razorpay Route). Don't try to collect money centrally and pay out by hand, because that can make you an unlicensed money transmitter.
+
+## Part A — Setup (Stripe)
+
+### Bare React Native
+
+1. Install the SDK and pods:
+
+```bash
+npm install @stripe/stripe-react-native
+cd ios && pod install && cd ..
+```
+
+2. Register a URL scheme for 3DS and bank redirects in `ios/MyShop/Info.plist`:
+
+```xml title="ios/MyShop/Info.plist"
+<key>CFBundleURLTypes</key>
+<array>
+  <dict>
+    <key>CFBundleURLName</key>
+    <string>com.example.myshop</string>
+    <key>CFBundleURLSchemes</key>
+    <array>
+      <string>myshop</string>
+    </array>
+  </dict>
+</array>
+```
+
+3. Make sure `ios/MyShop/AppDelegate.swift` forwards URLs to React Native's `RCTLinkingManager` (the current RN template already does this through `application(_:open:options:)`), so `Linking` receives `myshop://stripe-redirect`.
+
+4. On Android, check the app theme in `android/app/src/main/res/values/styles.xml`:
+
+```xml title="android/app/src/main/res/values/styles.xml"
+<resources>
+  <style name="AppTheme" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+    <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
+  </style>
+</resources>
+```
+
+5. Enable Google Pay (if you use it) in `android/app/src/main/AndroidManifest.xml`:
+
+```xml title="android/app/src/main/AndroidManifest.xml"
+<application android:name=".MainApplication" android:theme="@style/AppTheme">
+  <meta-data
+    android:name="com.google.android.gms.wallet.api.enabled"
+    android:value="true" />
+  <!-- activities ... -->
+</application>
+```
+
+6. Add an `intent-filter` for the `myshop` scheme to your main activity if deep links aren't configured yet. See [Deep Linking & Universal Links](deep-linking.html).
+
+### Expo (CNG)
+
+```bash
+npx expo install @stripe/stripe-react-native
+```
+
+```json title="app.json"
+{
+  "expo": {
+    "scheme": "myshop",
+    "ios": { "bundleIdentifier": "com.example.myshop" },
+    "android": { "package": "com.example.myshop" },
+    "plugins": [
+      [
+        "@stripe/stripe-react-native",
+        {
+          "merchantIdentifier": "merchant.com.example.myshop",
+          "enableGooglePay": true
+        }
+      ]
+    ]
+  }
+}
+```
+
+The plugin adds the Apple Pay entitlement (`merchantIdentifier`) and the Google Pay manifest `meta-data` (`enableGooglePay`). The `scheme` key registers the URL scheme on both platforms. Run `npx expo prebuild --clean` (or `eas build --profile development`) and install the dev build. EAS Build with managed credentials syncs the Apple Pay capability to your App ID.
+
+## Part A — Implementation (Stripe)
+
+### Backend: create the PaymentIntent
+
+```ts title="server/src/stripe.ts"
+import Stripe from 'stripe';
+
+export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+
+// Ephemeral keys must be created with an API version the mobile SDK understands.
+// Take the value from Stripe's React Native docs for the SDK version you ship.
+export const STRIPE_MOBILE_API_VERSION = process.env.STRIPE_MOBILE_API_VERSION!;
+```
+
+```ts title="server/src/routes/checkout.ts"
+import { Router } from 'express';
+import { stripe, STRIPE_MOBILE_API_VERSION } from '../stripe';
+import { db } from '../db';
+import { requireAuth, type AuthedRequest } from '../auth';
+
+export const checkoutRouter = Router();
+
+async function getOrCreateCustomer(userId: string, email: string): Promise<string> {
+  const existing = await db.users.getStripeCustomerId(userId);
+  if (existing) return existing;
+  const customer = await stripe.customers.create(
+    { email, metadata: { userId } },
+    { idempotencyKey: `customer_${userId}` },
+  );
+  await db.users.setStripeCustomerId(userId, customer.id);
+  return customer.id;
+}
+
+checkoutRouter.post('/checkout/payment-sheet', requireAuth, async (req: AuthedRequest, res) => {
+  const { cartId } = req.body as { cartId?: string };
+  const clientKey = req.header('Idempotency-Key');
+  if (!cartId || !clientKey) {
+    return res.status(400).json({ error: 'cartId and Idempotency-Key are required' });
+  }
+
+  // 1. The amount comes from OUR database, never from the request body.
+  const cart = await db.carts.findForUser(cartId, req.user.id);
+  if (!cart || cart.items.length === 0) return res.status(404).json({ error: 'Cart not found' });
+  const quote = await db.pricing.quote(cart); // items + shipping + tax, integer minor units
+
+  // 2. One pending order per cart. Reuse an open PaymentIntent instead of creating a new one per tap.
+  const order = await db.orders.upsertPending({
+    userId: req.user.id,
+    cartId,
+    amount: quote.total,
+    currency: quote.currency,
+  });
+
+  const customerId = await getOrCreateCustomer(req.user.id, req.user.email);
+
+  let paymentIntent = order.paymentIntentId
+    ? await stripe.paymentIntents.retrieve(order.paymentIntentId)
+    : null;
+
+  const reusable =
+    paymentIntent &&
+    paymentIntent.amount === quote.total &&
+    paymentIntent.currency === quote.currency &&
+    !['succeeded', 'canceled', 'processing'].includes(paymentIntent.status);
+
+  if (!reusable) {
+    paymentIntent = await stripe.paymentIntents.create(
+      {
+        amount: quote.total,
+        currency: quote.currency,
+        customer: customerId,
+        automatic_payment_methods: { enabled: true },
+        metadata: { orderId: order.id, userId: req.user.id },
+      },
+      // Same client key + same order => Stripe returns the same PaymentIntent on retries.
+      { idempotencyKey: `pi_${order.id}_${quote.total}_${clientKey}` },
+    );
+    await db.orders.attachPaymentIntent(order.id, paymentIntent.id);
+  }
+
+  const ephemeralKey = await stripe.ephemeralKeys.create(
+    { customer: customerId },
+    { apiVersion: STRIPE_MOBILE_API_VERSION },
+  );
+
+  return res.json({
+    orderId: order.id,
+    amount: quote.total,
+    currency: quote.currency,
+    paymentIntentClientSecret: paymentIntent!.client_secret,
+    customerId,
+    ephemeralKeySecret: ephemeralKey.secret,
+  });
+});
+```
+
+Why this shape:
+
+- **Idempotency** works at two levels. Stripe's `idempotencyKey` makes a retried HTTP request (a flaky network, a double tap) return the *same* PaymentIntent instead of creating a second one. Your own "one pending order per cart" rule stops a user from opening two payment sheets for the same cart. Stripe keeps idempotency keys for at least 24 hours, and a key reused with *different* parameters returns an error. That's why the amount is part of the key: if the cart changes, a new PaymentIntent is created.
+- `automatic_payment_methods` lets you turn payment methods on and off in the Dashboard without an app release.
+- `metadata.orderId` is how the webhook finds the order again. Never rely on the client to tell you which order was paid.
+
+### Backend: the webhook handler
+
+```ts title="server/src/routes/stripeWebhook.ts"
+import express, { Router } from 'express';
+import type Stripe from 'stripe';
+import { stripe } from '../stripe';
+import { db } from '../db';
+import { logger } from '../logger';
+
+export const stripeWebhookRouter = Router();
+
+// express.raw is required: signature verification runs over the exact bytes Stripe sent.
+stripeWebhookRouter.post(
+  '/webhooks/stripe',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    let event: Stripe.Event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body as Buffer,
+        req.header('stripe-signature') ?? '',
+        process.env.STRIPE_WEBHOOK_SECRET!,
+      );
+    } catch {
+      logger.warn('stripe webhook signature verification failed');
+      return res.status(400).send('Invalid signature');
+    }
+
+    // Deliveries are at-least-once: record the event id and skip duplicates.
+    const isNew = await db.processedEvents.insertIfAbsent('stripe', event.id);
+    if (!isNew) return res.sendStatus(200);
+
+    try {
+      switch (event.type) {
+        case 'payment_intent.succeeded': {
+          const pi = event.data.object;
+          await db.orders.markPaid({
+            orderId: pi.metadata.orderId,
+            paymentIntentId: pi.id,
+            amountReceived: pi.amount_received,
+            currency: pi.currency,
+          }); // transaction: verify amount matches the order, set PAID, enqueue fulfillment
+          break;
+        }
+        case 'payment_intent.processing':
+          await db.orders.setStatus(event.data.object.metadata.orderId, 'processing');
+          break;
+        case 'payment_intent.payment_failed': {
+          const pi = event.data.object;
+          await db.orders.recordFailedAttempt(pi.metadata.orderId, pi.last_payment_error?.code);
+          break;
+        }
+        case 'payment_intent.canceled':
+          await db.orders.setStatus(event.data.object.metadata.orderId, 'canceled');
+          break;
+        case 'charge.refunded': {
+          const charge = event.data.object;
+          await db.orders.applyRefund(charge.payment_intent as string, charge.amount_refunded);
+          break;
+        }
+        case 'charge.dispute.created':
+          await db.disputes.open(event.data.object); // alert ops, freeze related entitlements
+          break;
+        default:
+          break; // ignore event types you didn't subscribe to
+      }
+      return res.sendStatus(200);
+    } catch (err) {
+      // Let Stripe retry: remove the dedupe marker and return 5xx.
+      await db.processedEvents.remove('stripe', event.id);
+      logger.error({ eventId: event.id, type: event.type, err }, 'stripe webhook handling failed');
+      return res.sendStatus(500);
+    }
+  },
+);
+```
+
+```ts title="server/src/app.ts"
+import express from 'express';
+import { stripeWebhookRouter } from './routes/stripeWebhook';
+import { checkoutRouter } from './routes/checkout';
+
+const app = express();
+app.use(stripeWebhookRouter); // BEFORE express.json(), or the raw body is gone
+app.use(express.json());
+app.use(checkoutRouter);
+app.listen(4242);
+```
+
+> [!WARNING]
+> The most common webhook bug is a JSON body parser that runs before the webhook route. `constructEvent` then throws "No signatures found matching the expected signature" for every event. The same applies to serverless platforms that pre-parse bodies: get the raw body. Also keep the handler fast. Acknowledge with 200 and push slow work (emails, fulfillment calls) onto a queue, because Stripe treats slow responses as failures.
+
+`markPaid` must be a single DB transaction that re-checks the current state (`WHERE status <> 'paid'`) and compares `amountReceived` against the order amount. That makes it safe under duplicate or out-of-order events and catches any tampering or mispricing bugs.
+
+### Client: provider and redirect handling
+
+```tsx title="src/payments/PaymentsProvider.tsx"
+import { useEffect, type PropsWithChildren } from 'react';
+import { Linking } from 'react-native';
+import { StripeProvider, useStripe } from '@stripe/stripe-react-native';
+import { env } from '../config/env';
+
+function StripeRedirectHandler() {
+  const { handleURLCallback } = useStripe();
+
+  useEffect(() => {
+    const handle = async (url: string | null) => {
+      if (!url) return;
+      // Returns true if the URL was a Stripe redirect (3DS, bank auth) that it consumed.
+      await handleURLCallback(url);
+    };
+    void Linking.getInitialURL().then(handle);
+    const sub = Linking.addEventListener('url', ({ url }) => void handle(url));
+    return () => sub.remove();
+  }, [handleURLCallback]);
+
+  return null;
+}
+
+export function PaymentsProvider({ children }: PropsWithChildren) {
+  return (
+    <StripeProvider
+      publishableKey={env.stripePublishableKey}
+      merchantIdentifier="merchant.com.example.myshop" // Apple Pay
+      urlScheme="myshop" // required for 3DS / redirect-based payment methods
+    >
+      <StripeRedirectHandler />
+      {children}
+    </StripeProvider>
+  );
+}
+```
+
+If you use Expo Router or React Navigation linking, make sure `myshop://stripe-redirect` doesn't also resolve to a "not found" route. Either ignore that path in your linking config or give it a no-op screen. To rotate keys or switch environments without a release, fetch the publishable key from your backend and call `initStripe(...)` once it arrives.
+
+### Client: the checkout hook
+
+```tsx title="src/payments/useCheckout.ts"
+import 'react-native-get-random-values';
+import { useCallback, useRef, useState } from 'react';
+import { v4 as uuidv4 } from 'uuid';
+import { PaymentSheetError, useStripe } from '@stripe/stripe-react-native';
+import { api } from '../api/client';
+import { env } from '../config/env';
+
+type PaymentSheetParams = {
+  orderId: string;
+  paymentIntentClientSecret: string;
+  customerId: string;
+  ephemeralKeySecret: string;
+};
+
+export type CheckoutState =
+  | { status: 'idle' }
+  | { status: 'preparing' }
+  | { status: 'ready'; orderId: string }
+  | { status: 'presenting'; orderId: string }
+  | { status: 'confirming'; orderId: string }
+  | { status: 'paid'; orderId: string }
+  | { status: 'error'; message: string; orderId?: string };
+
+async function waitForOrderPaid(orderId: string, timeoutMs = 30_000): Promise<'paid' | 'failed' | 'pending'> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const { status } = await api.get<{ status: string }>(`/orders/${orderId}`);
+    if (status === 'paid') return 'paid';
+    if (status === 'payment_failed' || status === 'canceled') return 'failed';
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  return 'pending'; // webhook still in flight: show "we'll notify you", don't show failure
+}
+
+export function useCheckout(cartId: string) {
+  const { initPaymentSheet, presentPaymentSheet } = useStripe();
+  // One key per checkout attempt, stable across retries of the same request.
+  const idempotencyKey = useRef(uuidv4()).current;
+  const [state, setState] = useState<CheckoutState>({ status: 'idle' });
+
+  const prepare = useCallback(async () => {
+    setState({ status: 'preparing' });
+    try {
+      const params = await api.post<PaymentSheetParams>(
+        '/checkout/payment-sheet',
+        { cartId },
+        { headers: { 'Idempotency-Key': idempotencyKey } },
+      );
+      const { error } = await initPaymentSheet({
+        merchantDisplayName: 'My Shop',
+        paymentIntentClientSecret: params.paymentIntentClientSecret,
+        customerId: params.customerId,
+        customerEphemeralKeySecret: params.ephemeralKeySecret,
+        returnURL: 'myshop://stripe-redirect',
+        allowsDelayedPaymentMethods: false, // true only if you handle 'processing' orders
+        applePay: { merchantCountryCode: 'US' },
+        googlePay: {
+          merchantCountryCode: 'US',
+          currencyCode: 'USD',
+          testEnv: env.stripeMode === 'test', // tie to your Stripe mode, not __DEV__
+        },
+      });
+      if (error) throw new Error(error.message);
+      setState({ status: 'ready', orderId: params.orderId });
+    } catch (e) {
+      setState({ status: 'error', message: e instanceof Error ? e.message : 'Could not start checkout' });
+    }
+  }, [cartId, idempotencyKey, initPaymentSheet]);
+
+  const pay = useCallback(async () => {
+    if (state.status !== 'ready') return; // also guards against double taps
+    const { orderId } = state;
+    setState({ status: 'presenting', orderId });
+
+    const { error } = await presentPaymentSheet();
+    if (error) {
+      if (error.code === PaymentSheetError.Canceled) {
+        setState({ status: 'ready', orderId }); // user closed the sheet: not an error
+        return;
+      }
+      // PaymentSheetError.Failed: declined card, failed 3DS, network error...
+      setState({ status: 'error', orderId, message: error.localizedMessage ?? error.message });
+      return;
+    }
+
+    setState({ status: 'confirming', orderId });
+    const result = await waitForOrderPaid(orderId);
+    if (result === 'paid') setState({ status: 'paid', orderId });
+    else if (result === 'failed') setState({ status: 'error', orderId, message: 'Payment failed' });
+    else setState({ status: 'confirming', orderId }); // keep showing "processing", push will follow
+  }, [presentPaymentSheet, state]);
+
+  return { state, prepare, pay };
+}
+```
+
+The screen itself stays thin: call `prepare()` on mount, render the **Pay** button enabled only in the `ready` state, show "Confirming your payment…" while `confirming`, and navigate to the receipt screen on `paid`.
+
+> [!TIP]
+> Show amounts from the **server's** response formatted with `Intl.NumberFormat` (Hermes supports `Intl`). Don't recompute totals in the app. If the app and the server disagree about the price, the user sees one number and pays another.
+
+### Saving cards with SetupIntents
+
+To save a card without charging it (a "wallet" screen, or a ride app that charges after the trip), use a **SetupIntent**. PaymentSheet supports it directly:
+
+```ts title="server/src/routes/paymentMethods.ts"
+checkoutRouter.post('/payment-methods/setup-sheet', requireAuth, async (req: AuthedRequest, res) => {
+  const customerId = await getOrCreateCustomer(req.user.id, req.user.email);
+  const [setupIntent, ephemeralKey] = await Promise.all([
+    stripe.setupIntents.create({
+      customer: customerId,
+      automatic_payment_methods: { enabled: true },
+      usage: 'off_session', // we'll charge later without the user present
+    }),
+    stripe.ephemeralKeys.create({ customer: customerId }, { apiVersion: STRIPE_MOBILE_API_VERSION }),
+  ]);
+  res.json({ setupIntentClientSecret: setupIntent.client_secret, customerId, ephemeralKeySecret: ephemeralKey.secret });
+});
+```
+
+On the client, pass `setupIntentClientSecret` (instead of `paymentIntentClientSecret`) plus the customer and ephemeral key to `initPaymentSheet`, then `presentPaymentSheet()`. Any 3DS runs now, while the user is present.
+
+To charge later, the server creates a PaymentIntent with `customer`, `payment_method`, `off_session: true, confirm: true`. If the bank demands authentication anyway (the error code is `authentication_required`), notify the user and bring them back **on-session** to complete a PaymentIntent in the app. To save a card *during* a payment instead, set `setup_future_usage: 'off_session'` on the PaymentIntent. Stripe's **CustomerSheet** gives you a ready-made "manage payment methods" UI.
+
+## Apple Pay and Google Pay
+
+Wallets raise conversion because there's no card typing and authentication happens on the device. With Stripe they appear inside PaymentSheet automatically once configured. For an express-checkout button outside the sheet, use `isPlatformPaySupported()`, `PlatformPayButton` and `confirmPlatformPayPayment(clientSecret, …)`.
+
+### Setup — Apple Pay (iOS)
+
+1. **Create a Merchant ID.** In Apple Developer → Certificates, Identifiers & Profiles → Identifiers → **+** → Merchant IDs, create something like `merchant.com.example.myshop`.
+2. **Get a CSR from Stripe.** In the Stripe Dashboard → Settings → Payment methods → Apple Pay, add a new iOS certificate and download the **CSR**. Stripe holds the private key, so it can decrypt Apple Pay tokens.
+3. **Create the Apple Pay Payment Processing Certificate.** In Apple Developer → your Merchant ID → Apple Pay Payment Processing Certificate → Create Certificate, upload Stripe's CSR and download the `.cer`.
+4. **Upload the `.cer` to Stripe.** The certificate expires after about 25 months, so put a renewal reminder in your calendar.
+5. **Add the capability.** In Xcode → target → Signing & Capabilities → **+ Capability → Apple Pay**, tick the Merchant ID. This writes the entitlement:
+
+```xml title="ios/MyShop/MyShop.entitlements"
+<key>com.apple.developer.in-app-payments</key>
+<array>
+  <string>merchant.com.example.myshop</string>
+</array>
+```
+
+6. Regenerate provisioning profiles (automatic signing and EAS do this for you). Pass `merchantIdentifier` to `StripeProvider` and `applePay: { merchantCountryCode }` to `initPaymentSheet`.
+7. **Expo:** the config plugin's `merchantIdentifier` writes the entitlement during prebuild. You still do steps 1–4 by hand.
+
+### Setup — Google Pay (Android)
+
+1. Enable **Google Pay** under Stripe Dashboard → Settings → Payment methods.
+2. Add the `com.google.android.gms.wallet.api.enabled` `meta-data` to `AndroidManifest.xml` (or set `enableGooglePay: true` in the Expo plugin).
+3. Pass `googlePay: { merchantCountryCode, currencyCode, testEnv }` to `initPaymentSheet`. With `testEnv: true`, Google returns test tokens that work with Stripe test keys. Test on a device or emulator with Play services and a signed-in Google account.
+4. **Production access:** in the Google Pay & Wallet Console, create a business profile, then under Google Pay API add your Android app and submit the integration checklist and screenshots for review. Only then switch release builds to `testEnv: false` with live keys.
+5. Follow the Google Pay brand guidelines for buttons and wording (Apple has equivalent Apple Pay marketing guidelines).
+
+## Razorpay (India)
+
+In India, UPI accounts for most digital payments, and Razorpay is the usual gateway. The flow is the same shape as Stripe's: a server-created **order**, a client checkout SDK, verification, and webhooks.
+
+```mermaid
+sequenceDiagram
+    participant App as RN App
+    participant RZ as Razorpay Checkout SDK
+    participant BE as Backend
+    participant API as Razorpay API
+    App->>BE: POST /razorpay/orders (cartId)
+    BE->>BE: Price cart in paise
+    BE->>API: orders.create amount, currency INR, receipt
+    API-->>BE: order_id
+    BE-->>App: keyId, order_id, amount
+    App->>RZ: RazorpayCheckout.open(options)
+    RZ->>RZ: User pays via UPI app, card, netbanking
+    RZ-->>App: payment_id, order_id, signature
+    App->>BE: POST /razorpay/verify
+    BE->>BE: HMAC SHA256 of order_id and payment_id with key secret
+    API->>BE: Webhook payment.captured or order.paid
+    BE->>BE: Verify webhook signature, mark order paid
+```
+*Figure: Razorpay flow. The client callback and the webhook both arrive, and fulfillment must be idempotent across them.*
+
+```ts title="server/src/routes/razorpay.ts"
+import crypto from 'node:crypto';
+import express, { Router } from 'express';
+import Razorpay from 'razorpay';
+import { db } from '../db';
+import { requireAuth, type AuthedRequest } from '../auth';
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID!,
+  key_secret: process.env.RAZORPAY_KEY_SECRET!,
+});
+
+function safeEqualHex(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'hex');
+  const bb = Buffer.from(b, 'hex');
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
+export const razorpayRouter = Router();
+
+razorpayRouter.post('/razorpay/orders', requireAuth, express.json(), async (req: AuthedRequest, res) => {
+  const order = await db.orders.createFromCart(req.user.id, req.body.cartId); // server-side amount, in paise
+  const rzpOrder = await razorpay.orders.create({
+    amount: order.amount, // 49900 = Rs 499.00
+    currency: 'INR',
+    receipt: order.id,
+    notes: { orderId: order.id },
+  });
+  await db.orders.attachGatewayOrder(order.id, rzpOrder.id);
+  res.json({ keyId: process.env.RAZORPAY_KEY_ID, razorpayOrderId: rzpOrder.id, amount: rzpOrder.amount, currency: 'INR' });
+});
+
+razorpayRouter.post('/razorpay/verify', requireAuth, express.json(), async (req: AuthedRequest, res) => {
+  const { razorpay_payment_id, razorpay_signature, orderId } = req.body as Record<string, string>;
+  // Use the gateway order id WE stored, not one supplied by the client.
+  const order = await db.orders.findForUser(orderId, req.user.id);
+  if (!order?.gatewayOrderId) return res.status(404).end();
+
+  const expected = crypto
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
+    .update(`${order.gatewayOrderId}|${razorpay_payment_id}`)
+    .digest('hex');
+
+  if (!safeEqualHex(expected, razorpay_signature ?? '')) return res.status(400).json({ error: 'Invalid signature' });
+
+  await db.orders.markPaidIfPending(order.id, { gatewayPaymentId: razorpay_payment_id }); // idempotent
+  res.json({ status: 'paid' });
+});
+
+razorpayRouter.post('/webhooks/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
+  const expected = crypto
+    .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET!) // webhook secret, NOT the key secret
+    .update(req.body as Buffer)
+    .digest('hex');
+  if (!safeEqualHex(expected, req.header('x-razorpay-signature') ?? '')) return res.status(400).end();
+
+  const eventId = req.header('x-razorpay-event-id');
+  if (eventId && !(await db.processedEvents.insertIfAbsent('razorpay', eventId))) return res.sendStatus(200);
+
+  const event = JSON.parse((req.body as Buffer).toString('utf8'));
+  switch (event.event) {
+    case 'order.paid':
+    case 'payment.captured':
+      await db.orders.markPaidByGatewayOrder(event.payload.payment.entity.order_id, event.payload.payment.entity.id);
+      break;
+    case 'payment.failed':
+      await db.orders.recordFailedAttemptByGatewayOrder(event.payload.payment.entity.order_id);
+      break;
+    case 'refund.processed':
+      await db.orders.applyGatewayRefund(event.payload.refund.entity);
+      break;
+  }
+  res.sendStatus(200);
+});
+```
+
+```tsx title="src/payments/razorpayCheckout.ts"
+import RazorpayCheckout from 'react-native-razorpay';
+import { api } from '../api/client';
+
+type RazorpaySuccess = { razorpay_payment_id: string; razorpay_order_id: string; razorpay_signature: string };
+
+export async function payWithRazorpay(cartId: string, user: { email: string; phone: string }) {
+  const order = await api.post<{ keyId: string; razorpayOrderId: string; amount: number; orderId: string }>(
+    '/razorpay/orders',
+    { cartId },
+  );
+  try {
+    const data: RazorpaySuccess = await RazorpayCheckout.open({
+      key: order.keyId, // key_id only; the key secret never ships in the app
+      order_id: order.razorpayOrderId,
+      amount: String(order.amount),
+      currency: 'INR',
+      name: 'My Shop',
+      description: `Order ${order.orderId}`,
+      prefill: { email: user.email, contact: user.phone },
+      theme: { color: '#0F766E' },
+    });
+    await api.post('/razorpay/verify', { ...data, orderId: order.orderId });
+    return { status: 'paid' as const, orderId: order.orderId };
+  } catch (err) {
+    // err has { code, description }. It can be a user dismissal, a failure, OR a payment that
+    // succeeded in the UPI app while our process was killed. Always ask the server.
+    const { status } = await api.get<{ status: string }>(`/orders/${order.orderId}`);
+    return { status: status === 'paid' ? ('paid' as const) : ('not_paid' as const), orderId: order.orderId };
+  }
+}
+```
+
+**Razorpay notes:**
+
+- **Signature:** the checkout signature is `HMAC_SHA256(order_id + "|" + razorpay_payment_id, key_secret)` as hex. Webhooks use a **separate webhook secret** over the raw body, sent in `X-Razorpay-Signature`.
+- **Capture:** enable auto-capture (payment capture settings in the Dashboard). Authorised but uncaptured payments are auto-refunded after a window.
+- **UPI** payments are often completed in another app (GPay, PhonePe, Paytm). The user may never come back to yours, so webhooks and order polling on resume are essential. On iOS, add the UPI app schemes Razorpay lists to `LSApplicationQueriesSchemes` in `Info.plist` so the SDK can detect installed UPI apps. On Android, the SDK's manifest handles package visibility.
+- **Recurring payments** (UPI AutoPay, card e-mandates) run under RBI mandate rules. Use Razorpay Subscriptions rather than hand-rolled off-session charges.
+- **Expo:** `react-native-razorpay` autolinks in a development build. It doesn't work in Expo Go.
+
+**Other gateways, briefly:** Braintree (Drop-in UI, PayPal/Venmo), Adyen (`@adyen/react-native` with the Sessions flow, where the server creates a session and the client renders Drop-in) and PayPal all follow the same shape. The server creates the session and amount, the client SDK collects payment and handles authentication, and a signed webhook confirms the result.
+
+## Money operations: refunds, disputes, currencies, taxes
+
+| Topic | What to do |
+|---|---|
+| **Minor units** | Store and transmit amounts as **integers in the smallest currency unit** (cents, paise). Watch for zero-decimal currencies (JPY and KRW: `500` means ¥500) and three-decimal ones (KWD, BHD). Never use floating-point math for money. Format for display with `Intl.NumberFormat(locale, { style: 'currency', currency })`. |
+| **Currencies** | Presentment currency (what the customer pays) is not the same as settlement currency (what you receive). Price in local currency on purpose, and don't let FX conversion surprise users. |
+| **Taxes** | Calculate server-side *before* creating the PaymentIntent (Stripe Tax, Avalara, TaxJar), including shipping. Store the tax breakdown on the order. With IAP, Apple and Google act as merchant of record and handle VAT and sales tax in most regions, and you receive net proceeds. |
+| **Receipts** | Stripe can email receipts (`receipt_email`). Some regions legally require proper invoices (EU VAT, India GST), which you generate from your order data. |
+| **Refunds** | `stripe.refunds.create({ payment_intent, amount }, { idempotencyKey })`, with `amount` omitted for a full refund. Refunds are asynchronous (`refund.updated`, `charge.refunded`). Processing fees are generally not returned. However a refund is issued (admin tool or Dashboard), let the `charge.refunded` webhook update order state. |
+| **Disputes / chargebacks** | `charge.dispute.created` has an evidence deadline. Keep evidence: delivery proof, IP address and device, 3DS result, communication logs. Successful 3DS generally shifts liability for fraud disputes to the issuer. Every dispute also costs a fee. |
+| **Fraud** | **Stripe Radar** risk scores and rules (block high risk, request 3DS above a threshold), velocity limits per user, device and card, and rate limits on the PaymentIntent endpoint to stop card-testing attacks. Require an authenticated user before creating PaymentIntents. |
+| **Reconciliation** | A daily job matches orders against balance transactions and payouts. Alert on orders stuck in intermediate states and on amount mismatches. |
+
+## Part B — In-app purchases: how it works
+
+With IAP the **store** is the merchant of record. Apple or Google show the payment sheet, charge the user's store account, handle tax, refunds and renewals, and give you a signed transaction. Your job is to verify it, map it to *your* user, grant an **entitlement**, finish the transaction, and keep entitlement state in sync as the store notifies you about renewals, billing problems and refunds.
+
+### Product types
+
+| Type | Apple | Google Play | Examples | Restorable? |
+|---|---|---|---|---|
+| **Consumable** | Consumable | One-time product, **consumed** after granting | Coins, credits, extra lives | No, so the balance must live on your server |
+| **Non-consumable** | Non-Consumable | One-time product, **acknowledged**, never consumed | Remove ads, lifetime unlock | Yes |
+| **Auto-renewable subscription** | Auto-Renewable Subscription inside a **subscription group** | Subscription with an **auto-renewing base plan** | Pro monthly or yearly | Yes |
+| **Non-renewing subscription** | Non-Renewing Subscription | Closest match is a **prepaid base plan** | Season pass | You track duration and sync it across devices yourself |
+
+**Apple subscription groups:** a user can have only **one active subscription per group**. Products in a group are ranked by **level**, which determines whether a change is an upgrade, a downgrade or a crossgrade. Introductory-offer eligibility is per group. Most apps need exactly one group.
+
+**Google subscriptions** are split into a hierarchy: **subscription** (the product, such as `pro`) → **base plans** (such as `monthly-autorenew`, `yearly-autorenew` or `monthly-prepaid`) → **offers** (free trial or intro-price phases, with eligibility rules such as *new customer acquisition*, *upgrade* or *developer determined*). To buy, you pass the chosen offer's **`offerToken`**. Google only returns offers the user is eligible for.
+
+### Offers, trials and codes
+
+| Concept | Apple | Google |
+|---|---|---|
+| Free trial | Introductory offer (free), once per subscription group | Offer with a free phase, once per subscription by default |
+| Intro price | Introductory offer: *pay as you go* or *pay up front* | Offer with discounted phase(s) |
+| Retention / win-back | **Promotional offers** (require a signature from your server), **win-back offers** (iOS 18+) | Developer-determined offers, win-back via eligibility tags |
+| Codes | **Offer codes** (redeemable in App Store or in-app) | Promo codes |
+
+### Lifecycle concepts you must model
+
+| Concept | Apple | Google |
+|---|---|---|
+| **Grace period** (renewal failed, **user keeps access**) | Billing Grace Period, opt-in in App Store Connect (3, 16 or 28 days) | Grace period, configurable per base plan |
+| **Billing retry / account hold** (no access while the store retries the card) | Billing retry for up to 60 days | **Account hold** after grace ends |
+| **Pause** | Not available | User can pause for a limited period (Android only) |
+| **Cancel** | Auto-renew turned off, access until `expiresDate` | `CANCELED`, access until expiry |
+| **Refund** | Apple decides (reportaproblem.apple.com, or `beginRefundRequest` in-app) and sends a `REFUND` notification | You can refund or revoke via the Play Console or API. Users can also request one through Play, and you get a voided-purchase notification |
+| **Family Sharing** | Opt-in per product (irreversible). A `REVOKE` notification arrives when access is removed | Supported for some products, check Play's family library rules |
+
+Defaults and limits change, so check the current values in App Store Connect and the Play Console when you configure them.
+
+## Part B — Requirements & prerequisites
+
+| Area | Apple (App Store Connect) | Google (Play Console) |
+|---|---|---|
+| Account | Apple Developer Program ($99/yr) | Play developer account (one-time fee) plus a **payments profile** |
+| Agreements | **Paid Applications Agreement** accepted by the Account Holder, with **banking and tax** forms complete (Business section). Without this, product queries return empty, even in sandbox. | Payments profile linked, merchant details complete |
+| App | Bundle ID with In-App Purchase enabled. In Xcode: Signing & Capabilities → **+ In-App Purchase** | An AAB with the `BILLING` permission (added by Play Billing Library) **uploaded to a testing track**, usually internal testing. You can't create products until one exists. |
+| Products | Created with ID, price, localisation and **review screenshot**, status **Ready to Submit**. Subscriptions sit inside a group with a localised group name. The **first** IAP must be submitted with an app version. | One-time products and subscriptions (base plans and offers) created and **activated** |
+| Testers | **Sandbox testers** (Users and Access → Sandbox) | **License testers** (Settings → License testing) who have also **joined the test track** via the opt-in link |
+| Server access | **In-App Purchase key** (`.p8`, Key ID, Issuer ID) for the App Store Server API, and your app's numeric **Apple ID** | A Google Cloud **service account** invited in Play Console → Users and permissions (view financial data, manage orders and subscriptions), with the Google Play Android Developer API enabled |
+| Notifications | App Store Server Notifications **V2** URLs (production and sandbox) in App Information | A **Cloud Pub/Sub topic**, with `google-play-developer-notifications@system.gserviceaccount.com` granted Publisher. Set the topic in Monetization setup |
+| Library | StoreKit 2 (iOS 15+) through your RN library | **Play Billing Library** at a version Play still accepts. PBL 7 was required from August 2025, and each major version is deprecated about two years after release, so expect PBL 8. Check that your RN library bundles a compliant version. |
+| Local testing | **StoreKit Configuration file** in Xcode (works without App Store Connect) | **Play Billing Lab** app, plus license-tester test instruments |
+
+> [!IMPORTANT]
+> Apple's legacy `verifyReceipt` endpoint and the app-specific shared secret are deprecated. New work uses **signed JWS transactions**, the **App Store Server API** and **App Store Server Notifications V2**.
+
+## Choosing an IAP library
+
+| Option | What you get | What you build | Cost | Best for |
+|---|---|---|---|---|
+| **react-native-iap** (v14+, Nitro Modules) | Thin cross-platform wrapper over StoreKit 2 and Play Billing, a `useIAP` hook, follows the OpenIAP spec | Validation backend, notification processing, entitlement DB, paywall, analytics | Free (MIT) | Teams with backend capacity who want full control of data |
+| **expo-iap** | Same maintainer and API shape as react-native-iap, built on the Expo Modules API | Same as above | Free | Expo projects that want the open-source route |
+| **RevenueCat** (`react-native-purchases`) | SDK plus **hosted receipt validation**, entitlements, cross-platform customer state (including web billing), webhooks, integrations, charts, **paywalls** (`react-native-purchases-ui`), experiments | Your business logic, and optionally a webhook consumer | Free up to a monthly revenue threshold, then a percentage of tracked revenue | Most subscription apps, especially small teams |
+| **Adapty / Qonversion** | A similar hosted model with a strong paywall and A/B-testing focus | Business logic | Revenue-based tiers | Teams that do heavy paywall experimentation |
+
+**Recommendation.** Calling `requestPurchase` is not the hard part of IAP. The server side is: validating JWS and tokens, tracking renewal, grace, hold and refund state, handling upgrades that change purchase tokens, processing notifications that can arrive late, duplicated or out of order, and merging iOS, Android and web into one entitlement. For a subscription app without a dedicated billing team, **start with RevenueCat**, because its fee is usually far less than the engineering time. Choose **react-native-iap / expo-iap plus your own backend** when you already run a billing platform (for example, Stripe subscriptions on the web that must be the single source of truth), need data residency or full control, or when revenue share at your scale costs more than the team. Either way, put the vendor behind a small `PurchasesService` interface so you can switch later.
+
+> [!WARNING]
+> react-native-iap's API has changed substantially across major versions: `getProducts` became `fetchProducts`, `requestPurchase({ sku })` became a `request` object with per-platform keys (`ios`/`android`, and more recently `apple`/`google`), and v14 moved to Nitro Modules with StoreKit 2 only (iOS 15+) and a React Native 0.79+ requirement. The code below shows the current style. **Check the docs for the exact version you install.**
+
+## Setup — IAP on iOS and Android
+
+**Bare React Native:**
+
+```bash
+npm install react-native-iap react-native-nitro-modules
+cd ios && pod install && cd ..
+```
+
+**Expo:**
+
+```bash
+npx expo install expo-iap
+```
+
+```json title="app.json"
+{
+  "expo": {
+    "plugins": ["expo-iap"]
+  }
+}
+```
+
+Then run `npx expo prebuild` or `eas build --profile development`. IAP never works in Expo Go.
+
+**iOS:**
+
+1. Xcode → target → Signing & Capabilities → **+ In-App Purchase**. IAP needs no entitlement key, but the capability must be enabled on the App ID.
+2. For local testing, go to File → New → File from Template → **StoreKit Configuration File**, and optionally tick *Sync this file with an app in App Store Connect*. Select it in Product → Scheme → Edit Scheme → Run → Options → **StoreKit Configuration**.
+3. The bundle ID must match the App Store Connect app exactly for sandbox queries.
+
+**Android:**
+
+1. Play Billing Library adds `<uses-permission android:name="com.android.vending.BILLING" />` through manifest merging. Make sure nothing removes it with `tools:node="remove"`.
+2. Upload a release-signed AAB with that permission to **internal testing**. The `applicationId` of the build you test must match.
+3. Add testers to **License testing** *and* to the test track, and have them accept the opt-in link and install from Play at least once.
+
+## Part B — Implementation
+
+### End-to-end purchase flow
+
+```mermaid
+sequenceDiagram
+    participant App as RN App
+    participant Store as StoreKit or Play Billing
+    participant BE as Backend
+    participant SAPI as Apple or Google server API
+    App->>Store: fetchProducts(skus)
+    Store-->>App: Localized prices and eligible offers
+    App->>Store: requestPurchase(sku, account token)
+    Store->>Store: Payment sheet, Face ID, Ask to Buy
+    Store-->>App: purchaseUpdated(purchase)
+    App->>BE: POST /iap/verify (platform, JWS or purchase token)
+    alt iOS
+        BE->>BE: SignedDataVerifier checks the JWS chain and bundle id
+        BE->>SAPI: Optional subscription status lookup
+    else Android
+        BE->>SAPI: subscriptionsv2.get or products.get
+        SAPI-->>BE: State, expiry, obfuscated account id
+    end
+    BE->>BE: Upsert purchase, recompute entitlements (idempotent)
+    BE-->>App: Active entitlements
+    App->>Store: finishTransaction (acknowledge or consume)
+    Note over App,Store: Android refunds purchases not acknowledged within 3 days
+    SAPI-->>BE: Later, server notifications for renewals and refunds
+```
+*Figure: IAP purchase flow. Grant on the server first, then finish the transaction.*
+
+The order at the end matters. **Verify and grant, then finish.** If you finish first and your backend call fails, the store considers the purchase delivered and won't redeliver it. The user has paid and has nothing to show for it. If you grant and then fail to finish, the store redelivers the transaction on the next launch, and your idempotent backend simply returns the existing entitlement.
+
+### Client: purchases service with react-native-iap / expo-iap
+
+Mount the purchase listener **once, at the app root**, not only on the paywall screen. Renewals, Ask to Buy approvals, pending Android purchases and interrupted purchases can all complete while the user is somewhere else in the app, or on the next launch.
+
+```tsx title="src/iap/PurchasesProvider.tsx"
+import { createContext, useCallback, useEffect, useState } from 'react';
+import { Platform } from 'react-native';
+import {
+  ErrorCode,
+  getAvailablePurchases as fetchAvailablePurchases,
+  useIAP,
+  type Purchase,
+} from 'react-native-iap'; // or 'expo-iap' (same API shape)
+import { api } from '../api/client';
+import { useAuth } from '../auth/useAuth';
+
+export const SUBSCRIPTION_SKUS = ['com.example.pro.monthly', 'com.example.pro.yearly'];
+const CONSUMABLE_SKUS = ['com.example.coins.500'];
+
+type VerifyResponse = { entitlements: string[]; status: 'granted' | 'pending' | 'rejected' };
+type Ctx = ReturnType<typeof usePurchasesInternal>;
+const PurchasesContext = createContext<Ctx | null>(null);
+
+function usePurchasesInternal() {
+  const { user } = useAuth(); // user.iapAccountToken is a UUID issued by our backend
+  const [entitlements, setEntitlements] = useState<string[]>([]);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const verifyAndFinish = useCallback(
+    async (purchase: Purchase, finish: (args: { purchase: Purchase; isConsumable: boolean }) => Promise<unknown>) => {
+      if (purchase.purchaseState === 'pending') {
+        setMessage('Your purchase is pending approval. We will unlock it as soon as it completes.');
+        return; // never grant or finish a pending purchase
+      }
+      try {
+        const res = await api.post<VerifyResponse>('/iap/verify', {
+          platform: Platform.OS,
+          productId: purchase.productId,
+          purchaseToken: purchase.purchaseToken, // iOS: StoreKit 2 JWS, Android: Play purchase token
+        });
+        if (res.status === 'granted') {
+          setEntitlements(res.entitlements);
+          await finish({ purchase, isConsumable: CONSUMABLE_SKUS.includes(purchase.productId) });
+        }
+      } catch {
+        // Don't finish: the store redelivers the transaction and we retry on the next launch.
+        setMessage('We could not confirm your purchase yet. It will be retried automatically.');
+      }
+    },
+    [],
+  );
+
+  const iap = useIAP({
+    onPurchaseSuccess: (purchase) => void verifyAndFinish(purchase, iap.finishTransaction),
+    onPurchaseError: (error) => {
+      if (error.code === ErrorCode.UserCancelled) return; // older versions: E_USER_CANCELLED
+      setMessage(error.message);
+    },
+  });
+
+  useEffect(() => {
+    if (!iap.connected) return;
+    void iap.fetchProducts({ skus: SUBSCRIPTION_SKUS, type: 'subs' });
+    void iap.fetchProducts({ skus: CONSUMABLE_SKUS, type: 'in-app' });
+  }, [iap.connected]);
+
+  const buySubscription = useCallback(
+    async (sku: string, offerToken?: string) => {
+      if (!user) throw new Error('Sign in before purchasing'); // so the purchase is linked to an account
+      const sub = iap.subscriptions.find((s) => s.id === sku);
+      // Android: choose ONE eligible offer (trial or base plan) for this SKU.
+      const token = offerToken ?? sub?.subscriptionOfferDetailsAndroid?.[0]?.offerToken;
+      await iap.requestPurchase({
+        request: {
+          apple: { sku, appAccountToken: user.iapAccountToken },
+          google: {
+            skus: [sku],
+            subscriptionOffers: token ? [{ sku, offerToken: token }] : [],
+            obfuscatedAccountIdAndroid: user.iapAccountToken,
+          },
+        },
+        type: 'subs',
+      });
+      // Don't use the return value: the result arrives via onPurchaseSuccess / onPurchaseError.
+    },
+    [iap, user],
+  );
+
+  const restore = useCallback(async () => {
+    const purchases = await fetchAvailablePurchases(); // StoreKit 2 current entitlements / Play owned purchases
+    const res = await api.post<VerifyResponse>('/iap/restore', {
+      platform: Platform.OS,
+      purchases: purchases.map((p) => ({ productId: p.productId, purchaseToken: p.purchaseToken })),
+    });
+    setEntitlements(res.entitlements);
+    return res.entitlements.length > 0;
+  }, []);
+
+  return { ...iap, entitlements, message, buySubscription, restore };
+}
+
+// PurchasesProvider renders <PurchasesContext.Provider value={usePurchasesInternal()}> at the app root,
+// and usePurchases() reads that context.
+```
+
+The paywall renders **store-provided, localised prices** (`product.displayPrice`). Never hardcode "$9.99". Prices vary by storefront, currency and tax, and a mismatch between your text and the payment sheet is an App Review rejection.
+
+```tsx title="src/iap/Paywall.tsx"
+import { Button, Linking, Text, View } from 'react-native';
+import { usePurchases } from './PurchasesProvider';
+
+export function Paywall() {
+  const { subscriptions, buySubscription, restore, message } = usePurchases();
+  return (
+    <View style={{ padding: 16, gap: 12 }}>
+      {subscriptions.map((s) => (
+        <Button key={s.id} title={`${s.title}: ${s.displayPrice}`} onPress={() => void buySubscription(s.id)} />
+      ))}
+      <Text>Renews automatically at the price shown unless canceled at least 24 hours before the period ends.</Text>
+      <Text onPress={() => Linking.openURL('https://example.com/terms')}>Terms of Use</Text>
+      <Text onPress={() => Linking.openURL('https://example.com/privacy')}>Privacy Policy</Text>
+      <Button title="Restore purchases" onPress={() => void restore()} />
+      {message && <Text accessibilityRole="alert">{message}</Text>}
+    </View>
+  );
+}
+```
+
+### Linking purchases to your user
+
+Store accounts are not your accounts. One Apple ID can be used by several app users, and one app user can have several devices and stores. Link them explicitly:
+
+- **iOS: `appAccountToken`**, which **must be a UUID**. Generate one per user on your backend and store it. Apple embeds it in every signed transaction and in renewal notifications.
+- **Android: `obfuscatedAccountId`** (and optionally `obfuscatedProfileId`). It must not contain PII (no email addresses) and has a length limit, so use the same UUID. It comes back as `externalAccountIdentifiers.obfuscatedExternalAccountId`.
+- On verification, if the token belongs to **another** user, apply an explicit policy: *transfer* to the current account (usual for "restore on a new account") or *deny* (to stop one subscription being shared). Log it either way.
+- Transactions created outside your purchase call (offer code redemption in the App Store, promoted IAP, purchases before you added the token) carry no token. Fall back to mapping by `originalTransactionId` / purchase token, and attach them to the authenticated user who submits them.
+
+### Backend: verifying Apple transactions
+
+```ts title="server/src/iap/apple.ts"
+import fs from 'node:fs';
+import {
+  AppStoreServerAPIClient,
+  Environment,
+  SignedDataVerifier,
+  type JWSTransactionDecodedPayload,
+} from '@apple/app-store-server-library';
+
+const bundleId = 'com.example.app';
+const appAppleId = Number(process.env.APPLE_APP_ID); // numeric App Store ID, required for Production
+// Apple root certificates downloaded from apple.com/certificateauthority (e.g. AppleRootCA-G3.cer)
+const rootCAs = ['AppleRootCA-G3.cer', 'AppleRootCA-G2.cer', 'AppleIncRootCertificate.cer'].map((f) =>
+  fs.readFileSync(`certs/${f}`),
+);
+const enableOnlineChecks = true; // OCSP revocation checks on the certificate chain
+
+const verifiers = {
+  production: new SignedDataVerifier(rootCAs, enableOnlineChecks, Environment.PRODUCTION, bundleId, appAppleId),
+  sandbox: new SignedDataVerifier(rootCAs, enableOnlineChecks, Environment.SANDBOX, bundleId),
+};
+
+export const appStoreApi = new AppStoreServerAPIClient(
+  process.env.APPLE_IAP_KEY_P8!, // In-App Purchase key contents
+  process.env.APPLE_IAP_KEY_ID!,
+  process.env.APPLE_ISSUER_ID!,
+  bundleId,
+  Environment.PRODUCTION,
+);
+
+/**
+ * App Review and TestFlight purchase in SANDBOX against your PRODUCTION backend,
+ * so production servers must accept sandbox transactions (and flag them as such).
+ */
+export async function verifyAppleTransaction(jws: string): Promise<JWSTransactionDecodedPayload> {
+  try {
+    return await verifiers.production.verifyAndDecodeTransaction(jws);
+  } catch (prodErr) {
+    return await verifiers.sandbox.verifyAndDecodeTransaction(jws); // throws if also invalid
+  }
+}
+```
+
+```ts title="server/src/iap/verifyRoute.ts"
+iapRouter.post('/iap/verify', requireAuth, async (req: AuthedRequest, res) => {
+  const { platform, productId, purchaseToken } = req.body as VerifyBody;
+  const user = await db.users.get(req.user.id);
+
+  if (platform === 'ios') {
+    const tx = await verifyAppleTransaction(purchaseToken).catch(() => null);
+    if (!tx) return res.status(400).json({ status: 'rejected' });
+    if (tx.appAccountToken && tx.appAccountToken !== user.iapAccountToken) {
+      return res.status(409).json({ status: 'rejected', reason: 'owned_by_other_account' });
+    }
+    await db.storePurchases.upsert({
+      store: 'app_store',
+      userId: user.id,
+      productId: tx.productId!,
+      originalId: tx.originalTransactionId!, // stable across renewals: the subscription's identity
+      latestTransactionId: tx.transactionId!,
+      environment: tx.environment!,
+      expiresAt: tx.expiresDate ? new Date(tx.expiresDate) : null,
+      status: tx.revocationDate ? 'revoked' : 'active',
+    }); // unique (store, originalId): replays are no-ops
+  } else {
+    await verifyGooglePurchase(user, productId, purchaseToken); // below
+  }
+
+  const entitlements = await recomputeEntitlements(user.id);
+  res.json({ status: 'granted', entitlements });
+});
+```
+
+For subscriptions, you can also call `appStoreApi.getAllSubscriptionStatuses(originalTransactionId)` to get the authoritative current state (including renewal info) instead of trusting a possibly stale transaction. Transactions from a local **StoreKit Configuration file** are signed by Xcode, not Apple, so they fail this verification. Handle them in a dev-only path, or test server flows with sandbox instead.
+
+### Backend: verifying Google purchases
+
+```ts title="server/src/iap/google.ts"
+import { google } from 'googleapis';
+
+const packageName = 'com.example.app';
+const auth = new google.auth.GoogleAuth({
+  scopes: ['https://www.googleapis.com/auth/androidpublisher'], // service account via GOOGLE_APPLICATION_CREDENTIALS
+});
+const publisher = google.androidpublisher({ version: 'v3', auth });
+
+const ENTITLED_STATES = new Set([
+  'SUBSCRIPTION_STATE_ACTIVE',
+  'SUBSCRIPTION_STATE_IN_GRACE_PERIOD',
+  'SUBSCRIPTION_STATE_CANCELED', // auto-renew off, but still paid until expiryTime
+]);
+
+export async function verifyGooglePurchase(user: User, productId: string, token: string) {
+  if (SUBSCRIPTION_PRODUCT_IDS.has(productId)) {
+    const { data } = await publisher.purchases.subscriptionsv2.get({ packageName, token });
+    const owner = data.externalAccountIdentifiers?.obfuscatedExternalAccountId;
+    if (owner && owner !== user.iapAccountToken) throw new OwnershipError();
+
+    const line = data.lineItems?.[0];
+    const expiresAt = line?.expiryTime ? new Date(line.expiryTime) : null;
+    const entitled = ENTITLED_STATES.has(data.subscriptionState ?? '') && !!expiresAt && expiresAt > new Date();
+
+    // Upgrades, downgrades and resubscribes create a NEW token that points at the old one.
+    if (data.linkedPurchaseToken) await db.storePurchases.markReplaced('play_store', data.linkedPurchaseToken);
+
+    await db.storePurchases.upsert({
+      store: 'play_store',
+      userId: user.id,
+      productId: line?.productId ?? productId,
+      originalId: token,
+      latestTransactionId: data.latestOrderId ?? token,
+      environment: data.testPurchase ? 'sandbox' : 'production',
+      expiresAt,
+      status: entitled ? 'active' : mapGoogleState(data.subscriptionState),
+    });
+    return;
+  }
+
+  // One-time products
+  const { data } = await publisher.purchases.products.get({ packageName, productId, token });
+  if (data.purchaseState === 2) return; // pending: grant later via RTDN or the next client delivery
+  if (data.purchaseState !== 0) throw new Error('Purchase canceled');
+  if (data.obfuscatedExternalAccountId && data.obfuscatedExternalAccountId !== user.iapAccountToken) {
+    throw new OwnershipError();
+  }
+  // Consumables: credit the balance exactly once per token (unique constraint on the token).
+  await db.consumableGrants.insertOnce({ token, userId: user.id, productId, orderId: data.orderId });
+}
+```
+
+As a safety net, a scheduled job should find verified Play purchases still in `ACKNOWLEDGEMENT_STATE_PENDING` after a few hours and acknowledge them server-side (`purchases.subscriptions.acknowledge` / `purchases.products.acknowledge`). The 3-day auto-refund then can't happen even if the app never came back. For one-time products with several purchase options, newer API versions add a v2 product purchase endpoint, so check the current Android Publisher reference.
+
+### Alternative: RevenueCat
+
+With RevenueCat, the SDK sends transactions to RevenueCat's servers, which validate them, finish them and keep entitlement state. You work in terms of **offerings → packages** and **entitlements**:
+
+```tsx title="src/iap/revenuecat.ts"
+import { Platform } from 'react-native';
+import Purchases, {
+  LOG_LEVEL,
+  PURCHASES_ERROR_CODE,
+  type CustomerInfo,
+  type PurchasesPackage,
+} from 'react-native-purchases';
+
+export function configurePurchases(appUserID: string) {
+  Purchases.setLogLevel(__DEV__ ? LOG_LEVEL.DEBUG : LOG_LEVEL.WARN);
+  Purchases.configure({
+    apiKey: Platform.OS === 'ios' ? 'appl_public_sdk_key' : 'goog_public_sdk_key', // public SDK keys
+    appUserID, // your user id, so entitlements follow the account across devices and stores
+  });
+}
+
+export const isPro = (info: CustomerInfo) => info.entitlements.active['pro'] !== undefined;
+
+export async function getPaywallPackages(): Promise<PurchasesPackage[]> {
+  const offerings = await Purchases.getOfferings();
+  return offerings.current?.availablePackages ?? []; // pkg.product.priceString is localized
+}
+
+export async function purchase(pkg: PurchasesPackage): Promise<'pro' | 'cancelled' | 'pending'> {
+  try {
+    const { customerInfo } = await Purchases.purchasePackage(pkg);
+    return isPro(customerInfo) ? 'pro' : 'pending';
+  } catch (e: any) {
+    if (e.userCancelled) return 'cancelled';
+    if (e.code === PURCHASES_ERROR_CODE.PAYMENT_PENDING_ERROR) return 'pending';
+    throw e;
+  }
+}
+
+export const restore = async () => isPro(await Purchases.restorePurchases());
+```
+
+Call `Purchases.logIn(userId)` / `logOut()` when auth changes, subscribe with `addCustomerInfoUpdateListener`, and use `RevenueCatUI.presentPaywallIfNeeded({ requiredEntitlementIdentifier: 'pro' })` from `react-native-purchases-ui` for remotely configured paywalls. Your **backend** should trust RevenueCat's webhooks (`INITIAL_PURCHASE`, `RENEWAL`, `CANCELLATION`, `BILLING_ISSUE`, `EXPIRATION`, `PRODUCT_CHANGE`) or its REST API, never an "I'm pro" flag sent by the app.
+
+### Restore, pending, interrupted and plan changes
+
+- **Restore purchases is required.** Apple requires a restore mechanism for restorable purchases (non-consumables and subscriptions), so a visible **Restore Purchases** button on the paywall and in settings is expected in review. Only force a StoreKit sync (the library's `syncIOS` / `AppStore.sync()`) on an explicit user tap, because it can prompt for the Apple ID password. On Android, owned purchases come back from the Play query automatically after a reinstall, but keep the button for parity.
+- **Pending purchases (Android):** cash payments, some carrier billing and slow payment methods produce `PENDING`. Don't grant and don't acknowledge. Show "pending" and grant when it becomes `PURCHASED` (via the listener or RTDN). The 3-day acknowledgement window starts at that point.
+- **Ask to Buy (iOS):** a child's purchase returns *pending*. Approval can arrive hours later as a transaction update, which is why the listener lives at the app root.
+- **Interrupted purchases (iOS):** the user may have to accept new terms or fix a payment method mid-purchase. The purchase first fails or pends, then succeeds later through transaction updates. Test this with a StoreKit Configuration file ("Enable Interrupted Purchases").
+- **Upgrades, downgrades and crossgrades:**
+
+| | iOS | Android |
+|---|---|---|
+| How | Buy another product in the **same subscription group**, and StoreKit handles the switch | New purchase that passes the **old purchase token** plus a **replacement mode** |
+| Upgrade | Immediate, with the remaining time refunded pro rata | Depends on replacement mode: `WITH_TIME_PRORATION`, `CHARGE_PRORATED_PRICE`, `CHARGE_FULL_PRICE`, `WITHOUT_PRORATION` |
+| Downgrade | Takes effect at next renewal (`DID_CHANGE_RENEWAL_PREF`) | Usually `DEFERRED` |
+| Crossgrade | Same duration: immediate. Different duration: at next renewal | Per replacement mode |
+| Backend impact | Same `originalTransactionId`, new `transactionId` / `productId` | **New purchase token**, with `linkedPurchaseToken` pointing at the old one, which you must retire |
+
+## Server notifications & entitlements
+
+The client only sees the moment of purchase. Renewals, billing failures, refunds, family-sharing revocations and cancellations all happen **server to server**, so without notifications your entitlement data goes stale.
+
+### App Store Server Notifications V2
+
+Apple POSTs `{ "signedPayload": "<JWS>" }`. Verify it with `verifier.verifyAndDecodeNotification(signedPayload)`, then verify the nested `signedTransactionInfo` and `signedRenewalInfo` the same way. Dedupe on `notificationUUID`. Apple retries failed deliveries several times over a few days, and the **Get Notification History** endpoint lets you backfill anything you missed.
+
+| `notificationType` (subtype) | Meaning | Action |
+|---|---|---|
+| `SUBSCRIBED` (`INITIAL_BUY`, `RESUBSCRIBE`) | New or returning subscriber | Grant |
+| `DID_RENEW` (`BILLING_RECOVERY`) | Renewed, or recovered from billing retry | Extend `expires_at` |
+| `DID_FAIL_TO_RENEW` (`GRACE_PERIOD` or none) | Renewal failed | Grace: keep access, prompt to fix payment. None: billing retry, remove access |
+| `GRACE_PERIOD_EXPIRED` | Grace ended without recovery | Remove access (billing retry continues) |
+| `DID_CHANGE_RENEWAL_STATUS` (`AUTO_RENEW_DISABLED` / `ENABLED`) | User canceled or re-enabled | Keep access until expiry, drive win-back |
+| `DID_CHANGE_RENEWAL_PREF` (`UPGRADE` / `DOWNGRADE`) | Plan change | Upgrade: immediate. Downgrade: at renewal |
+| `EXPIRED` (`VOLUNTARY`, `BILLING_RETRY`, `PRICE_INCREASE`, …) | Ended | Remove access |
+| `REFUND` / `REVOKE` | Refunded, or family-sharing access removed | Remove access, claw back consumables |
+| `REFUND_DECLINED`, `REFUND_REVERSED`, `CONSUMPTION_REQUEST`, `OFFER_REDEEMED`, `PRICE_INCREASE`, `RENEWAL_EXTENDED`, `TEST` | Other lifecycle events | Log and handle as relevant (answer `CONSUMPTION_REQUEST` with consumption data) |
+
+```ts title="server/src/iap/appStoreNotifications.ts"
+iapRouter.post('/webhooks/app-store', express.json(), async (req, res) => {
+  const payload = req.body.signedPayload as string;
+  const n = await verifiers.production
+    .verifyAndDecodeNotification(payload)
+    .catch(() => verifiers.sandbox.verifyAndDecodeNotification(payload))
+    .catch(() => null);
+  if (!n) return res.sendStatus(400);
+  if (!(await db.processedEvents.insertIfAbsent('app_store', n.notificationUUID!))) return res.sendStatus(200);
+
+  // Ack fast; the job verifies n.data.signedTransactionInfo / signedRenewalInfo and applies the transition.
+  await jobs.enqueue('apply-apple-notification', { type: n.notificationType, subtype: n.subtype, data: n.data });
+  res.sendStatus(200);
+});
+```
+
+### Google Real-time Developer Notifications (RTDN)
+
+Play publishes to your **Cloud Pub/Sub** topic. With a push subscription (authenticated with an OIDC token that you verify), your endpoint receives a base64 `message.data` containing `subscriptionNotification`, `oneTimeProductNotification`, `voidedPurchaseNotification` or `testNotification`. RTDN **carries no state**, only a type and a `purchaseToken`. Always call `purchases.subscriptionsv2.get` for the truth, and ack the Pub/Sub message only after you've processed it.
+
+| Notification | Action after re-fetching state |
+|---|---|
+| `SUBSCRIPTION_PURCHASED` | Grant, acknowledge if still pending |
+| `SUBSCRIPTION_RENEWED`, `SUBSCRIPTION_RECOVERED`, `SUBSCRIPTION_RESTARTED` | Extend or restore access |
+| `SUBSCRIPTION_IN_GRACE_PERIOD` | Keep access, prompt to fix payment |
+| `SUBSCRIPTION_ON_HOLD` | Remove access (account hold) |
+| `SUBSCRIPTION_PAUSED`, `SUBSCRIPTION_PAUSE_SCHEDULE_CHANGED` | Remove access while paused |
+| `SUBSCRIPTION_CANCELED` | Keep access until expiry, auto-renew is off |
+| `SUBSCRIPTION_EXPIRED` | Remove access |
+| `SUBSCRIPTION_REVOKED` | Remove access immediately (refund or revoke) |
+| `SUBSCRIPTION_PENDING_PURCHASE_CANCELED` | Clear the pending UI |
+| `ONE_TIME_PRODUCT_PURCHASED` / `ONE_TIME_PRODUCT_CANCELED` | Grant a completed pending purchase, or clear it |
+| Voided purchase | Revoke, claw back consumables, flag abuse |
+
+### Subscription state machine
+
+```mermaid
+stateDiagram-v2
+    state "Active" as Active
+    state "Active, auto-renew off" as Canceling
+    state "Grace period (access)" as Grace
+    state "Billing retry or on hold (no access)" as Retry
+    state "Paused (Android)" as Paused
+    state "Expired" as Expired
+    state "Revoked or refunded" as Revoked
+    [*] --> Active : SUBSCRIBED or PURCHASED
+    Active --> Active : DID_RENEW or RENEWED
+    Active --> Canceling : auto-renew disabled or CANCELED
+    Canceling --> Active : re-enabled or RESTARTED
+    Canceling --> Expired : EXPIRED
+    Active --> Grace : renewal failed, grace enabled
+    Active --> Retry : renewal failed, no grace
+    Grace --> Active : payment recovered
+    Grace --> Retry : GRACE_PERIOD_EXPIRED or ON_HOLD
+    Retry --> Active : RECOVERED or BILLING_RECOVERY
+    Retry --> Expired : retry window ends
+    Active --> Paused : PAUSED
+    Paused --> Active : resumes
+    Active --> Revoked : REFUND or REVOKED
+    Expired --> Active : resubscribe
+    Revoked --> [*]
+```
+*Figure: A unified subscription state machine. Apple and Google events map onto the same states.*
+
+Entitlement rule: **access = state in (Active, Canceling, Grace) and `expires_at` > now**, always evaluated with server time.
+
+### Entitlement data model
+
+Store purchases per store, and **derive** entitlements from them. Never let the client write an entitlement directly.
+
+```plaintext
+users              (id uuid PK, iap_account_token uuid UNIQUE, stripe_customer_id text, ...)
+
+store_purchases    (id uuid PK,
+                    user_id uuid NULL REFERENCES users,      -- null until linked
+                    store text,              -- app_store | play_store | stripe
+                    environment text,        -- production | sandbox
+                    product_id text,
+                    original_id text,        -- Apple originalTransactionId | Play purchase token | Stripe subscription id
+                    latest_transaction_id text,
+                    status text,             -- active | canceling | grace | retry | paused | expired | revoked | pending
+                    auto_renew boolean,
+                    expires_at timestamptz NULL,
+                    replaced_by uuid NULL,   -- Play linkedPurchaseToken chain, plan changes
+                    updated_at timestamptz,
+                    UNIQUE (store, original_id))
+
+product_entitlements (product_id text, entitlement text)   -- 'com.example.pro.yearly' -> 'pro'
+
+entitlements       (user_id uuid, entitlement text, source_purchase_id uuid,
+                    expires_at timestamptz NULL, PRIMARY KEY (user_id, entitlement))
+
+processed_events   (provider text, event_id text, received_at timestamptz,
+                    PRIMARY KEY (provider, event_id))       -- webhook / notification dedupe
+```
+
+`recomputeEntitlements(userId)` runs in a transaction after any purchase change. It takes the best active purchase for each entitlement (latest `expires_at`, ignoring sandbox rows for revenue reporting) and upserts the `entitlements` table. Clients fetch `GET /me/entitlements` and cache it locally (in MMKV, with its expiry) so paying users aren't locked out while offline.
+
+### Cross-platform entitlements
+
+```mermaid
+flowchart TD
+    Web["Web checkout<br/>Stripe Billing"] -->|"signed webhooks"| Ingest
+    IOS["iOS app<br/>StoreKit 2"] -->|"JWS and ASSN V2"| Ingest
+    Droid["Android app<br/>Play Billing"] -->|"token and RTDN"| Ingest
+    Ingest["Purchase ingestion<br/>verify, dedupe, normalize"] --> Purchases[("store_purchases")]
+    Purchases --> Resolver["Entitlement resolver"]
+    Resolver --> Ent[("entitlements")]
+    Ent --> MeAPI["GET /me/entitlements"]
+    MeAPI --> Clients["iOS, Android, web<br/>gate features"]
+```
+*Figure: Every store feeds one normalised pipeline, and every client reads the same entitlements.*
+
+Practical rules:
+
+- **The account is the unit, not the device.** A user who subscribed on the web (Stripe Billing: `customer.subscription.updated`, `invoice.paid`, `invoice.payment_failed`) gets Pro on iOS after signing in. This is allowed under the multiplatform-services rule, as long as the app also offers IAP.
+- **Prevent double subscriptions.** If the user already has an active entitlement from another store, hide the paywall and say where they're subscribed.
+- **Manage in the right place.** You can't cancel an Apple subscription from Android. Route "Manage subscription" by `store`: `https://apps.apple.com/account/subscriptions` for iOS, `https://play.google.com/store/account/subscriptions?sku=<id>&package=<pkg>` for Play, and the Stripe customer portal for web.
+
+## Security
+
+- **Server-side prices.** The client sends IDs and quantities only.
+- **Idempotency everywhere money moves:** idempotency keys, unique constraints on `(store, original_id)`, consumable tokens and event IDs.
+- **Authenticate every inbound event:** Stripe `constructEvent`, Razorpay HMAC compared in constant time, Apple JWS via `SignedDataVerifier`, Pub/Sub push OIDC tokens.
+- **Replay protection:** dedupe event IDs, rely on Stripe's timestamp tolerance, and treat a transaction already linked to another user as a conflict, not a new grant.
+- **Never trust client receipts or "isPro" flags.** Jailbreak tweaks fake StoreKit responses locally, so gate server features on server-verified entitlements.
+- **Refund abuse:** process `REFUND` and voided purchases, claw back consumables (allow negative balances), flag repeat refunders, and answer `CONSUMPTION_REQUEST` truthfully.
+- **Secrets** (Stripe secret key, `.p8`, service-account JSON) live in a secret manager. The app ships only publishable or public SDK keys.
+- **Log IDs, not data.** No card data, client secrets, raw JWS, emails or addresses in logs. Scrub Sentry breadcrumbs on payment routes.
+- **Authenticate and rate-limit payment endpoints** to stop card testing.
+
+See [Security](security.html) for device hardening and [Authentication & Sessions](authentication.html) for account linking.
+
+## Edge cases & gotchas
+
+- **App killed mid-payment.** Stripe: the webhook still fulfils. IAP: the unfinished transaction is redelivered on the next launch, as long as your listener is mounted at startup.
+- **Double taps and retries** create duplicate PaymentIntents or orders unless you use idempotency keys and disable the button.
+- **Sandbox transactions in production.** App Review purchases with sandbox accounts against your production backend. Rejecting sandbox JWS or tokens there is a classic rejection cause ("the purchase didn't unlock anything").
+- **Account switching.** Apple ID A buys while app user X is signed in, then user Y signs in on the same device. Your ownership policy decides what happens, and it must be explicit.
+- **Price increases.** Apple may require user consent for some increases (`PRICE_INCREASE`), and Play has its own price-change flow. Users who don't consent churn at renewal.
+- **Clock and timezones.** Evaluate expiry with server UTC time, never the device clock.
+
+## Testing & debugging
+
+### Stripe
+
+```bash
+stripe login
+stripe listen --forward-to localhost:4242/webhooks/stripe   # prints a whsec_ for local use
+stripe trigger payment_intent.succeeded
+stripe trigger charge.dispute.created
+```
+
+| Test card | Behaviour |
+|---|---|
+| `4242 4242 4242 4242` | Succeeds |
+| `4000 0027 6000 3184` | Always requires 3DS authentication |
+| `4000 0000 0000 0002` | Generic decline |
+| `4000 0000 0000 9995` | Insufficient funds |
+
+Use any future expiry date and any CVC. Test the 3DS card on a **real device in a release-like build** to confirm the redirect returns to the app. For subscriptions billed on the web, use Stripe **test clocks** to simulate renewals and failures.
+
+### Apple
+
+- **StoreKit Configuration file:** instant, offline purchases in the simulator. The **Transaction Manager** (Debug → StoreKit → Manage Transactions) lets you refund, expire, trigger Ask to Buy and interrupted purchases, and speed up renewals.
+- **Sandbox testers:** sign in on the device under the sandbox account section of Settings (under App Store, or Developer on recent iOS versions). Subscriptions renew on an accelerated schedule: a 1-month subscription renews roughly every 5 minutes and a 1-year one roughly every hour. You can adjust the renewal rate, clear purchase history and simulate billing issues per tester in App Store Connect.
+- **TestFlight** also uses the sandbox environment.
+- **Notifications:** call `appStoreApi.requestTestNotification()` to check that your endpoint receives and verifies a `TEST` notification.
+
+### Google
+
+- **License testers** see test instruments ("Test card, always approves", "…always declines", and slow cards that produce **pending** purchases). Test subscriptions renew fast (a monthly plan renews in about 5 minutes), and test orders are refunded automatically.
+- **Play Billing Lab** lets you change the Play country and test offer eligibility and accelerated subscription scenarios.
+- **RTDN:** use *Send test notification* on the Monetization setup page, and watch the Pub/Sub subscription metrics for undelivered messages.
+- Debug on device with `adb logcat | grep -i billing`.
+
+## App Review pitfalls
+
+- **External payment for digital goods** outside the storefronts and entitlements that allow it (guideline 3.1.1). This includes "subscribe on our website" buttons in regions where steering is still prohibited.
+- **No Restore Purchases** button for non-consumables or subscriptions.
+- **Missing subscription disclosures (3.1.2):** the paywall must show the title, length, **price per period** and what's included. The binary must link to your **Terms of Use (EULA)** and **Privacy Policy**, and the App Store metadata must include them too.
+- **Misleading paywalls:** the trial price shown bigger than the real price, hidden close buttons, fake countdowns, or "free" without clearly stating what's charged afterwards.
+- **IAP products not submitted** with the build, or the reviewer's sandbox purchase failing because the backend rejects sandbox transactions.
+- **Using IAP for physical goods or real-world services**, which is also a rejection.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| iOS product list is empty | Paid Applications Agreement, banking or tax incomplete; product in *Missing Metadata*; bundle ID mismatch; product IDs typo'd; new products still propagating | Complete the agreements in App Store Connect → Business, fill in all product metadata (including the review screenshot) until it reads *Ready to Submit*, check the bundle ID, wait a few hours after creating products |
+| Android product list is empty | App not uploaded to a testing track; tester not a license tester or hasn't accepted the opt-in; installed build's `applicationId` differs; products inactive; device account isn't the tester | Upload an AAB with the `BILLING` permission to internal testing, add the tester to both lists, install from the Play link, activate products and base plans |
+| Android purchases refunded after 3 days | Purchase never acknowledged or consumed | Call `finishTransaction` after granting, and add a server-side acknowledgement sweeper |
+| "Item already owned" on Android | Consumable never consumed, or a previous purchase pending | Consume after granting (`isConsumable: true`), and process unfinished purchases at launch |
+| Purchase succeeded but nothing unlocked | Backend rejected a sandbox transaction, or verification failed and the client still finished | Accept sandbox on production (flagged), and only finish after a successful grant |
+| PaymentSheet 3DS never returns to the app | Missing `urlScheme` / `returnURL`, URL scheme not registered, or links not forwarded to `handleURLCallback` | Register the scheme in `Info.plist` and the manifest, pass `urlScheme` to `StripeProvider` and `returnURL` to `initPaymentSheet`, wire up the `Linking` handler |
+| Apple Pay missing from PaymentSheet | No Merchant ID or Apple Pay capability/entitlement, processing certificate not uploaded to Stripe, `applePay` not passed, no card in Wallet | Complete the Apple Pay setup steps and test on a device with a card |
+| Google Pay missing | Manifest `meta-data` missing, Google Pay disabled in Stripe, `testEnv` doesn't match your keys, no Play services or card | Add the `meta-data` (or the plugin flag), enable Google Pay, align `testEnv` with test/live mode |
+| Every webhook returns 400 | JSON parser ran before `constructEvent`, or the wrong `whsec_` (CLI vs Dashboard endpoint, test vs live) | Mount the raw-body route first, and use the secret for that endpoint |
+| Duplicate orders or charges | No idempotency key, a new PaymentIntent per tap | Idempotency keys, one pending order per cart, reuse open PaymentIntents |
+| Apple JWS verification fails | Wrong environment verifier, missing `appAppleId` for production, missing root certs, StoreKit-config (Xcode-signed) transaction | Try production then sandbox, configure the app ID and root CAs, don't verify local StoreKit transactions against Apple roots |
+| No RTDN arriving | Pub/Sub publisher grant missing, wrong topic name in Play Console, push endpoint rejecting auth | Grant the Play service account Publisher, re-send the test notification, check the subscription's delivery metrics |
+
+## Production checklist
+
+- [ ] Payment mechanism chosen per product type and storefront, with current §3.1 / Play Payments policy reviewed for every region shipped
+- [ ] Live Stripe account activated; live keys in the secret manager; publishable key per environment
+- [ ] Amounts computed server-side; idempotency keys on PaymentIntent, refund and customer creation
+- [ ] Webhook endpoint uses a raw body, verifies signatures, dedupes event IDs, acknowledges fast and queues work
+- [ ] Reconciliation job for stuck orders and daily payout matching, with alerts
+- [ ] 3DS tested on a real device in a release build; `urlScheme` / `returnURL` configured
+- [ ] Apple Pay processing certificate uploaded, with a renewal reminder; Google Pay production access approved and `testEnv: false` in release
+- [ ] Radar rules, rate limits and auth on payment endpoints; dispute evidence process defined
+- [ ] Paid Applications Agreement, banking and tax complete; IAP products *Ready to Submit* and attached to the version
+- [ ] Play payments profile set up; products and base plans active; Play Billing Library version compliant
+- [ ] Purchase listener mounted at app root; transactions finished or acknowledged only after the server grants
+- [ ] Server verification for Apple (JWS, `SignedDataVerifier`, sandbox fallback) and Google (`subscriptionsv2.get` / `products.get`)
+- [ ] `appAccountToken` / `obfuscatedAccountId` sent on every purchase; ownership conflict policy defined
+- [ ] App Store Server Notifications V2 (production and sandbox URLs) and RTDN configured and tested
+- [ ] Subscription state machine covers grace, retry or hold, pause, cancel, expire, refund and revoke
+- [ ] Restore Purchases button on the paywall and in settings
+- [ ] Paywall shows localised prices, period, auto-renew terms, and links to Terms and Privacy
+- [ ] Unified entitlements API used by every client; offline cache with expiry
+- [ ] Refund and voided-purchase handling claws back consumables
+- [ ] Logs and crash reports scrubbed of card data, secrets and PII
+- [ ] Monitoring on webhook failure rates, verification errors, payment success rate and entitlement mismatches (see [Monitoring](monitoring.html))
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [Stripe — Accept a payment (React Native)](https://docs.stripe.com/payments/accept-a-payment?platform=react-native)
+- [stripe-react-native](https://github.com/stripe/stripe-react-native)
+- [Apple — App Store Server API](https://developer.apple.com/documentation/appstoreserverapi)
+- [Google Play Billing](https://developer.android.com/google/play/billing)
+- [RevenueCat documentation](https://www.revenuecat.com/docs)
+- [App Store Review Guidelines (§3.1 Payments)](https://developer.apple.com/app-store/review/guidelines/)
+
+## Interview questions
+
+### How do you decide between a payment gateway like Stripe and Apple/Google in-app purchases?
+
+It depends on **what is sold and where it's consumed**. Physical goods and real-world services (food, rides, bookings, e-commerce) must use a gateway such as Stripe, Braintree, Adyen or Razorpay, usually with Apple Pay and Google Pay. Digital content, features and subscriptions used in the app must use IAP / Play Billing under Apple 3.1.1 and Google's Payments policy. Exceptions include reader apps (link-out entitlement), real-time one-to-one services, enterprise apps sold to organisations, and multiplatform access to purchases made elsewhere (provided IAP is also offered). Regional rules now differ: US link-outs after the 2025 *Epic v. Apple* ruling, the EU DMA, Japan and South Korea. So I'd check the current guidelines per storefront and make payment options configurable from the server.
+
+### Walk me through a Stripe PaymentSheet payment. Where does fulfillment happen, and why?
+
+The app sends a cart ID and an idempotency key. The server recomputes the total, creates a Customer, an Ephemeral Key (or CustomerSession) and a PaymentIntent, and returns the `client_secret`. The app calls `initPaymentSheet` and `presentPaymentSheet`. The SDK collects the card (keeping us in minimal PCI scope), runs 3DS if required, and returns via the URL scheme. **Fulfillment happens in the `payment_intent.succeeded` webhook**, after signature verification and event-ID dedupe. The client can die mid-flow, a 3DS redirect can strand the user, and asynchronous methods can settle later, so only the signed provider event is authoritative. The client just polls or listens for the order status.
+
+### How do you prevent double charges?
+
+Use layers. The UI disables the button while presenting. The client sends a stable **idempotency key** per checkout attempt. The server keeps **one pending order per cart**, reuses an open PaymentIntent whose amount matches, and passes a Stripe `idempotencyKey` derived from the order, amount and client key, so a retried request returns the same PaymentIntent. Webhooks are deduped by event ID, and `markPaid` is a conditional update (`WHERE status <> 'paid'`), so duplicate or out-of-order events are harmless. For IAP, the equivalent is unique constraints on the original transaction ID or purchase token, and granting each consumable token exactly once.
+
+### What is SCA / 3D Secure, and what commonly breaks it in React Native apps?
+
+Strong Customer Authentication (mandatory in the EEA and UK, and common elsewhere) requires the issuer to challenge the cardholder, for example with a bank-app approval or an OTP. The Stripe SDK handles it: the PaymentIntent moves to `requires_action`, the SDK presents the challenge in-app or in a browser, then completes confirmation. What breaks it is a missing **`urlScheme` on `StripeProvider` / `returnURL` in `initPaymentSheet`**, an unregistered URL scheme, a deep-link handler that doesn't forward URLs to `handleURLCallback`, or a navigation linking config that swallows the redirect. The user then gets stuck in the browser, and the order stays in `requires_action` until the reconciliation job cancels it.
+
+### How do you verify an in-app purchase on the server for iOS and Android?
+
+**iOS:** StoreKit 2 gives a JWS-signed transaction. The backend verifies it with Apple's `@apple/app-store-server-library` `SignedDataVerifier` (certificate chain to Apple's root CA, bundle ID, environment, and the app's Apple ID in production). It optionally calls the App Store Server API (`getAllSubscriptionStatuses`) for the current status. **Android:** the backend calls the Google Play Developer API (`purchases.subscriptionsv2.get` or `purchases.products.get`) with the purchase token, using a service account, and reads the state, expiry, acknowledgement state and `obfuscatedExternalAccountId`. On both platforms: check that the account token matches the user, upsert idempotently, recompute entitlements, and accept sandbox transactions on production (flagged) because App Review uses sandbox. The legacy `verifyReceipt` is deprecated.
+
+### What happens if you don't finish or acknowledge a transaction, and in what order should you do it?
+
+On **Android**, a purchase not **acknowledged within 3 days** (or consumed, for consumables) is automatically refunded and the entitlement revoked. On **iOS**, an unfinished transaction stays in the queue and is redelivered on every launch. The right order is **verify, then grant on the server, then finish**. Finishing first risks a paid user with nothing unlocked if the backend call fails. Granting first and failing to finish just causes a harmless redelivery that your idempotent backend absorbs. Add a server-side acknowledgement sweeper for Play as a safety net.
+
+### How would you model subscription state, including grace periods, billing retry and refunds?
+
+Normalise both stores into one state machine: active, active with auto-renew off, grace period (keeps access), billing retry / account hold (no access), paused (Android), expired, and revoked or refunded. Transitions are driven by **App Store Server Notifications V2** (`DID_RENEW`, `DID_FAIL_TO_RENEW`, `GRACE_PERIOD_EXPIRED`, `EXPIRED`, `REFUND`, `REVOKE`, and so on) and **Google RTDN** via Pub/Sub. For Google I always re-fetch state with `subscriptionsv2.get`, because RTDN carries no state. Access is derived: state in (active, canceling, grace) and `expires_at` > server now. Purchases are stored per store, and entitlements are recomputed from them, never written by the client.
+
+### A user subscribes on the web, then installs the iOS and Android apps. How do you support that?
+
+Entitlements belong to the **account**, not the device or store. Web purchases arrive through Stripe Billing webhooks, iOS through JWS verification plus ASSN V2, and Android through token verification plus RTDN. All of them flow into one `store_purchases` table, and an entitlement resolver computes `entitlements`. Every client calls `GET /me/entitlements` after sign-in. Apple allows accessing purchases made elsewhere as long as IAP is also offered in the app. The UX details: hide the paywall when an entitlement from another store is active (to prevent double billing), and route "Manage subscription" to the right place (App Store settings, Play subscriptions, or the Stripe customer portal).
+
+### RevenueCat or react-native-iap: which would you choose?
+
+The client call is trivial with either. The real cost is the backend: validation, notification processing, renewal, grace and refund state, upgrade token chains and cross-platform entitlements. For a typical subscription app without a billing team, I'd choose **RevenueCat**: hosted validation, entitlements, webhooks and remote paywalls, for a revenue share that's usually cheaper than the engineering time. I'd choose **react-native-iap / expo-iap plus our own backend** when we already run billing (for example, Stripe on the web as the source of truth), need data control or residency, or the revenue share is significant at our scale. Either way, I'd wrap it behind a `PurchasesService` interface so the choice stays reversible.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

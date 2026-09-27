@@ -1,0 +1,1333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deep Linking &amp; Universal Links · React Native Interview Handbook</title>
+<meta name="description" content="How to make URLs open specific screens in a React Native app: custom URL schemes, iOS Universal Links, Android App Links and deferred deep links — with the native setup, the…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Deep Linking &amp; Universal Links · React Native Interview Handbook">
+<meta property="og:description" content="How to make URLs open specific screens in a React Native app: custom URL schemes, iOS Universal Links, Android App Links and deferred deep links — with the native setup, the…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/deep-linking.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Deep Linking & Universal Links
+
+How to make URLs open specific screens in a React Native app: custom URL schemes, iOS Universal Links, Android App Links and deferred deep links — with the native setup, the hosted verification files, React Navigation and Expo Router configuration, auth-gated and push-driven routing, security hardening, and a testing and troubleshooting playbook.
+
+## How it works
+
+A deep link is a URL that the OS hands to your app instead of (or before) a browser. Your app then turns that URL into navigation state. There are four mechanisms, and a senior engineer should be able to explain when each applies:
+
+| Mechanism | Example | Ownership verified? | If app not installed | Typical use |
+|---|---|---|---|---|
+| **Custom URI scheme** | `myapp://product/42` | No — any app can register `myapp` | Error / nothing happens | App-to-app, OAuth redirects (with PKCE), internal links, dev testing |
+| **iOS Universal Links** | `https://example.com/product/42` | Yes — `apple-app-site-association` (AASA) file on your domain + Associated Domains entitlement | Opens the page in Safari | Shared links, emails, SMS, marketing, SEO pages |
+| **Android App Links** | `https://example.com/product/42` | Yes — `assetlinks.json` on your domain + `autoVerify` intent filter | Opens in the browser | Same as Universal Links |
+| **Deferred deep links** | `https://go.example.com/p/42` | Via an attribution service or your own backend | Store → install → first launch restores the destination | Growth: invites, referrals, paid campaigns |
+
+Universal Links and App Links are the default choice for anything a human will share, because they are **verified** (no other app can hijack them), they **degrade gracefully** to your website, and the same URL works on web, iOS and Android. Custom schemes remain useful for app-to-app communication and development, but should never carry anything sensitive.
+
+```mermaid
+flowchart TD
+    Tap(["User taps a link"]) --> Kind{"Link type?"}
+    Kind -->|"custom scheme"| Scheme{"Installed app<br/>claims the scheme?"}
+    Scheme -->|"yes"| OpenScheme["Open app<br/>Safari may confirm first"]
+    Scheme -->|"no"| Fail["Error or nothing happens"]
+    Kind -->|"https"| Plat{"Platform?"}
+    Plat -->|"iOS"| UL{"App installed, domain verified<br/>via AASA and path matches?"}
+    Plat -->|"Android"| AL{"App installed and host<br/>verified via assetlinks.json?"}
+    UL -->|"yes"| OpenUL["Open app directly<br/>continueUserActivity"]
+    AL -->|"yes"| OpenAL["Open app directly<br/>VIEW intent"]
+    UL -->|"no"| Browser["Open in browser"]
+    AL -->|"no, Android 12+"| Browser
+    Browser --> Web["Web page with smart banner<br/>or store link"]
+    Web -->|"user installs"| Store["App Store or Play Store"]
+    Store -.->|"first launch"| Deferred["Deferred link restores<br/>original destination"]
+```
+*Figure: How the OS decides where a link goes. Verified https links open the app with no prompt; everything else falls back to the browser.*
+
+### What happens under the hood
+
+- **iOS** downloads the AASA file for every domain listed in the app's Associated Domains entitlement when the app is installed or updated — not when the link is tapped. Since iOS 14 the download goes through an **Apple-operated CDN** that caches your file. When a user taps an `https` link, the system checks its local database; on a match it launches the app and delivers an `NSUserActivity` of type `NSUserActivityTypeBrowsingWeb` to `application(_:continue:restorationHandler:)`.
+- **Android** verifies each host in intent filters marked `android:autoVerify="true"` by fetching `https://<host>/.well-known/assetlinks.json` and checking that it lists your package name and signing-certificate SHA-256 fingerprint. Verified links are delivered straight to your activity as an `ACTION_VIEW` intent. Since Android 12, unverified `https` links open in the browser rather than showing a chooser.
+- **React Native** exposes both platforms through the `Linking` module: `Linking.getInitialURL()` for the URL that launched the app (cold start) and the `'url'` event for URLs received while running (warm start). Navigation libraries (React Navigation, Expo Router) subscribe to these and map paths to screens.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant Msg as Messages or Mail
+    participant iOS as iOS swcd
+    participant CDN as Apple CDN
+    participant Site as example.com
+    participant AD as AppDelegate
+    participant JS as RN Linking
+    participant Nav as React Navigation
+    Note over iOS,Site: At app install or update
+    iOS->>CDN: request AASA for example.com
+    CDN->>Site: GET /.well-known/apple-app-site-association
+    Site-->>CDN: JSON, cached by Apple
+    CDN-->>iOS: AASA JSON
+    Note over iOS: Stores domain and path rules for the app
+    U->>Msg: tap link to example.com/product/42
+    Msg->>iOS: open https URL
+    iOS->>iOS: domain and path match components
+    iOS->>AD: continueUserActivity with browsing-web activity
+    AD->>JS: RCTLinkingManager emits url event
+    JS->>Nav: linking listener receives URL
+    Nav->>Nav: getStateFromPath, navigate to Product 42
+```
+*Figure: Universal Link verification at install time and a tap while the app is running. On a cold start the URL is returned by getInitialURL instead of the url event.*
+
+## Requirements & prerequisites
+
+| Requirement | Needed for | Details |
+|---|---|---|
+| A domain you control, served over **HTTPS** with a valid certificate | Universal Links, App Links | Use a domain (or subdomain like `links.example.com`) where you can guarantee the files stay online. A marketing site on a third-party CMS that can't serve `/.well-known/` files is a common blocker |
+| Ability to host files at `/.well-known/` | Both | `apple-app-site-association` (no extension) and `assetlinks.json`, served as `application/json`, **without redirects**, publicly reachable (no auth, no bot challenge) |
+| Apple **Team ID** + **bundle ID** | iOS | Combined as the app ID `ABCDE12345.com.example.app` in the AASA file |
+| Associated Domains capability | iOS | Enabled on the App ID and in the entitlements file (`com.apple.developer.associated-domains`) |
+| Android **package name** | Android | `com.example.app` (the `applicationId`) |
+| SHA-256 certificate fingerprints | Android | Debug keystore, upload key, and the **Play App Signing** key from Play Console (plus the internal app sharing certificate if you use that) |
+| A custom scheme name | Custom scheme | Unique, reverse-DNS-like or brand-specific (`myapp`, `com.example.app`); avoid generic words |
+| Navigation library with linking support | JS routing | React Navigation 7 (`linking` prop) or Expo Router (automatic) |
+| Attribution provider or own backend | Deferred deep links | Branch, AppsFlyer, Adjust, or a custom solution using Play Install Referrer |
+
+## Choosing an approach
+
+| Decision | Options | Recommendation |
+|---|---|---|
+| Link format | Custom scheme only / Universal + App Links / both | **Both**: https links for everything shared; the custom scheme for app-to-app, dev tools and as a fallback. Configure both as prefixes so the same paths work |
+| Routing | React Navigation `linking` config / Expo Router | Expo Router if you're on Expo and want file-based routes with automatic links; React Navigation when you need full control or have an existing navigator tree |
+| Deferred deep linking and attribution | Branch / AppsFlyer / Adjust / DIY | A provider if marketing needs attribution, campaign analytics and link management. DIY (own link domain + Play Install Referrer + landing page) if you only need "open the invite after install" and can accept weaker iOS matching |
+| Link domain | Main domain / dedicated subdomain | Main domain paths for content that also exists on the web (`/product/42`). A dedicated subdomain (`go.example.com`) for short links and campaigns, so you can exclude it from web-only routing |
+
+> [!NOTE]
+> Firebase Dynamic Links shut down on **August 25, 2025**. Any `*.page.link` URLs in old emails, QR codes or printed material no longer resolve. New projects should use Universal Links / App Links directly, plus a deferred-linking provider if needed (see the Deferred deep linking section).
+
+## Setup — custom URL scheme
+
+### iOS: register the scheme
+
+```xml title="ios/MyApp/Info.plist (excerpt)"
+<key>CFBundleURLTypes</key>
+<array>
+  <dict>
+    <key>CFBundleURLName</key>
+    <string>com.example.app</string>
+    <key>CFBundleURLSchemes</key>
+    <array>
+      <string>myapp</string>
+    </array>
+  </dict>
+</array>
+```
+
+`npx uri-scheme add myapp` can add this (and the Android equivalent) for you. If your app needs to *check* whether other apps are installed with `Linking.canOpenURL('otherapp://')`, list those schemes under `LSApplicationQueriesSchemes`; opening them with `Linking.openURL` works without it.
+
+### iOS: forward URLs to React Native
+
+iOS delivers custom-scheme URLs to `application(_:open:options:)` and Universal Links to `application(_:continue:restorationHandler:)`. Both must be forwarded to `RCTLinkingManager`, which feeds `Linking.getInitialURL()` and the `'url'` event. This is the single most commonly missed step when "links open the app but nothing happens".
+
+```swift title="ios/MyApp/AppDelegate.swift (additions)"
+import UIKit
+import React
+
+@main
+class AppDelegate: UIResponder, UIApplicationDelegate {
+  // ... window, reactNativeFactory and didFinishLaunching from the template
+
+  // Custom scheme: myapp://product/42
+  func application(
+    _ app: UIApplication,
+    open url: URL,
+    options: [UIApplication.OpenURLOptionsKey: Any] = [:]
+  ) -> Bool {
+    return RCTLinkingManager.application(app, open: url, options: options)
+  }
+
+  // Universal Links: https://example.com/product/42
+  func application(
+    _ application: UIApplication,
+    continue userActivity: NSUserActivity,
+    restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void
+  ) -> Bool {
+    return RCTLinkingManager.application(
+      application,
+      continue: userActivity,
+      restorationHandler: restorationHandler
+    )
+  }
+}
+```
+
+If your `AppDelegate` subclasses `RCTAppDelegate` (the Swift template used by React Native 0.77–0.78), these methods need the `override` keyword. If Swift can't see `RCTLinkingManager`, import its header (`#import <React/RCTLinkingManager.h>`) in the bridging header.
+
+The Objective-C equivalent for older projects:
+
+```objectivec title="ios/MyApp/AppDelegate.mm (additions)"
+#import <React/RCTLinkingManager.h>
+
+- (BOOL)application:(UIApplication *)application
+            openURL:(NSURL *)url
+            options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options
+{
+  return [RCTLinkingManager application:application openURL:url options:options];
+}
+
+- (BOOL)application:(UIApplication *)application
+    continueUserActivity:(nonnull NSUserActivity *)userActivity
+      restorationHandler:(nonnull void (^)(NSArray<id<UIUserActivityRestoring>> *_Nullable))restorationHandler
+{
+  return [RCTLinkingManager application:application
+                   continueUserActivity:userActivity
+                     restorationHandler:restorationHandler];
+}
+```
+
+> [!NOTE]
+> Apple is moving apps to the scene-based lifecycle (`UIScene`). In a scene-based app, URLs arrive in the scene delegate (`scene(_:openURLContexts:)`, `scene(_:continue:)`, and in `connectionOptions` on cold start) instead of the app delegate. React Native templates and Expo handle this for you when they adopt scenes; if you migrate by hand, forward those callbacks too. Check the current React Native and Apple guidance for your version.
+
+### Android: intent filter
+
+```xml title="android/app/src/main/AndroidManifest.xml (MainActivity)"
+<activity
+    android:name=".MainActivity"
+    android:exported="true"
+    android:launchMode="singleTask"
+    android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+    android:windowSoftInputMode="adjustResize">
+
+    <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+    </intent-filter>
+
+    <!-- Custom scheme: myapp://... -->
+    <intent-filter>
+        <action android:name="android.intent.action.VIEW" />
+        <category android:name="android.intent.category.DEFAULT" />
+        <category android:name="android.intent.category.BROWSABLE" />
+        <data android:scheme="myapp" />
+    </intent-filter>
+</activity>
+```
+
+- `VIEW` + `DEFAULT` lets the system resolve implicit intents to your activity; `BROWSABLE` allows browsers and other apps to open it from a link. Missing `BROWSABLE` is a classic "works from adb, not from Chrome" bug.
+- `launchMode="singleTask"` makes a link delivered while the app is running go to the existing activity (`onNewIntent`, surfaced as the `'url'` event) instead of creating a second activity with a second React instance.
+- `android:exported="true"` is mandatory for activities with intent filters when targeting Android 12+.
+
+## Setup — iOS Universal Links
+
+### Step 1 — Associated Domains entitlement
+
+Enable **Associated Domains** in Xcode → target → Signing & Capabilities, and add one entry per host. Subdomains are separate hosts: `example.com` does not cover `www.example.com`. A wildcard (`applinks:*.example.com`) matches subdomains but not the apex domain.
+
+```xml title="ios/MyApp/MyApp.entitlements"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.developer.associated-domains</key>
+  <array>
+    <string>applinks:example.com</string>
+    <string>applinks:www.example.com</string>
+    <string>applinks:go.example.com</string>
+    <!-- Password AutoFill for the same domain -->
+    <string>webcredentials:example.com</string>
+  </array>
+</dict>
+</plist>
+```
+
+For staging domains during development, append `?mode=developer` (for example `applinks:staging.example.com?mode=developer`). In developer mode the device fetches the AASA file **directly from your server**, bypassing Apple's CDN, so changes apply immediately. It only works for development-signed builds on devices with **Settings → Developer → Associated Domains Development** turned on. Don't ship it as your only production entry.
+
+### Step 2 — The apple-app-site-association file
+
+The modern format (iOS 13+) uses `components`, which match path (`/`), query (`?`) and fragment (`#`) separately. Rules are evaluated **in order and the first match wins**, so exclusions go first.
+
+```json title="https://example.com/.well-known/apple-app-site-association"
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": ["ABCDE12345.com.example.app", "ABCDE12345.com.example.app.staging"],
+        "components": [
+          { "/": "/account/*", "exclude": true, "comment": "Account pages stay on the web" },
+          { "#": "web", "exclude": true, "comment": "Escape hatch: add #web to force the browser" },
+          { "/": "/product/*", "comment": "Product detail" },
+          { "/": "/orders/*", "comment": "Order detail (auth required)" },
+          { "/": "/i/*", "comment": "Invites" },
+          { "/": "/search", "?": { "q": "?*" }, "comment": "Search with a non-empty query" }
+        ]
+      }
+    ]
+  },
+  "webcredentials": {
+    "apps": ["ABCDE12345.com.example.app"]
+  }
+}
+```
+
+The legacy `paths` format still works and is what you'll find in older projects (use `NOT` for exclusions). If both are present, iOS 13+ uses `components`:
+
+```json
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appID": "ABCDE12345.com.example.app",
+        "paths": ["NOT /account/*", "/product/*", "/orders/*", "/i/*"]
+      }
+    ]
+  }
+}
+```
+
+Matching notes: `*` matches any number of characters and `?` exactly one; matching is case-sensitive unless you set `"caseSensitive": false`; the component `"/"` pattern must match the whole path. Route only paths the app actually handles — a Universal Link that opens the app to a "not found" screen is worse than the web page.
+
+### Step 3 — Hosting rules
+
+| Rule | Detail |
+|---|---|
+| Location | `https://<host>/.well-known/apple-app-site-association` (the root path is also checked, but use `.well-known`) |
+| File name | Exactly `apple-app-site-association` — **no `.json` extension** |
+| Content-Type | `application/json` |
+| Transport | HTTPS with a valid, trusted certificate |
+| Redirects | **None** — not `http`→`https`, not apex→`www`, not to a CDN path |
+| Size | 128 KB maximum uncompressed |
+| Access | Public: no auth, no IP allowlists, no bot/WAF challenge pages, no geo-blocking. Apple's CDN fetches it from Apple's servers |
+| SPA fallbacks | Make sure your web framework doesn't rewrite unknown paths to `index.html` — an HTML 200 response is an invalid AASA |
+
+A minimal server route, if your site is served by Node:
+
+```ts title="server/wellKnown.ts"
+import express from 'express';
+import aasa from './apple-app-site-association.json';
+import assetlinks from './assetlinks.json';
+
+export const wellKnown = express.Router();
+
+// Both files: JSON content type, no redirects, cacheable but not forever.
+wellKnown.get('/.well-known/apple-app-site-association', (_req, res) => {
+  res.type('application/json').set('Cache-Control', 'public, max-age=3600').send(JSON.stringify(aasa));
+});
+
+wellKnown.get('/.well-known/assetlinks.json', (_req, res) => {
+  res.type('application/json').set('Cache-Control', 'public, max-age=3600').send(JSON.stringify(assetlinks));
+});
+```
+
+### Step 4 — Apple's CDN and change propagation
+
+Devices don't fetch from your server in production; they ask Apple's CDN, which fetches and caches your file. Consequences:
+
+- A fix to your AASA file can take a while (often hours, sometimes longer) to reach users, and devices refresh it on app install/update and periodically afterwards.
+- Make AASA changes **before** shipping an app version that depends on them, and make them additive (add new paths first, remove old ones later).
+- You can see exactly what Apple has cached:
+
+```bash
+curl -sS https://app-site-association.cdn-apple.com/a/v1/example.com | python3 -m json.tool
+```
+
+### Step 5 — Validate
+
+```bash
+# Headers: expect HTTP 200, content-type application/json, no Location header
+curl -sSI https://example.com/.well-known/apple-app-site-association
+
+# The body must be valid JSON
+curl -sS https://example.com/.well-known/apple-app-site-association | python3 -m json.tool
+```
+
+On a device with Developer Mode, recent iOS versions include Universal Links diagnostics under **Settings → Developer**, where you can enter a URL and see whether it matches an installed app. On macOS, `swcutil` (the command-line client of the `swcd` daemon that manages associated domains) can download and inspect association data. For deep debugging, filter device logs in Console.app for the `swcd` process.
+
+## Setup — Android App Links
+
+### Step 1 — Verified intent filter
+
+Add a separate intent filter for your https hosts with `android:autoVerify="true"`. Keep custom-scheme and https filters **separate**: all `<data>` elements within one filter are combined, so mixing them creates unintended scheme/host combinations and can break verification.
+
+```xml title="android/app/src/main/AndroidManifest.xml (inside MainActivity)"
+<intent-filter android:autoVerify="true">
+    <action android:name="android.intent.action.VIEW" />
+    <category android:name="android.intent.category.DEFAULT" />
+    <category android:name="android.intent.category.BROWSABLE" />
+    <data android:scheme="https" />
+    <data android:host="example.com" />
+    <data android:host="www.example.com" />
+    <data android:pathPrefix="/product" />
+    <data android:pathPrefix="/orders" />
+    <data android:pathPrefix="/i/" />
+</intent-filter>
+
+<intent-filter android:autoVerify="true">
+    <action android:name="android.intent.action.VIEW" />
+    <category android:name="android.intent.category.DEFAULT" />
+    <category android:name="android.intent.category.BROWSABLE" />
+    <data android:scheme="https" />
+    <data android:host="go.example.com" />
+</intent-filter>
+```
+
+Every host in an `autoVerify` filter must serve a valid `assetlinks.json`. Path attributes (`path`, `pathPrefix`, `pathPattern`, and on Android 12+ `pathAdvancedPattern` and `pathSuffix`) control which URLs the app claims; the verification itself is per host.
+
+### Step 2 — assetlinks.json
+
+```json title="https://example.com/.well-known/assetlinks.json"
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.example.app",
+      "sha256_cert_fingerprints": [
+        "14:6D:E9:83:C5:73:06:50:D8:EE:B9:95:2F:34:FC:64:16:A0:83:42:E6:1D:BE:A8:8A:04:96:B2:3F:CF:44:E5",
+        "B0:4E:29:05:4E:AB:44:C6:9A:CB:D5:89:A3:A8:1C:FF:09:6B:45:00:C5:FD:D1:3E:3E:12:C5:F3:FB:BD:BA:D3"
+      ]
+    }
+  }
+]
+```
+
+Same hosting rules as the AASA: HTTPS, `application/json`, no redirects, publicly reachable, one file per host. Include one entry per app (production and staging packages) and every signing certificate that will ship builds users can install.
+
+### Step 3 — Get the right SHA-256 fingerprints
+
+| Certificate | Where to get it | Covers |
+|---|---|---|
+| Debug keystore | `keytool -list -v -keystore android/app/debug.keystore -alias androiddebugkey -storepass android -keypass android` or `cd android && ./gradlew signingReport` | Local debug builds |
+| Upload key | `keytool -list -v -keystore my-upload-key.keystore -alias my-key-alias` | Builds you distribute yourself signed with the upload key (e.g. APKs via Firebase App Distribution) |
+| **Play App Signing key** | Play Console → your app → **App integrity / App signing** → "App signing key certificate" SHA-256 (Play Console also offers a ready-made Digital Asset Links JSON snippet there) | **Everything installed from Google Play**, including internal/closed testing tracks |
+| Internal app sharing certificate | Same Play Console page, if you use internal app sharing | Builds shared through internal app sharing |
+| EAS-managed keystore | `eas credentials` → Android → shows SHA-256 | Expo builds signed by EAS (upload key when publishing to Play) |
+
+> [!WARNING]
+> The classic production bug: App Links work on every build QA sideloads, then fail for all Play Store users. With **Play App Signing**, Google re-signs your app with its own key, so the fingerprint of your upload keystore isn't the one on users' devices. Always include the Play App Signing key's SHA-256.
+
+### Step 4 — Verify on a device
+
+```bash
+# Reset verification state, trigger re-verification, then inspect (Android 12+)
+adb shell pm set-app-links --package com.example.app 0 all
+adb shell pm verify-app-links --re-verify com.example.app
+adb shell pm get-app-links com.example.app
+#   example.com: verified         <- good
+#   go.example.com: 1024          <- failure code; check file, fingerprint, redirects
+
+# Resolve a real https link the way a browser would (no package name)
+adb shell am start -W -a android.intent.action.VIEW \
+  -c android.intent.category.BROWSABLE \
+  -d "https://example.com/product/42"
+```
+
+Google's Digital Asset Links API can check a site's statements from anywhere:
+
+```bash
+curl -sS "https://digitalassetlinks.googleapis.com/v1/statements:list?source.web.site=https://example.com&relation=delegate_permission/common.handle_all_urls"
+```
+
+Android Studio's **App Links Assistant** and the Play Console's deep links report also show verification status per domain.
+
+### Android 12+ behaviour
+
+| | Android 11 and lower | Android 12+ |
+|---|---|---|
+| Unverified https link | Disambiguation dialog (app or browser) | Opens in the **default browser**; the app isn't offered |
+| Verification scope | If any host in the app fails, verification can fail for all hosts | Each host is verified independently |
+| User control | Limited | Settings → Apps → your app → **Open by default** → add/verify supported links manually |
+| Custom schemes | Unaffected | Unaffected (never verified) |
+
+Newer Android versions also support dynamic rules in `assetlinks.json` (path and query include/exclude rules evaluated server-side, similar to Apple's `components`). Check the Android App Links documentation for availability before relying on them; static manifest filters remain the baseline.
+
+## Setup — Expo
+
+With Continuous Native Generation you declare everything in app config and `npx expo prebuild` / EAS Build writes the native files. EAS also syncs the Associated Domains capability to your App ID.
+
+```ts title="app.config.ts"
+import type { ExpoConfig } from 'expo/config';
+
+const config: ExpoConfig = {
+  name: 'MyApp',
+  slug: 'my-app',
+  scheme: 'myapp', // custom scheme; Expo Router uses it automatically
+  ios: {
+    bundleIdentifier: 'com.example.app',
+    associatedDomains: ['applinks:example.com', 'applinks:www.example.com', 'applinks:go.example.com'],
+  },
+  android: {
+    package: 'com.example.app',
+    intentFilters: [
+      {
+        action: 'VIEW',
+        autoVerify: true,
+        data: [
+          { scheme: 'https', host: 'example.com', pathPrefix: '/product' },
+          { scheme: 'https', host: 'example.com', pathPrefix: '/orders' },
+          { scheme: 'https', host: 'example.com', pathPrefix: '/i/' },
+        ],
+        category: ['BROWSABLE', 'DEFAULT'],
+      },
+    ],
+  },
+  plugins: ['expo-router'],
+};
+
+export default config;
+```
+
+Expo's `AppDelegate` already forwards `openURL` and `continueUserActivity`, so no native edits are needed. In **Expo Go** your custom scheme isn't registered — links look like `exp://127.0.0.1:8081/--/product/42` — so test real schemes and Universal Links in a **development build**. `Linking.createURL('/product/42')` from `expo-linking` produces the right form for the current environment.
+
+## Routing: React Navigation
+
+React Navigation turns a URL into a navigation state using the `linking` prop on `NavigationContainer`: it strips a matching **prefix**, matches the remaining path against your **config**, builds nested state (including parent navigators), and dispatches it. The same config is used in reverse to build URLs (`useLinkBuilder`, `Link`) and on web.
+
+### Typed param lists
+
+```ts title="src/navigation/types.ts"
+import type { NavigatorScreenParams } from '@react-navigation/native';
+
+export type TabParamList = {
+  Feed: undefined;
+  Search: { q?: string } | undefined;
+  Account: undefined;
+};
+
+export type RootStackParamList = {
+  Tabs: NavigatorScreenParams<TabParamList> | undefined;
+  Product: { id: number; slug?: string; ref?: string };
+  Order: { orderId: string };
+  Invite: { code: string };
+  SignIn: undefined;
+  NotFound: undefined;
+};
+
+declare global {
+  namespace ReactNavigation {
+    interface RootParamList extends RootStackParamList {}
+  }
+}
+```
+
+### Linking config
+
+```ts title="src/navigation/linkingConfig.ts"
+import type { LinkingOptions } from '@react-navigation/native';
+import type { RootStackParamList } from './types';
+
+export const PREFIXES = ['myapp://', 'https://example.com', 'https://www.example.com', 'https://go.example.com'];
+
+export const linkingConfig = {
+  // Deep-linked screens get Tabs underneath them, so "back" works after a cold start.
+  initialRouteName: 'Tabs',
+  screens: {
+    Tabs: {
+      screens: {
+        Feed: '',
+        Search: 'search', // ?q=shoes becomes { q: 'shoes' } automatically
+        Account: 'account',
+      },
+    },
+    Product: {
+      path: 'product/:id/:slug?',
+      parse: { id: Number },
+      stringify: { id: (id: number) => String(id) },
+    },
+    Order: 'orders/:orderId',
+    Invite: 'i/:code',
+    SignIn: 'login',
+    NotFound: '*', // catch-all: must be last
+  },
+} satisfies NonNullable<LinkingOptions<RootStackParamList>['config']>;
+```
+
+```tsx title="src/navigation/linking.ts"
+import { Linking } from 'react-native';
+import {
+  getStateFromPath as defaultGetStateFromPath,
+  type LinkingOptions,
+} from '@react-navigation/native';
+import { linkingConfig, PREFIXES } from './linkingConfig';
+import { gateUrl } from '../linking/authGate';
+import type { RootStackParamList } from './types';
+
+export const linking: LinkingOptions<RootStackParamList> = {
+  prefixes: PREFIXES,
+  config: linkingConfig,
+
+  // Ignore URLs another library handles (e.g. OAuth redirects consumed by the auth SDK).
+  filter: (url) => !url.includes('/oauth/callback'),
+
+  // Rewrite legacy or marketing URLs before matching.
+  getStateFromPath(path, options) {
+    const legacy = path.match(/^\/?p\?id=(\d+)/); // old web app: /p?id=42
+    const normalized = legacy ? `/product/${legacy[1]}` : path;
+    return defaultGetStateFromPath(normalized, options);
+  },
+
+  async getInitialURL() {
+    const url = await Linking.getInitialURL();
+    return url ? gateUrl(url) : null;
+  },
+
+  subscribe(listener) {
+    const sub = Linking.addEventListener('url', ({ url }) => listener(gateUrl(url)));
+    return () => sub.remove();
+  },
+};
+```
+
+```ts title="src/navigation/navigationRef.ts"
+import { createNavigationContainerRef } from '@react-navigation/native';
+import type { RootStackParamList } from './types';
+
+// Lets non-component code (link replay, notification handlers) navigate once the container is ready.
+export const navigationRef = createNavigationContainerRef<RootStackParamList>();
+```
+
+```tsx title="src/navigation/RootNavigator.tsx"
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { linking } from './linking';
+import { navigationRef } from './navigationRef';
+import { useAuth } from '../auth/store';
+import { useResumePendingLink } from '../linking/useResumePendingLink';
+import { SplashScreen } from '../screens/SplashScreen';
+import { Tabs } from './Tabs';
+import { ProductScreen, OrderScreen, InviteScreen, SignInScreen, NotFoundScreen } from '../screens';
+import type { RootStackParamList } from './types';
+
+const Stack = createNativeStackNavigator<RootStackParamList>();
+
+function Screens() {
+  const isSignedIn = useAuth((s) => s.isSignedIn);
+  useResumePendingLink();
+  return (
+    <Stack.Navigator>
+      {isSignedIn ? (
+        <>
+          <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
+          <Stack.Screen name="Product" component={ProductScreen} />
+          <Stack.Screen name="Order" component={OrderScreen} />
+        </>
+      ) : (
+        <Stack.Screen name="SignIn" component={SignInScreen} />
+      )}
+      <Stack.Screen name="Invite" component={InviteScreen} />
+      <Stack.Screen name="NotFound" component={NotFoundScreen} />
+    </Stack.Navigator>
+  );
+}
+
+export function RootNavigator() {
+  // Render navigation only after the session has been restored, so link gating sees the real auth state.
+  const hydrated = useAuth((s) => s.hydrated);
+  if (!hydrated) return <SplashScreen />;
+  return (
+    <NavigationContainer ref={navigationRef} linking={linking} fallback={<SplashScreen />}>
+      <Screens />
+    </NavigationContainer>
+  );
+}
+```
+
+Config details that trip people up:
+
+- **Nested navigators must be mirrored** in `config.screens`. If `Search` lives in a tab navigator inside the root stack, it must be nested under `Tabs.screens`, or the link opens the wrong navigator.
+- **Params are strings** until you `parse` them. Query parameters (`?ref=newsletter`) are merged into params automatically, also as strings.
+- **`initialRouteName`** (at the root or inside a nested config) controls what sits underneath the deep-linked screen. Without it, a cold-start link to `Product` produces a one-screen stack with no way back.
+- **`NotFound: '*'`** catches unmatched paths. Without it, unknown links fall back to the initial route silently, and you lose the signal.
+- **Prefixes** must cover every scheme and host you ship, including `www`. React Navigation also supports wildcard subdomains (`https://*.example.com`).
+- The `fallback` prop renders while the initial URL is being resolved, avoiding a flash of the home screen.
+
+Teams on the **static API** (React Navigation 7's `createStaticNavigation`) declare `linking: 'product/:id'` or `{ path, parse }` per screen, and pass `linking={{ enabled: 'auto', prefixes: PREFIXES }}` to generate paths automatically from screen names. The concepts are identical.
+
+### Unit-test the routing table
+
+Linking configs rot silently. Test them like any other routing table:
+
+```ts title="src/navigation/__tests__/linking.test.ts"
+import { getStateFromPath } from '@react-navigation/native';
+import { linkingConfig } from '../linkingConfig';
+
+function leaf(path: string) {
+  let state: any = getStateFromPath(path, linkingConfig);
+  let route = state?.routes[state.routes.length - 1];
+  while (route?.state) {
+    state = route.state;
+    route = state.routes[state.routes.length - 1];
+  }
+  return route;
+}
+
+test.each([
+  ['/product/42/red-shoes?ref=push', 'Product', { id: 42, slug: 'red-shoes', ref: 'push' }],
+  ['/orders/ord_123', 'Order', { orderId: 'ord_123' }],
+  ['/search?q=shoes', 'Search', { q: 'shoes' }],
+  ['/does/not/exist', 'NotFound', undefined],
+])('%s resolves to %s', (path, name, params) => {
+  const route = leaf(path);
+  expect(route?.name).toBe(name);
+  if (params) expect(route?.params).toEqual(params);
+});
+```
+
+## Routing: Expo Router
+
+Expo Router derives links from the file system: every file in `app/` is a route, so deep links work without a separate config.
+
+```plaintext
+app/
+  _layout.tsx                 root Stack
+  (tabs)/_layout.tsx          tab navigator
+  (tabs)/index.tsx            /             and myapp://
+  (tabs)/account.tsx          /account
+  product/[id].tsx            /product/42   and myapp://product/42
+  orders/[orderId].tsx        /orders/ord_123
+  i/[code].tsx                /i/ABC123
+  +not-found.tsx              unmatched paths
+  +native-intent.tsx          rewrite incoming native URLs
+```
+
+```tsx title="app/product/[id].tsx"
+import { useLocalSearchParams } from 'expo-router';
+import { z } from 'zod';
+import { ProductView } from '../../src/product/ProductView';
+import { InvalidLink } from '../../src/linking/InvalidLink';
+
+const Params = z.object({ id: z.coerce.number().int().positive(), ref: z.string().max(64).optional() });
+
+export default function ProductRoute() {
+  const parsed = Params.safeParse(useLocalSearchParams());
+  if (!parsed.success) return <InvalidLink />;
+  return <ProductView id={parsed.data.id} referrer={parsed.data.ref} />;
+}
+```
+
+`+native-intent.tsx` lets you rewrite URLs that come from outside the app (legacy paths, third-party link formats) before Expo Router matches them:
+
+```tsx title="app/+native-intent.tsx"
+export function redirectSystemPath({ path }: { path: string; initial: boolean }): string {
+  // Old web URLs: /p?id=42 -> /product/42
+  const legacy = path.match(/\/p\?id=(\d+)/);
+  if (legacy) return `/product/${legacy[1]}`;
+  return path;
+}
+```
+
+For auth-gated routes, Expo Router offers protected route groups (`Stack.Protected` with a `guard`, in recent SDKs) or a redirect in a layout; the pending-link pattern below still applies if you want the user to land on the original destination after signing in.
+
+## Implementation
+
+### Cold start vs warm start
+
+| | Cold start (app not running) | Warm start (app in background) |
+|---|---|---|
+| iOS entry point | `didFinishLaunching` launch options, then `open url` / `continueUserActivity` | `open url` / `continueUserActivity` |
+| Android entry point | Launch intent's data | `onNewIntent` (requires `singleTask`) |
+| React Native API | `await Linking.getInitialURL()` | `Linking.addEventListener('url', ({ url }) => ...)` |
+| Typical bugs | Navigating before the navigator is ready; auth not restored yet; handling the same initial URL again on remount | Missing `singleTask` creates a second activity; listener registered twice |
+
+If you're not using a navigation library's built-in linking, the raw pattern is:
+
+```tsx title="src/linking/useIncomingLinks.ts"
+import { useEffect, useRef } from 'react';
+import { Linking } from 'react-native';
+
+export function useIncomingLinks(onUrl: (url: string, source: 'initial' | 'event') => void) {
+  const handledInitial = useRef(false);
+
+  useEffect(() => {
+    // getInitialURL returns the same value for the whole process lifetime: handle it once.
+    if (!handledInitial.current) {
+      handledInitial.current = true;
+      Linking.getInitialURL()
+        .then((url) => { if (url) onUrl(url, 'initial'); })
+        .catch(() => undefined);
+    }
+    const sub = Linking.addEventListener('url', ({ url }) => onUrl(url, 'event'));
+    return () => sub.remove();
+  }, [onUrl]);
+}
+```
+
+Don't combine this with React Navigation's `linking` prop for the same URLs, or every link is handled twice.
+
+### Parse and validate every link
+
+A deep link is **untrusted input from the internet**. Anyone can craft `https://example.com/orders/../../admin` or `myapp://checkout?amount=0`, and custom schemes can be invoked by any app on the device. Validate centrally, before navigation or any side effect:
+
+```ts title="src/linking/parseDeepLink.ts"
+import 'react-native-url-polyfill/auto'; // bare RN: core URL support is incomplete; Expo ships a compliant URL
+import { z } from 'zod';
+
+const HTTPS_HOSTS = new Set(['example.com', 'www.example.com', 'go.example.com']);
+
+export type DeepLink =
+  | { kind: 'product'; id: number; ref?: string }
+  | { kind: 'order'; orderId: string }
+  | { kind: 'invite'; code: string };
+
+const productId = z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const orderId = z.string().regex(/^ord_[A-Za-z0-9]{3,32}$/);
+const inviteCode = z.string().regex(/^[A-Z0-9]{6,12}$/);
+const ref = z.string().regex(/^[\w-]{1,64}$/).optional();
+
+export function parseDeepLink(raw: string): DeepLink | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+
+  let segments: string[];
+  if (url.protocol === 'myapp:') {
+    // myapp://product/42 parses with hostname 'product' and pathname '/42'
+    segments = [url.hostname, ...url.pathname.split('/')].filter(Boolean);
+  } else if (url.protocol === 'https:' && HTTPS_HOSTS.has(url.hostname)) {
+    segments = url.pathname.split('/').filter(Boolean);
+  } else {
+    return null; // unknown scheme or host: never follow
+  }
+
+  const [head, first] = segments;
+  const refParam = ref.safeParse(url.searchParams.get('ref') ?? undefined);
+
+  switch (head) {
+    case 'product': {
+      const id = productId.safeParse(first);
+      return id.success ? { kind: 'product', id: id.data, ref: refParam.success ? refParam.data : undefined } : null;
+    }
+    case 'orders': {
+      const id = orderId.safeParse(first);
+      return id.success ? { kind: 'order', orderId: id.data } : null;
+    }
+    case 'i': {
+      const code = inviteCode.safeParse(first);
+      return code.success ? { kind: 'invite', code: code.data } : null;
+    }
+    default:
+      return null;
+  }
+}
+
+export const isAllowedDeepLink = (raw: string): boolean => parseDeepLink(raw) !== null;
+```
+
+Use `parseDeepLink` for links that don't come through React Navigation's matcher (push payloads, QR scanner, attribution SDK callbacks), and validate params again at the screen level with a schema, because React Navigation will happily pass `id: NaN` to your screen.
+
+### Auth-gated links
+
+With conditional screen rendering (the recommended React Navigation auth pattern), protected screens don't exist while the user is signed out, so a link to `/orders/123` would be dropped. The fix: intercept protected links, remember them, send the user to sign in, and replay the link once the protected screens are mounted.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant OS as OS
+    participant App as App bootstrap
+    participant Auth as Auth store
+    participant Gate as Link gate
+    participant Nav as NavigationContainer
+    U->>OS: tap link to /orders/123, app not running
+    OS->>App: launch with URL
+    App->>Auth: restore session from secure storage
+    Auth-->>App: no valid session
+    App->>Nav: mount after hydration
+    Nav->>Gate: getInitialURL
+    Gate->>Gate: Order is protected and user is signed out
+    Gate->>Gate: save pending link with expiry
+    Gate-->>Nav: myapp://login
+    Nav->>U: SignIn screen
+    U->>Auth: sign in
+    Auth-->>Nav: isSignedIn true, protected screens mount
+    Nav->>Gate: take pending link
+    Gate-->>Nav: dispatch action for Order 123
+    Nav->>U: Order screen, back goes to Tabs
+```
+*Figure: Cold start through an auth gate. The destination survives the login detour.*
+
+```ts title="src/linking/pendingLink.ts"
+import { create } from 'zustand';
+
+const MAX_AGE_MS = 15 * 60 * 1000;
+
+type PendingLinkState = {
+  url: string | null;
+  savedAt: number;
+  save: (url: string) => void;
+  take: () => string | null;
+};
+
+export const usePendingLink = create<PendingLinkState>((set, get) => ({
+  url: null,
+  savedAt: 0,
+  save: (url) => set({ url, savedAt: Date.now() }),
+  take: () => {
+    const { url, savedAt } = get();
+    set({ url: null, savedAt: 0 });
+    return url && Date.now() - savedAt < MAX_AGE_MS ? url : null;
+  },
+}));
+```
+
+```ts title="src/linking/authGate.ts"
+import { getStateFromPath } from '@react-navigation/native';
+import { linkingConfig, PREFIXES } from '../navigation/linkingConfig';
+import { useAuth } from '../auth/store';
+import { usePendingLink } from './pendingLink';
+
+const PUBLIC_ROUTES = new Set(['SignIn', 'Invite', 'NotFound']);
+
+type AnyState = { index?: number; routes: { name: string; state?: AnyState }[] };
+
+function leafRouteName(state: AnyState | undefined): string | undefined {
+  let current = state;
+  let name: string | undefined;
+  while (current) {
+    const route = current.routes[current.index ?? current.routes.length - 1];
+    if (!route) break;
+    name = route.name;
+    current = route.state;
+  }
+  return name;
+}
+
+export function pathFromUrl(url: string): string | null {
+  for (const prefix of PREFIXES) {
+    if (!url.startsWith(prefix)) continue;
+    const rest = url.slice(prefix.length);
+    // 'https://example.com' must not match 'https://example.com.evil.io/...'
+    if (prefix.endsWith('://') || rest === '' || /^[/?#]/.test(rest)) return rest || '/';
+  }
+  return null;
+}
+
+/** Returns the URL to navigate to now; protected links are parked until sign-in. */
+export function gateUrl(url: string): string {
+  const path = pathFromUrl(url);
+  if (path === null) return url;
+  const target = leafRouteName(getStateFromPath(path, linkingConfig) as AnyState | undefined);
+  if (!target || PUBLIC_ROUTES.has(target) || useAuth.getState().isSignedIn) return url;
+  usePendingLink.getState().save(url);
+  return 'myapp://login';
+}
+```
+
+```ts title="src/linking/useResumePendingLink.ts"
+import { useEffect } from 'react';
+import { getActionFromState, getStateFromPath } from '@react-navigation/native';
+import { navigationRef } from '../navigation/navigationRef';
+import { linkingConfig } from '../navigation/linkingConfig';
+import { useAuth } from '../auth/store';
+import { usePendingLink } from './pendingLink';
+import { pathFromUrl } from './authGate';
+
+export function useResumePendingLink(): void {
+  const isSignedIn = useAuth((s) => s.isSignedIn);
+
+  useEffect(() => {
+    if (!isSignedIn) return;
+    const url = usePendingLink.getState().take();
+    const path = url ? pathFromUrl(url) : null;
+    if (!path) return;
+
+    // Wait a frame so the navigator has re-rendered with the signed-in screens.
+    const frame = requestAnimationFrame(() => {
+      const state = getStateFromPath(path, linkingConfig);
+      if (!state || !navigationRef.isReady()) return;
+      const action = getActionFromState(state, linkingConfig);
+      if (action) navigationRef.dispatch(action);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [isSignedIn]);
+}
+```
+
+If sign-in can leave the app (email magic link, external OAuth, SSO), persist the pending link (MMKV or AsyncStorage) with its timestamp so it survives the process being killed.
+
+> [!CAUTION]
+> Never let a link **perform** a sensitive action by itself — `myapp://transfer?to=...&amount=...`, `myapp://account/delete`, `myapp://logout` or "accept invite and grant access". Links may only **navigate** to a screen that shows what will happen and requires an explicit, authenticated confirmation. This also neutralises CSRF-style attacks where a malicious page silently triggers your scheme.
+
+### Push notification taps are deep links too
+
+Put a `url` in every notification payload and route taps through the same linking pipeline. You get one routing table for Universal Links, custom schemes, notifications, QR codes and in-app banners — and a single place for validation, auth gating and analytics. The [Push Notifications guide](push-notifications.html) covers the payload and handler side in detail.
+
+```mermaid
+flowchart TD
+    Src1["Universal Link or App Link"] --> Entry["Single entry point<br/>linking.getInitialURL and subscribe"]
+    Src2["Custom scheme URL"] --> Entry
+    Src3["Push notification tap<br/>data.url"] --> Entry
+    Src4["Deferred link from<br/>attribution SDK"] --> Entry
+    Src5["QR code or in-app banner"] --> Entry
+    Entry --> Valid{"Allowed host and path,<br/>params valid?"}
+    Valid -->|"no"| Reject["NotFound or Home<br/>log rejected link"]
+    Valid -->|"yes"| Gate{"Protected route<br/>and signed out?"}
+    Gate -->|"yes"| Pending["Save pending link<br/>show SignIn"]
+    Pending -->|"after sign-in"| Route
+    Gate -->|"no"| Route["getStateFromPath<br/>then navigate"]
+    Route --> Track["Track deep_link_opened<br/>source and campaign"]
+```
+*Figure: Every link source converges on one pipeline: validate, gate, route, track.*
+
+With React Navigation and React Native Firebase, extend `getInitialURL` and `subscribe`:
+
+```tsx title="src/navigation/linking.ts (notification additions)"
+import { Linking } from 'react-native';
+import {
+  getInitialNotification,
+  getMessaging,
+  onNotificationOpenedApp,
+} from '@react-native-firebase/messaging';
+import { isAllowedDeepLink } from '../linking/parseDeepLink';
+import { gateUrl } from '../linking/authGate';
+
+function urlFromData(data: Record<string, unknown> | undefined): string | null {
+  const url = data?.url;
+  return typeof url === 'string' && isAllowedDeepLink(url) ? url : null;
+}
+
+export async function getInitialURL(): Promise<string | null> {
+  const url = (await Linking.getInitialURL()) ?? urlFromData((await getInitialNotification(getMessaging()))?.data);
+  return url ? gateUrl(url) : null;
+}
+
+export function subscribe(listener: (url: string) => void): () => void {
+  const linkSub = Linking.addEventListener('url', ({ url }) => listener(gateUrl(url)));
+  const unsubPush = onNotificationOpenedApp(getMessaging(), (message) => {
+    const url = urlFromData(message.data);
+    if (url) listener(gateUrl(url));
+  });
+  return () => {
+    linkSub.remove();
+    unsubPush();
+  };
+}
+
+// In linking.ts: { prefixes: PREFIXES, config: linkingConfig, getInitialURL, subscribe }
+```
+
+If notifications are displayed locally (Notifee or expo-notifications presenting a data message), their press events are a separate source — add them to the same two functions.
+
+With Expo Router and `expo-notifications`, observe responses in the root layout and push the path:
+
+```tsx title="app/_layout.tsx (excerpt)"
+import { useEffect } from 'react';
+import { router, Stack } from 'expo-router';
+import * as Notifications from 'expo-notifications';
+import { parseDeepLink } from '../src/linking/parseDeepLink';
+
+function useNotificationRouting() {
+  useEffect(() => {
+    let mounted = true;
+
+    function open(notification: Notifications.Notification) {
+      const url = notification.request.content.data?.url;
+      if (typeof url !== 'string' || !parseDeepLink(url)) return;
+      const { pathname, search } = new URL(url.replace(/^myapp:\/\//, 'https://app.local/'));
+      router.push(`${pathname}${search}`);
+    }
+
+    Notifications.getLastNotificationResponseAsync().then((response) => {
+      if (mounted && response) open(response.notification);
+    });
+    const sub = Notifications.addNotificationResponseReceivedListener((r) => open(r.notification));
+    return () => {
+      mounted = false;
+      sub.remove();
+    };
+  }, []);
+}
+
+export default function RootLayout() {
+  useNotificationRouting();
+  return <Stack />;
+}
+```
+
+### Attribution and UTM parameters
+
+Links from campaigns carry `utm_source`, `utm_medium`, `utm_campaign` (and often your own `ref`). Capture them once, at the entry point, together with the link **source** (universal link, scheme, push, deferred, QR), then strip anything sensitive before it reaches analytics:
+
+```ts title="src/linking/trackDeepLink.ts"
+import { analytics } from '../monitoring/analytics';
+
+const UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'ref'] as const;
+const SENSITIVE_KEYS = ['token', 'code', 'otp', 'email', 'phone'];
+
+export type LinkSource = 'universal_link' | 'custom_scheme' | 'push' | 'deferred' | 'qr';
+
+export function trackDeepLink(raw: string, source: LinkSource): void {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return;
+  }
+  const utm = Object.fromEntries(
+    UTM_KEYS.map((k) => [k, url.searchParams.get(k)]).filter(([, v]) => v !== null),
+  );
+  SENSITIVE_KEYS.forEach((k) => url.searchParams.delete(k));
+  analytics.track('deep_link_opened', {
+    source,
+    host: url.hostname,
+    path: url.pathname, // consider templating IDs (/orders/:id) to keep cardinality low
+    ...utm,
+  });
+}
+```
+
+Store first-touch attribution (e.g. the invite code or campaign that brought the user) so it can be attached to sign-up server-side. On iOS, cross-app tracking for advertising purposes still requires App Tracking Transparency consent; campaign parameters on your own links are first-party data, but check your privacy disclosures.
+
+## Security
+
+Treat links as an attack surface; they are how untrusted content from the web, other apps and messages gets into your navigation and API calls. See the [Security guide](security.html) for the broader threat model.
+
+| Threat | Example | Mitigation |
+|---|---|---|
+| **Scheme hijacking** | A malicious app registers `myapp://` and receives your links (iOS behaviour for duplicate schemes is undefined; Android shows a chooser) | Use Universal Links / App Links for anything that matters; never put secrets in custom-scheme URLs |
+| **OAuth redirect interception** | Authorization code delivered to `myapp://callback` is captured by another app | PKCE (RFC 7636) for every public client, `ASWebAuthenticationSession` / Custom Tabs, and https (verified) redirect URIs where supported — see [Authentication & Sessions](authentication.html) |
+| **Sensitive actions from links** | `myapp://transfer?to=attacker&amount=500` executed on open | Links only navigate; the screen shows details and requires explicit confirmation and a valid session (step-up auth for money movement) |
+| **Open redirect / arbitrary WebView** | `myapp://web?url=https://evil.example` loaded in a WebView that exposes a JS bridge or session cookies | Allowlist hosts for in-app browsing, open everything else in the system browser, never inject tokens into WebViews loading link-controlled URLs |
+| **Parameter injection** | `/orders/..%2F..%2Fadmin` or huge IDs flowing into API paths | Strict schemas per param (regex, length, type); encode path segments when calling APIs; server-side authorization on every resource |
+| **Tokens in links** | Magic-link or password-reset tokens logged by analytics or crash reporters | Short-lived, single-use tokens exchanged server-side; strip them from URLs before logging; never forward to third parties |
+| **Content spoofing / phishing** | `?message=Your account is locked, call ...` rendered as-is | Never render free text from link params; only IDs that resolve to server-owned content |
+| **Intent spoofing (Android)** | Another app sends an explicit intent with crafted data or extras to your exported activity | Validate `intent.data` like any URL, ignore unexpected extras, keep other components non-exported |
+
+> [!CAUTION]
+> Deep links are commonly used to reach screens that assume a previous step happened (e.g. a checkout confirmation, an "email verified" screen). Every deep-linkable screen must be safe to open **directly** with arbitrary params: load state from the server, don't trust params for anything beyond identifying what to load.
+
+## Deferred deep linking
+
+A deferred deep link survives an install: the user taps a link without the app, goes through the store, and the app opens to the original destination on first launch. Nothing in iOS or Android does this end to end; it is stitched together from a click record plus a way to recognise the same person after install.
+
+### How the match works
+
+| Technique | Platform | Accuracy | Notes |
+|---|---|---|---|
+| **Play Install Referrer API** | Android | Deterministic | The store URL carries `&referrer=...` (URL-encoded click ID or link data); the app reads it once after install via the Install Referrer library |
+| **Probabilistic matching** | iOS (and Android fallback) | Moderate, degrading | Matches the click and first launch by IP, user agent, OS version and timing. Reduced by iCloud Private Relay, carrier NAT and privacy rules — Apple's policies prohibit fingerprinting for tracking, so review what your provider does |
+| **Clipboard (pasteboard)** | iOS | Deterministic when it works | Landing page copies a click ID; the app reads it on first launch. Since iOS 16, reading another app's pasteboard content shows a paste permission prompt, unless the user taps a system paste control (`UIPasteControl`); pattern detection can check whether a URL-like value exists without reading it |
+| **User-assisted** | Both | Deterministic | After install, "tap the link again" (it now opens the app), enter an invite code, or match a pending invite to the email/phone the user signs up with |
+
+Read the Android referrer once on first launch:
+
+```ts title="src/linking/deferred.android.ts"
+import DeviceInfo from 'react-native-device-info';
+import { storage } from '../storage';
+
+export async function consumeInstallReferrer(): Promise<string | null> {
+  if (storage.getBoolean('referrer.consumed')) return null;
+  storage.set('referrer.consumed', true);
+  const referrer = await DeviceInfo.getInstallReferrer(); // e.g. "utm_source=invite&link=%2Fi%2FABC123"
+  const params = new URLSearchParams(referrer);
+  const link = params.get('link');
+  return link && link.startsWith('/') ? `https://example.com${link}` : null;
+}
+```
+
+The returned URL then goes through `parseDeepLink`, the auth gate and navigation like any other link — typically **after** onboarding, so the user isn't dropped into a product page before they've seen the welcome flow.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant Web as Link domain landing page
+    participant Attr as Attribution service
+    participant Store as App Store or Play Store
+    participant App as App first launch
+    U->>Web: tap campaign link, app not installed
+    Web->>Attr: record click with link data and signals
+    Web->>U: redirect to store listing
+    Note over Web,Store: Android store URL carries a referrer click ID
+    U->>Store: install, then open app
+    alt Android
+        App->>Store: Install Referrer API
+        Store-->>App: referrer with click ID
+        App->>Attr: resolve click ID
+    else iOS
+        App->>Attr: first-launch signals, optional pasteboard click ID
+        Attr->>Attr: match click to install
+    end
+    Attr-->>App: link data for product 42 and campaign
+    App->>App: validate, finish onboarding, route to product 42
+```
+*Figure: Deferred deep link across an install. Android matching is deterministic; iOS relies on weaker signals.*
+
+### Providers
+
+| | Branch | AppsFlyer (OneLink) | Adjust | DIY |
+|---|---|---|---|---|
+| Deferred deep links | Yes | Yes | Yes | Android via referrer; iOS limited |
+| Hosted link domain + AASA / assetlinks | Yes | Yes | Yes | You host |
+| Campaign attribution, ad network integrations | Strong | Strong (ads focus) | Strong (ads focus) | No |
+| SKAdNetwork / AdAttributionKit support | Yes | Yes | Yes | Build yourself |
+| Web fallback pages, QR codes, link analytics | Yes | Yes | Yes | Build yourself |
+| Cost / trade-off | Paid tiers; SDK weight; data sharing | Paid; SDK weight | Paid; SDK weight | Engineering time; weaker iOS matching |
+
+All three ship React Native SDKs with Expo config plugins. Whichever you choose, keep your **own** routing and validation: treat the provider's callback as another link source feeding `parseDeepLink`.
+
+### Firebase Dynamic Links shutdown and migration
+
+Firebase Dynamic Links (FDL) was shut down on **August 25, 2025**. Links on `*.page.link` domains stopped resolving, and the FDL APIs stopped working. If you still have them in the wild:
+
+1. **Inventory** where FDL links were used: emails, push templates, QR codes, printed material, referral flows, and **Firebase Auth email-link sign-in** (which used FDL and has moved to Firebase Hosting domains — update your action code settings).
+2. **Own the domain.** Serve Universal Links and App Links from your domain (or a subdomain like `go.example.com`) with AASA and `assetlinks.json`. If you used a custom domain with FDL, you control it and can redirect old paths; `page.link` domains cannot be redirected.
+3. **Recreate short links** with your provider or a small link service (short code → destination + metadata), with a web fallback page that sends users to the store.
+4. **Replace deferred linking** with a provider or the DIY approach above.
+5. **Remove** the `@react-native-firebase/dynamic-links` package and its native configuration, and replace `getInitialLink` / `onLink` handlers with the standard `Linking` pipeline.
+6. **Test old links** you can't recall (QR codes on packaging) to decide what needs a reprint.
+
+## Edge cases & gotchas
+
+- **Universal Links don't fire from everywhere.** Typing or pasting the URL into Safari's address bar, navigating within the same domain in Safari, and many in-app browsers (social apps, some mail clients) open the web page instead. Users who choose "Open in Safari" from the long-press menu or the banner can disable Universal Links for your domain until they choose "Open in App" again.
+- **JavaScript redirects** on your web page to an https link usually won't open the app; the tap must be a user-initiated navigation to the Universal Link URL. For web-to-app handoff, render a real link or button.
+- **Smart App Banners**: `<meta name="apple-itunes-app" content="app-id=123456789, app-argument=https://example.com/product/42">` shows an install/open banner in Safari and passes `app-argument` to the app when it's already installed. It is not deferred deep linking.
+- **Custom scheme parsing**: `myapp://product/42` puts `product` in the URL's host. Libraries handle this, but hand-written parsers often don't. `myapp:///product/42` (three slashes) has an empty host.
+- **Trailing slashes, case and encoding**: `/Product/42/` may not match `product/:id`. Normalise in `getStateFromPath` (lowercase static segments, strip trailing slash) and keep AASA `caseSensitive` consistent.
+- **`getInitialURL` is sticky**: it returns the launching URL for the whole process lifetime. If your navigator remounts (e.g. on logout), don't treat it as a new link.
+- **Android `singleTask` + intents from notifications**: launching via a `PendingIntent` for a notification also uses the same activity; make sure the notification library's intent reaches `onNewIntent` handling.
+- **Multiple apps, one domain**: list all app IDs in the AASA `appIDs` and each package in `assetlinks.json`; use `components` / path prefixes so each app claims only its own paths.
+- **Staging environments**: give staging its own domain (`staging.example.com`) with its own AASA and `assetlinks.json` referencing the staging bundle ID / package, rather than mixing staging paths into production files.
+- **iPad and Mac (Designed for iPad)** use the same Associated Domains; test there if you ship on those platforms.
+
+## Testing & debugging
+
+**iOS Simulator**
+
+```bash
+# Custom scheme
+xcrun simctl openurl booted "myapp://product/42"
+
+# Universal Link (requires the app's associated domains to be verified on the simulator)
+xcrun simctl openurl booted "https://example.com/product/42"
+```
+
+**Android emulator or device**
+
+```bash
+# Custom scheme, targeted at your package
+adb shell am start -W -a android.intent.action.VIEW -d "myapp://product/42" com.example.app
+
+# App Link, resolved like a browser would (tests verification, not just the filter)
+adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE \
+  -d "https://example.com/product/42"
+
+# Verification status per host
+adb shell pm get-app-links com.example.app
+```
+
+**Cross-platform helper**
+
+```bash
+npx uri-scheme open "myapp://product/42" --ios
+npx uri-scheme open "myapp://product/42" --android
+npx uri-scheme list   # shows the schemes registered in the native projects
+```
+
+**Test Universal Links like a user would.** Paste the link into **Notes**, **Messages** or **Reminders** on the device and tap it (long-press shows "Open in MyApp" when it's associated). Don't test by typing into Safari's address bar — that never opens the app, by design. Send links through the real channels too: email clients, Slack, WhatsApp, and social in-app browsers behave differently.
+
+**Automate the matrix.** Unit-test the linking config (shown above) for every route and legacy path. In end-to-end tests, Maestro's `openLink` and Detox's `device.openURL` / `device.launchApp({ url, newInstance: true })` cover warm and cold starts, signed-in and signed-out. In CI, a scheduled job can `curl` both `/.well-known/` files and assert status 200, `application/json`, no redirect, and that the expected app IDs and fingerprints are present — web deploys break these files more often than app releases do.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Universal Link opens Safari instead of the app | AASA unreachable or invalid (redirect, wrong content type, HTML from an SPA fallback, WAF challenge), wrong Team ID / bundle ID in `appIDs`, path not in `components`, domain missing from entitlements | Validate with `curl`, check Apple's CDN copy, fix `appIDs` and components, confirm the entitlement in the signed build |
+| Worked yesterday, not after an AASA change | Apple CDN still serves the old file; device hasn't refreshed | Check `app-site-association.cdn-apple.com`; wait or reinstall; use `?mode=developer` while iterating |
+| Works in development, not in TestFlight / App Store | Only a `?mode=developer` entry, or the distribution profile lacks Associated Domains | Add plain `applinks:` entries; regenerate profiles / let EAS sync capabilities |
+| Opens the app but nothing happens | AppDelegate doesn't forward `continueUserActivity` / `openURL` to `RCTLinkingManager`; no `linking` prop; URL filtered out | Add the forwarding methods; check prefixes and `filter` |
+| Opens the app on the wrong screen or Home | Config doesn't mirror nested navigators; path mismatch (case, trailing slash); target screen not rendered (auth) | Fix nested `screens`; normalise paths; use the pending-link pattern |
+| Android shows a chooser or opens the browser | App Links verification failed: missing Play App Signing fingerprint, redirect, wrong content type, one host failing on Android 11 and lower, missing `DEFAULT`/`BROWSABLE` | Fix `assetlinks.json`, re-verify with `pm verify-app-links`, inspect `pm get-app-links` |
+| App Links work for sideloaded builds, not Play installs | `assetlinks.json` has only the upload key | Add the Play App Signing SHA-256 from Play Console |
+| Android opens a second copy of the app | Activity not `singleTask` | Set `android:launchMode="singleTask"` on `MainActivity` |
+| Link handled twice | Manual `Linking` listener plus React Navigation `linking`, or initial URL re-processed on remount | Use one pipeline; guard initial URL handling |
+| Links from Instagram / Facebook / some mail apps open the web page | In-app browsers don't honour Universal Links / App Links | Landing page with an explicit "Open in app" button (custom scheme on iOS, `intent://` on Android) and store fallback |
+| Custom scheme opens a different app | Scheme collision | Use a more unique scheme; move important flows to verified https links |
+| Params arrive as strings or `NaN` | No `parse` functions / no validation | Add `parse`, validate with a schema, render an invalid-link state |
+| `getInitialURL()` returns null on cold start | Native forwarding missing, URL consumed by another library first, or launch came from a notification (not a URL) | Add forwarding; check SDKs that intercept links (auth, attribution); read the notification's initial payload |
+
+## Production checklist
+
+- [ ] Link strategy decided: https Universal Links / App Links for shared links, custom scheme for app-to-app and fallback
+- [ ] `apple-app-site-association` served at `/.well-known/` on every host: HTTPS, `application/json`, no redirects, no auth or bot challenges, under 128 KB
+- [ ] AASA `appIDs` use the correct Team ID + bundle ID for every app/environment; exclusions listed first
+- [ ] Associated Domains entitlement includes apex, `www` and link subdomains; no production reliance on `?mode=developer`
+- [ ] `assetlinks.json` includes the **Play App Signing** fingerprint plus upload/debug/EAS keys as needed, for every host in `autoVerify` filters
+- [ ] Separate intent filters for custom scheme and https; `VIEW`, `DEFAULT`, `BROWSABLE`; `singleTask`; `exported="true"`
+- [ ] `pm get-app-links` shows `verified` for all hosts on a Play-installed build
+- [ ] AppDelegate forwards `openURL` and `continueUserActivity` (or Expo handles it)
+- [ ] Linking config mirrors nested navigators, uses `parse`/`stringify`, sets `initialRouteName`, has a `NotFound` catch-all
+- [ ] Every deep-linkable screen validates params and is safe to open directly
+- [ ] Auth-gated links resume after sign-in (pending link persisted if login can leave the app)
+- [ ] Links never trigger sensitive actions without explicit confirmation
+- [ ] Notification payloads carry a `url` routed through the same pipeline
+- [ ] Deferred deep linking strategy chosen (provider or DIY); no remaining Firebase Dynamic Links dependencies
+- [ ] Analytics: `deep_link_opened` with source and UTM params; sensitive params stripped
+- [ ] CI monitors both `/.well-known/` files; linking config unit tests cover every route and legacy path
+- [ ] Manual test matrix: cold/warm start, signed in/out, iOS/Android, Notes/Messages/email/in-app browsers
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [React Navigation — Deep linking](https://reactnavigation.org/docs/deep-linking/)
+- [React Native — Linking API](https://reactnative.dev/docs/linking)
+- [Apple — Supporting universal links in your app](https://developer.apple.com/documentation/xcode/supporting-universal-links-in-your-app)
+- [Android — Handling Android App Links](https://developer.android.com/training/app-links)
+- [Expo — Linking overview](https://docs.expo.dev/linking/overview/)
+- [Firebase Dynamic Links deprecation FAQ](https://firebase.google.com/support/dynamic-links-faq)
+
+## Interview questions
+
+### What are the differences between custom URL schemes, Universal Links and App Links, and which would you use?
+
+A custom scheme (`myapp://`) is registered by the app with no ownership verification: any app can claim the same scheme, there's no fallback if the app isn't installed, and Safari may show a confirmation. Universal Links (iOS) and App Links (Android) are ordinary https URLs whose association with the app is verified through files hosted on the domain (`apple-app-site-association`, `assetlinks.json`); they open the app directly without prompts, can't be hijacked by other apps, and fall back to the website when the app isn't installed, so one URL works on web, iOS and Android. I'd use verified https links for anything shared by users, marketing, emails and notifications, and keep a custom scheme for app-to-app calls, development and as an extra prefix. Deferred deep linking is a separate layer on top for installs.
+
+### What do you need to set up Universal Links, and what usually breaks?
+
+The Associated Domains entitlement with `applinks:` entries for each host, an AASA file at `https://host/.well-known/apple-app-site-association` listing `TEAMID.bundleid` in `appIDs` with `components` for the paths, AppDelegate forwarding of `continueUserActivity` to `RCTLinkingManager`, and a linking config in JS. What breaks: redirects or SPA fallbacks serving HTML, wrong content type, bot protection blocking Apple's CDN, wrong Team ID, missing `www` or subdomain entries, forgetting that Apple's CDN caches the file (so fixes are slow — use `?mode=developer` in development and check the CDN URL), missing native forwarding, and testing by typing the URL into Safari, which never opens the app.
+
+### App Links work in QA builds but not for users who install from Google Play. Why?
+
+Almost always Play App Signing: Google re-signs the app with the app signing key, so the certificate on users' devices differs from the upload key QA builds are signed with. `assetlinks.json` must contain the SHA-256 of the **app signing key** from Play Console (and the internal app sharing certificate if used), alongside upload and debug fingerprints. Other causes: redirects, wrong content type, or one failing host breaking all verification on Android 11 and lower. On Android 12+ unverified links open in the browser, so the failure is silent. Diagnose with `adb shell pm get-app-links <package>` and `pm verify-app-links --re-verify`.
+
+### How do you handle deep links on cold start versus warm start in React Native?
+
+Cold start: the launching URL is read with `Linking.getInitialURL()` once the JS runtime is up; warm start: URLs arrive via `Linking.addEventListener('url', ...)` (on Android this requires `singleTask` so the existing activity receives `onNewIntent`). React Navigation's `linking` prop does both through `getInitialURL` and `subscribe`, and waits for the navigator with a `fallback`. The typical bugs are navigating before the container is ready, evaluating the link before the session is restored, handling the sticky initial URL twice on remount, and combining manual listeners with the `linking` prop. For notifications, the initial notification is a separate source that must also be checked in `getInitialURL`.
+
+### How do you handle a deep link to a screen that requires authentication?
+
+With conditional rendering, protected screens don't exist while signed out, so a naive link is dropped. I gate links centrally: resolve the URL to its target route with `getStateFromPath`; if it's protected and the user is signed out, store it as a pending link with an expiry (persisted if sign-in can leave the app) and route to sign-in. When the auth state flips and protected screens mount, take the pending link, rebuild state with `getStateFromPath`, and dispatch the action from `getActionFromState`, with `initialRouteName` ensuring a sensible back stack. The navigation container should mount only after session hydration so the gate sees the right auth state. Expo Router offers protected routes but the same "resume after login" idea applies.
+
+### What security concerns do deep links raise?
+
+Links are untrusted input. Custom schemes can be hijacked, so no secrets or OAuth codes over schemes without PKCE; params must be validated with strict schemas since they flow into navigation and API calls; links must never perform state-changing actions directly (transfers, deletions, logout) — they navigate to a confirmation screen with auth; URLs passed to WebViews or "open URL" features need host allowlists to avoid open redirects and bridge abuse; magic-link tokens must be short-lived, single-use and stripped from logs and analytics; free-text params should never be rendered (phishing); and every deep-linkable screen must be safe to open directly with arbitrary params. On Android, exported activities must validate incoming intents.
+
+### What is deferred deep linking, and how does it work on each platform now that Firebase Dynamic Links is gone?
+
+It restores the link destination after the user installs the app from the store. Android has a deterministic mechanism: the Play Store URL carries a `referrer` parameter that the app reads once via the Play Install Referrer API. iOS has no equivalent, so providers use probabilistic matching (IP, user agent, timing — weakened by Private Relay and privacy rules), the clipboard (which triggers a paste prompt on iOS 16+ unless the user taps a system paste control), or user-assisted flows (tap the link again, enter a code, match on sign-up email). Firebase Dynamic Links shut down on August 25, 2025, so teams migrate to Universal Links / App Links on their own domain plus Branch, AppsFlyer, Adjust or a DIY approach, and remove the dynamic-links SDK. The restored link should still go through the normal validation and auth pipeline, usually after onboarding.
+
+### How do notification taps fit into your deep linking architecture?
+
+A notification is just another link source. The payload carries a `url` (validated against an allowlist on receipt), and taps are fed into the same `getInitialURL` / `subscribe` pipeline as Universal Links: `getInitialNotification` for cold starts, `onNotificationOpenedApp` for background, plus the display library's press events for locally displayed notifications. That gives one routing table, consistent auth gating, one place for analytics (`source: 'push'` plus the notification ID), and it means marketing can target any screen that has a URL without app changes.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

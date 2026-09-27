@@ -1,0 +1,1186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance · React Native Interview Handbook</title>
+<meta name="description" content="How to reason about, measure and fix React Native performance: threads and frame budgets, the profiling toolbox, startup, rendering, lists, images, animations, memory, network…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Performance · React Native Interview Handbook">
+<meta property="og:description" content="How to reason about, measure and fix React Native performance: threads and frame budgets, the profiling toolbox, startup, rendering, lists, images, animations, memory, network…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/performance.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Performance
+
+How to reason about, measure and fix React Native performance: threads and frame budgets, the profiling toolbox, startup, rendering, lists, images, animations, memory, network and app size — with case studies and a production checklist. Every recommendation assumes one rule: **measure in a release build on a low-end Android device before and after you change anything**.
+
+## How it works: the mental model
+
+### Threads and the frame budget
+
+A React Native app has (at least) two threads that matter for perceived performance:
+
+- **UI (main) thread** — native input, layout mounting, drawing, native animations, Reanimated worklets on the UI runtime. If it misses a frame deadline, *everything* on screen stutters.
+- **JS thread** — React rendering, your components, effects, event handlers, business logic. If it is busy, the screen keeps showing the last frame; native scrolling still moves, but taps respond late and anything driven from JS freezes.
+
+The display refreshes on a fixed cadence (VSync). Each frame has a budget:
+
+| Refresh rate | Frame budget | Typical devices |
+|---|---|---|
+| 60 Hz | **16.67 ms** | Most low/mid-range Android, older iPhones |
+| 90 Hz | 11.11 ms | Many mid-range Android |
+| 120 Hz | **8.33 ms** | ProMotion iPhones (Pro models), flagship Android |
+
+The budget is shared with the OS and the framework, so your code realistically gets well under the full window. A single 50 ms task on the JS thread costs three dropped frames at 60 Hz and six at 120 Hz.
+
+### JS thread drops vs UI thread drops
+
+```mermaid
+flowchart TD
+    subgraph jsDrop["JS thread drop"]
+        J1["Work over budget on JS<br/>re-renders, big JSON.parse, sync loops"] --> J2["React commits late"]
+        J2 --> J3["UI keeps showing the last frame<br/>native scroll still moves"]
+        J3 --> J4["Symptoms: late tap feedback, frozen JS animations,<br/>blank list cells, JS FPS drops"]
+    end
+    subgraph uiDrop["UI thread drop"]
+        U1["Work over budget on main thread<br/>mounting many views, image decode, heavy layout"] --> U2["Frame misses the VSync deadline"]
+        U2 --> U3["Everything on screen stutters"]
+        U3 --> U4["Symptoms: janky scroll and native animations,<br/>UI FPS drops, ANR or hang if sustained"]
+    end
+```
+*Figure: The two kinds of jank look different and need different tools. Diagnose which thread is dropping before fixing anything.*
+
+This distinction is the most useful diagnostic question in React Native performance work: "Is it the JS thread or the UI thread?" The Perf Monitor overlay shows both counters; a JS FPS drop points at React/JS work, a UI FPS drop at native rendering, images, or too many views.
+
+### Key metrics
+
+| Metric | What it measures | How to measure | Reference points |
+|---|---|---|---|
+| **Cold start** | Process start → first meaningful, interactive screen | `adb shell am start -W`, Xcode Organizer launch metrics, custom marks, Sentry/Firebase app start | Android vitals flags cold starts ≥ 5 s as slow; aim for < 2 s on mid-range, < 3 s on low-end |
+| **Warm / hot start** | Process alive, activity/scene recreated or resumed | Same tools | Android vitals: slow warm ≥ 2 s, slow hot ≥ 1.5 s |
+| **TTID / TTFD** | Time to initial display (first frame) / time to full display (content ready) | Android `reportFullyDrawn()`, custom marks, APM | TTFD is what users feel; report both |
+| **TTI** | Content visible *and* responsive to input | Custom marks after data + first interaction works | Your product budget |
+| **UI FPS / JS FPS** | Frames rendered per second on each thread | Perf Monitor, Flashlight, Perfetto, Instruments | ≥ 55 on 60 Hz during scroll in release |
+| **Slow / frozen frames** | % frames > 16 ms / frames > 700 ms | Sentry, Firebase, Android vitals, `dumpsys gfxinfo` | Frozen frames should be ~0 |
+| **Memory** | Peak and steady-state footprint, growth over time | Android Studio Memory Profiler, Instruments Allocations, heap snapshots | No unbounded growth across a navigation loop |
+| **Bundle / app size** | JS bundle bytes, download and install size | Bundle visualizer, APK Analyzer, App Store Connect size report | Track per release; alarms on +5% |
+| **ANR / hang rate** | Main thread blocked (Android ANR ~5 s for input; iOS hang ≥ 250 ms) | Play Console Android vitals, Xcode Organizer Hangs, APM | Play's bad-behavior threshold for user-perceived ANR rate is 0.47% |
+| **Crash rate** | Crashes per user/session | Crashlytics, Sentry, vitals | Play's threshold for user-perceived crash rate is 1.09% |
+| **Network** | Requests per screen, p95 latency, bytes transferred | DevTools Network panel, proxy (Charles/Proxyman), APM | Budget per screen |
+
+> [!NOTE]
+> Store thresholds (Android vitals, App Store guidance) change over time — check the current Play Console and Xcode Organizer documentation.
+
+### Performance budgets
+
+Numbers without a budget do not drive decisions. Set budgets per device tier, enforce them in CI where possible, and review them each release.
+
+| Budget | Low-end Android (reference device) | Recent iPhone |
+|---|---|---|
+| Cold start to interactive home | ≤ 3.0 s | ≤ 1.5 s |
+| Feed scroll (Flashlight / average UI FPS) | ≥ 55 FPS, no frozen frames | ≥ 58 FPS (≥ 110 at 120 Hz) |
+| Screen transition to content | ≤ 400 ms | ≤ 250 ms |
+| JS bundle (Hermes bytecode) | ≤ 6 MB, +5% per release alarm | same |
+| Peak memory on image-heavy screen | ≤ 350 MB | ≤ 400 MB |
+| Android download size | ≤ 30 MB | — |
+
+> [!IMPORTANT] Always measure the real thing
+> Debug builds run unminified JS with dev-mode checks, no bytecode precompilation and extra warnings; they can be several times slower. Measure **release builds** on a **low-end Android device** (2–4 GB RAM, older SoC) — that is where your users' worst experience is, and an iPhone Pro hides almost every problem. Close other apps, disable debugging, repeat each measurement several times and use the median.
+
+```bash
+# Release builds locally
+npx react-native run-android --mode release
+npx react-native run-ios --mode Release
+# Expo
+npx expo run:android --variant release
+npx expo run:ios --configuration Release
+```
+
+## Measuring toolbox
+
+| Tool | Platform | Best for |
+|---|---|---|
+| **React Native DevTools** | Both | JS debugging, React component tree, React Profiler (why did this render?), memory heap snapshots; since 0.83 a **Performance panel** (JS execution, React tracks, network, user timings on one timeline) and a **Network panel** |
+| **Perf Monitor** overlay (Dev Menu) | Both | Quick UI FPS vs JS FPS reading while interacting |
+| React **`<Profiler>`** API | Both | Programmatic render timings of a subtree (dev/profiling builds) |
+| **Android Studio profilers** | Android | CPU (method/system traces), memory (heap dumps, allocations), energy |
+| **Perfetto** | Android | System-wide traces: main thread, RenderThread, JS thread, binder, GC, frame timeline |
+| **Xcode Instruments** | iOS | Time Profiler (CPU), Allocations, Leaks, Hangs, App Launch, Animation Hitches |
+| **Hermes sampling profiler** | Both | CPU profile of JS execution (recorded from DevTools) |
+| **Sentry / Firebase Performance** | Both | Production: app start, slow/frozen frames, screen load traces, network |
+| **Flashlight** | Android | Scored perf measurement (FPS, CPU, RAM) of a scripted scenario; CI-friendly |
+| **Reassure** | Both (Jest) | Render-count and render-duration regression tests in CI |
+
+### React Native DevTools
+
+Open it from the Dev Menu or by pressing `j` in the Metro terminal. For performance work:
+
+- **React Profiler tab** — record an interaction, then inspect the flame graph. Enable "Record why each component rendered" to see *which* prop, state or context change caused each render.
+- **Performance panel** (0.83+) — record a session and see JS call stacks, React render/commit tracks, network requests and your own `performance.mark`/`performance.measure` entries on one timeline.
+- **Memory panel** — take heap snapshots before and after a flow, compare retained objects.
+
+DevTools attaches to development builds, so use it to find *what* is slow and *why it renders*; confirm the *magnitude* in a release build.
+
+### React `<Profiler>`
+
+```tsx title="src/perf/RenderProfiler.tsx"
+import { Profiler, type ProfilerOnRenderCallback, type ReactNode } from 'react';
+
+const onRender: ProfilerOnRenderCallback = (id, phase, actualDuration, baseDuration) => {
+  // actualDuration: time spent rendering this commit (with memoization)
+  // baseDuration: estimated time to render the whole subtree without memoization
+  if (actualDuration > 8) {
+    console.log(`[perf] ${id} ${phase} ${actualDuration.toFixed(1)}ms (base ${baseDuration.toFixed(1)}ms)`);
+  }
+};
+
+export function RenderProfiler({ id, children }: { id: string; children: ReactNode }) {
+  return (
+    <Profiler id={id} onRender={onRender}>
+      {children}
+    </Profiler>
+  );
+}
+```
+
+`onRender` only fires in development and profiling builds; it is a no-op in standard production bundles. A large gap between `baseDuration` and `actualDuration` tells you memoization is working.
+
+### Native profilers and command-line checks
+
+```bash
+# Android: cold start time (TotalTime ≈ time to first frame)
+adb shell am force-stop com.myapp
+adb shell am start -W -n com.myapp/.MainActivity
+
+# Android: frame statistics for the last session (janky frames, percentiles)
+adb shell dumpsys gfxinfo com.myapp reset
+# ...scroll the feed for 10 seconds...
+adb shell dumpsys gfxinfo com.myapp
+
+# Android: 10-second system trace, then open it at ui.perfetto.dev
+adb shell perfetto -o /data/misc/perfetto-traces/trace.perfetto-trace -t 10s \
+  sched freq idle am wm gfx view dalvik input
+adb pull /data/misc/perfetto-traces/trace.perfetto-trace
+```
+
+- **Perfetto**: look at the `main` thread, `RenderThread` and `mqt_js` / `mqt_v_js` (JS thread) tracks; long slices on the JS thread line up with React commits, long slices on main with mounting, image decode or layout.
+- **Instruments**: *Time Profiler* for CPU hot spots (invert call tree, hide system libraries), *Allocations* for growth (mark generations between repeated flows), *Leaks* for retain cycles, *Hangs* / *Animation Hitches* for main-thread stalls, *App Launch* for startup phases.
+- **Hermes CPU profiles**: record in React Native DevTools; older CLI versions pulled profiles with `npx react-native profile-hermes`. Profiles from dev builds exaggerate costs, so use them for relative comparison.
+
+### Production monitoring
+
+Lab measurements miss device diversity. Ship an APM:
+
+```tsx title="src/monitoring/sentry.ts"
+import * as Sentry from '@sentry/react-native';
+
+export const navigationIntegration = Sentry.reactNavigationIntegration();
+
+Sentry.init({
+  dsn: process.env.EXPO_PUBLIC_SENTRY_DSN,
+  tracesSampleRate: 0.2,     // performance traces: app start, screen loads, slow/frozen frames
+  profilesSampleRate: 0.1,   // relative to traces
+  integrations: [navigationIntegration],
+});
+```
+
+Firebase Performance Monitoring (`@react-native-firebase/perf`) gives automatic app-start and HTTP traces plus custom traces. See the [Monitoring guide](monitoring.html) for setup.
+
+### Flashlight and Reassure: guard against regressions
+
+**Flashlight** measures an Android scenario and gives a performance score (FPS, CPU, RAM), so you can compare branches objectively:
+
+```bash
+# Live measurement while you use the app
+flashlight measure
+
+# Scripted: run a Maestro flow 10 times and store results
+flashlight test --bundleId com.myapp \
+  --testCommand "maestro test e2e/scroll-feed.yaml" \
+  --duration 10000 --iterationCount 10 \
+  --resultsFilePath results/feed-main.json
+
+# Compare runs side by side
+flashlight report results/feed-main.json results/feed-branch.json
+```
+
+**Reassure** runs in Jest and flags render regressions (count and duration) in pull requests:
+
+```tsx title="src/features/feed/Feed.perf-test.tsx"
+import { measureRenders } from 'reassure';
+import { fireEvent, screen } from '@testing-library/react-native';
+import { Feed } from './Feed';
+import { makePosts } from '../../test/factories';
+
+test('liking a post re-renders only that row', async () => {
+  const scenario = async () => {
+    fireEvent.press(screen.getAllByLabelText('Like')[0]);
+    await screen.findByText('1 like');
+  };
+
+  await measureRenders(<Feed posts={makePosts(50)} />, { scenario });
+});
+```
+
+```bash
+npx reassure --baseline   # on the main branch
+npx reassure              # on the PR branch, compares against baseline
+```
+
+### Investigation workflow
+
+```mermaid
+flowchart TD
+    Report(["Report: the app feels slow"]) --> Repro["Reproduce on a low-end Android<br/>release build"]
+    Repro --> Kind{"What kind of slow?"}
+    Kind -->|"slow launch"| Startup["Startup trace<br/>Perfetto, Instruments App Launch, marks"]
+    Kind -->|"janky scroll or animation"| Fps{"Perf Monitor:<br/>JS FPS or UI FPS drops?"}
+    Kind -->|"slow interaction"| Profiler["React Profiler and<br/>DevTools Performance panel"]
+    Kind -->|"grows over time or crashes"| Memory["Heap snapshots, Instruments Leaks,<br/>LeakCanary"]
+    Fps -->|"JS"| Profiler
+    Fps -->|"UI"| Native["Android Studio CPU, Perfetto,<br/>Instruments Time Profiler"]
+    Profiler --> Fix["Fix the top offender only"]
+    Native --> Fix
+    Startup --> Fix
+    Memory --> Fix
+    Fix --> Verify["Re-measure: same device, same scenario"]
+    Verify --> Guard["Add a guard: Reassure, Flashlight in CI,<br/>budgets and APM alerts"]
+```
+*Figure: Classify the symptom, pick the matching tool, fix one thing at a time, and lock in the improvement.*
+
+> [!TIP]
+> Change one thing per measurement. Five "optimizations" shipped together make it impossible to know which helped, which did nothing, and which made things worse.
+
+## Startup
+
+### Where cold start time goes
+
+```mermaid
+sequenceDiagram
+    participant OS as OS
+    participant Nat as Native app
+    participant JS as JS runtime
+    participant UI as UI thread
+    OS->>Nat: create process (cold start)
+    Nat->>Nat: load libraries, Application and AppDelegate init
+    Nat->>Nat: native SDK init (analytics, crash, ads, push)
+    Nat->>UI: native splash screen visible
+    Nat->>JS: create Hermes runtime, map bytecode bundle
+    JS->>JS: evaluate module graph (inline requires shrink this)
+    JS->>JS: read persisted state, build providers and navigation
+    JS->>UI: first React commit mounted (TTID)
+    JS->>JS: fetch or load cached content for home
+    JS->>UI: hide splash, meaningful content visible (TTFD)
+    Note over JS,UI: Interactive once the JS thread is free (TTI)
+    JS->>JS: deferred work - non-critical SDKs, prefetch
+```
+*Figure: A cold start is a chain of native and JS phases. Each arrow before TTFD is a place to cut or defer work.*
+
+Measure each phase before optimizing. `react-native-performance` exposes native marks (process/launch start, bundle run start/end) alongside the standard `performance.mark` / `measure` API:
+
+```ts title="src/perf/startup.ts"
+import performance from 'react-native-performance';
+
+export function markHomeInteractive() {
+  performance.mark('homeInteractive');
+  performance.measure('coldStart:toHomeInteractive', 'nativeLaunchStart', 'homeInteractive');
+  performance.measure('coldStart:jsBundle', 'runJsBundleStart', 'runJsBundleEnd');
+
+  const [total] = performance.getEntriesByName('coldStart:toHomeInteractive');
+  // Send to your APM / analytics with device class, app version, OS version.
+  console.log(`[startup] home interactive after ${Math.round(total.duration)}ms`);
+}
+```
+
+### Hermes and bytecode
+
+Hermes compiles your JS to **bytecode at build time**. At launch the runtime memory-maps the `.hbc` file instead of parsing and compiling source, which reduces startup time and memory compared with shipping plain JS. Hermes is the default engine; confirm with `global.HermesInternal != null`. "Hermes V1" (from the Static Hermes work) is experimental in recent releases — evaluate it on your own startup and FPS metrics before adopting.
+
+### Analyze the bundle
+
+Every module in the bundle costs bytes to ship and (if evaluated at startup) time to run.
+
+```bash
+# Quick treemap (bare RN)
+npx react-native-bundle-visualizer
+
+# Or build a production bundle + source map and inspect it
+npx react-native bundle --platform android --dev false --minify true \
+  --entry-file index.js --bundle-output /tmp/index.android.bundle \
+  --sourcemap-output /tmp/index.android.bundle.map
+npx source-map-explorer /tmp/index.android.bundle /tmp/index.android.bundle.map
+```
+
+Expo projects can use **Expo Atlas** to explore the Metro bundle graph (enable it with the environment variable documented for your SDK and run `npx expo export`).
+
+| Common heavy dependency | Better option |
+|---|---|
+| `moment` with all locales | `date-fns` (tree-shaken imports), `dayjs`, or `Intl.DateTimeFormat` (Hermes ships `Intl`) |
+| `lodash` whole-library import | Per-method imports (`lodash/debounce`) or native JS |
+| `crypto-js`, JS crypto polyfills | `react-native-quick-crypto` (native) or platform APIs |
+| Entire icon font families | Only the icon sets you use; SVG icons for a small set |
+| Big SDKs imported at the root (maps, charts, PDF, video) | Import inside the screen that needs them |
+| `Intl` polyfills from old setups | Remove — verify Hermes `Intl` coverage for your locales first |
+
+### Inline requires and lazy screens
+
+With **inline requires**, Metro rewrites imports so a module is evaluated when it is first *used*, not when the file importing it is loaded. Recent RN templates enable it in the default Metro config — verify, because custom configs often override it:
+
+```js title="metro.config.js"
+const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
+
+const config = {
+  transformer: {
+    getTransformOptions: async () => ({
+      transform: {
+        experimentalImportSupport: false,
+        inlineRequires: true,
+      },
+    }),
+  },
+};
+
+module.exports = mergeConfig(getDefaultConfig(__dirname), config);
+```
+
+Then keep the startup path small:
+
+- Screens not needed for the first frame should not be evaluated at startup. React Navigation's tab navigators render tabs lazily by default (`lazy: true`); keep heavy imports inside those screen files rather than in shared barrels (`index.ts` files that re-export everything defeat lazy evaluation).
+- `React.lazy(() => import('./HeavyChart'))` with `<Suspense>` defers evaluation of a component and its dependencies until first render (it is still in the same bundle, but not executed at startup).
+- Avoid top-level side effects in modules (SDK `init()` calls at import time, large constant tables built eagerly).
+
+### Defer non-critical work
+
+Anything not needed for the first meaningful screen should start after it renders.
+
+```ts title="src/bootstrap/deferredInit.ts"
+import { useEffect } from 'react';
+import { initAnalytics } from '../services/analytics';
+import { initSupportChat } from '../services/supportChat';
+import { prefetchRemoteConfig } from '../services/remoteConfig';
+
+export function useDeferredInit(homeReady: boolean) {
+  useEffect(() => {
+    if (!homeReady) return;
+    // requestIdleCallback runs when the JS thread is idle.
+    // InteractionManager is deprecated since RN 0.82 in favour of it.
+    const handle = requestIdleCallback(() => {
+      initAnalytics();
+      prefetchRemoteConfig();
+      initSupportChat(); // heavy SDK nobody needs in the first seconds
+    });
+    return () => cancelIdleCallback(handle);
+  }, [homeReady]);
+}
+```
+
+On the native side, audit `MainApplication.onCreate()` (Android) and `application(_:didFinishLaunchingWithOptions:)` (iOS). Ad, attribution, chat and analytics SDKs often do disk and network work there. Initialize only crash reporting eagerly (you want crashes during startup) and move the rest behind a flag or a deferred JS call. On Android also check auto-initializing `ContentProvider`s / `androidx.startup` initializers merged from libraries, and consider **Baseline Profiles** to speed up Kotlin/Java code on first launches.
+
+### Storage reads at startup
+
+A classic cold-start killer: rehydrating a multi-megabyte `redux-persist` blob from AsyncStorage and `JSON.parse`-ing it before the first render.
+
+- Persist only what the first screen needs (session, settings, a small cached home payload); load the rest lazily.
+- Prefer many small keys in a fast synchronous store (**react-native-mmkv**) over one giant JSON value.
+- Put large datasets in SQLite (`expo-sqlite`, `op-sqlite`, WatermelonDB) and query only the rows you display.
+- Never block the first render on the network; render cached content or a skeleton and refresh.
+
+### Splash strategy
+
+Keep the native splash visible until the first *meaningful* screen is ready, then hide it — no white flash, no empty screen. But cap it: if bootstrap takes more than a couple of seconds, show a skeleton instead of an endless splash.
+
+```tsx title="app/_layout.tsx (Expo Router)"
+import { useCallback, useEffect, useState } from 'react';
+import { View } from 'react-native';
+import { Stack } from 'expo-router';
+import * as SplashScreen from 'expo-splash-screen';
+import { bootstrap } from '../src/bootstrap/bootstrap';
+
+SplashScreen.preventAutoHideAsync();
+
+export default function RootLayout() {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    // bootstrap: restore session from MMKV, load fonts, read cached home data. No network awaits.
+    bootstrap().finally(() => setReady(true));
+  }, []);
+
+  const onLayoutRootView = useCallback(() => {
+    if (ready) SplashScreen.hideAsync();
+  }, [ready]);
+
+  if (!ready) return null;
+
+  return (
+    <View style={{ flex: 1 }} onLayout={onLayoutRootView}>
+      <Stack />
+    </View>
+  );
+}
+```
+
+Bare apps typically use `react-native-bootsplash` (`BootSplash.hide({ fade: true })`). See the [App Icon & Splash Screen guide](app-icon-splash.html) for native setup.
+
+## Rendering
+
+### Why components re-render
+
+A component re-renders when its state changes, its parent re-renders (by default, regardless of props), or a context it consumes changes. Re-rendering is not a bug — **wasted** re-rendering of big subtrees on every keystroke, tick or store update is.
+
+```mermaid
+flowchart TD
+    subgraph slowPath["Unoptimized: cart count changes"]
+        A1["App-level state or context update"] --> H1["Header re-renders"]
+        A1 --> F1["Feed re-renders"]
+        F1 --> R1["All 50 rows re-render"]
+        R1 --> I1["All row images and buttons re-render"]
+    end
+    subgraph fastPath["Optimized: selector plus memoized subtree"]
+        A2["Store update: cart count"] --> B2["CartBadge re-renders<br/>it selects cart.count"]
+        A2 -.->|"selected value unchanged"| F2["Feed skipped (memo)"]
+        F2 -.-> R2["Rows skipped (memo, stable props)"]
+    end
+```
+*Figure: Moving state to where it is used and memoizing stable subtrees turns an O(tree) update into an O(1) update.*
+
+### Memoization done right
+
+`React.memo` only helps when props are **referentially stable**. A new inline function or object on every render defeats it.
+
+```tsx title="src/features/feed/FeedRow.tsx"
+import { memo } from 'react';
+import { Pressable, Text, View } from 'react-native';
+import { Image } from 'expo-image';
+import type { Post } from './types';
+
+type Props = {
+  post: Post;
+  onLike: (id: string) => void; // stable reference from the parent
+};
+
+export const FeedRow = memo(function FeedRow({ post, onLike }: Props) {
+  return (
+    <View style={{ padding: 12 }}>
+      <Image source={{ uri: post.thumbUrl }} style={{ height: 200 }} contentFit="cover" recyclingKey={post.id} />
+      <Text>{post.title}</Text>
+      <Pressable accessibilityLabel="Like" onPress={() => onLike(post.id)}>
+        <Text>{post.likes} likes</Text>
+      </Pressable>
+    </View>
+  );
+});
+```
+
+```tsx title="src/features/feed/Feed.tsx (parent)"
+const likePost = useFeedStore((s) => s.likePost); // store actions are stable
+const onLike = useCallback((id: string) => likePost(id), [likePost]);
+```
+
+Pitfalls: memoizing cheap leaf components adds comparison cost for no gain; passing `style={{...}}` or `data={items.filter(...)}` inline creates new references every render; spreading a whole store object into props re-renders on any change.
+
+### Context splitting and selectors
+
+A single `AppContext` holding user, theme, cart and feature flags re-renders every consumer when anything changes. Split by update frequency, and keep values stable:
+
+```tsx title="src/state/CartContext.tsx"
+const CartStateContext = createContext<CartState | null>(null);
+const CartActionsContext = createContext<CartActions | null>(null);
+
+export function CartProvider({ children }: { children: ReactNode }) {
+  const [state, dispatch] = useReducer(cartReducer, initialCart);
+  // Actions never change, so components that only dispatch never re-render on cart updates.
+  const actions = useMemo<CartActions>(
+    () => ({
+      add: (item) => dispatch({ type: 'add', item }),
+      remove: (id) => dispatch({ type: 'remove', id }),
+    }),
+    [],
+  );
+  return (
+    <CartActionsContext.Provider value={actions}>
+      <CartStateContext.Provider value={state}>{children}</CartStateContext.Provider>
+    </CartActionsContext.Provider>
+  );
+}
+```
+
+For frequently changing global state, a store with **selectors** is better than context, because each component subscribes only to the slice it reads:
+
+```ts title="Selectors in Zustand and Redux Toolkit"
+// Zustand: re-render only when the selected value changes
+const count = useCartStore((s) => s.items.length);
+// Selecting several fields: compare shallowly
+import { useShallow } from 'zustand/react/shallow';
+const { total, currency } = useCartStore(useShallow((s) => ({ total: s.total, currency: s.currency })));
+
+// Redux Toolkit: memoized derived data with createSelector
+import { createSelector } from '@reduxjs/toolkit';
+const selectVisibleTodos = createSelector(
+  [(s: RootState) => s.todos.items, (s: RootState) => s.todos.filter],
+  (items, filter) => items.filter((t) => filter === 'all' || t.status === filter),
+);
+const visible = useSelector(selectVisibleTodos);
+```
+
+### React Compiler
+
+React Compiler (stable since v1.0) analyzes components and hooks at build time and inserts memoization automatically — effectively `useMemo`/`useCallback`/`memo` everywhere it is safe. It requires code that follows the Rules of React (pure render, no mutation of props/state).
+
+```js title="babel.config.js (bare RN)"
+module.exports = {
+  presets: ['module:@react-native/babel-preset'],
+  plugins: [
+    'babel-plugin-react-compiler', // must run first in the plugin list
+    // ...other plugins, e.g. 'react-native-worklets/plugin' last
+  ],
+};
+```
+
+```json title="app.json (Expo)"
+{
+  "expo": {
+    "experiments": {
+      "reactCompiler": true
+    }
+  }
+}
+```
+
+Roll it out with the ESLint React Hooks plugin's compiler rules enabled, check that re-render counts actually drop (Reassure, React Profiler), and opt out a problematic component with the `"use no memo"` directive. The compiler does not fix expensive renders, huge lists or unstable data coming from outside React.
+
+### Keys, heavy computation and transitions
+
+- **Keys**: use stable IDs. Index keys on lists that insert/remove/reorder cause remounts and state bugs; random keys (`Math.random()`) remount every render.
+- **`useMemo` for real work**: sorting/filtering thousands of items, building chart series, parsing. Not for cheap expressions.
+- **Transitions**: mark expensive, non-urgent updates as interruptible so typing stays responsive (requires the New Architecture — see [The New Architecture](new-architecture.html)).
+
+```tsx title="src/features/search/ProductSearch.tsx"
+import { useDeferredValue, useMemo, useState } from 'react';
+import { TextInput } from 'react-native';
+import { ProductList } from './ProductList';
+import { filterProducts } from './filterProducts';
+import type { Product } from './types';
+
+export function ProductSearch({ products }: { products: Product[] }) {
+  const [query, setQuery] = useState('');
+  // The input updates immediately; the list re-renders with the deferred value in the background.
+  const deferredQuery = useDeferredValue(query);
+  const results = useMemo(() => filterProducts(products, deferredQuery), [products, deferredQuery]);
+
+  return (
+    <>
+      <TextInput value={query} onChangeText={setQuery} placeholder="Search" />
+      <ProductList data={results} dimmed={query !== deferredQuery} />
+    </>
+  );
+}
+```
+
+For navigation-heavy apps, also enable `freezeOnBlur` on screens (React Navigation + `react-native-screens`) so screens in the back stack or inactive tabs do not re-render while hidden.
+
+## Lists
+
+Long lists are where most RN apps feel slow. The rules: virtualize, keep rows cheap, keep props stable, and size images correctly.
+
+### FlatList tuning
+
+`FlatList` virtualizes by rendering a window of rows around the viewport and unmounting the rest. Its props trade blank areas against JS work and memory:
+
+| Prop | What it does | Trade-off |
+|---|---|---|
+| `keyExtractor` | Stable key per row (e.g. `item.id`) | Index keys break row identity on insert/remove |
+| `getItemLayout` | Supplies row offset/length so rows are not measured; enables instant `scrollToIndex` | Only possible with fixed or computable heights; wrong values cause jumps |
+| `initialNumToRender` | Rows rendered in the first batch (default 10) | Too high slows the first frame; too low shows blanks on first scroll — cover exactly one screen |
+| `maxToRenderPerBatch` | Rows rendered per incremental batch (default 10) | Higher fills faster but blocks JS longer per batch |
+| `updateCellsBatchingPeriod` | Delay between batches (default 50 ms) | Lower fills faster, more JS pressure |
+| `windowSize` | Rendered area in viewport heights (default 21: the visible screen plus 10 above and 10 below) | Lower saves memory and work but increases blank areas on fast scroll; 5–11 is common for heavy rows |
+| `removeClippedSubviews` | Detaches off-screen native views from the hierarchy | Less UI work; can cause missing content with some layouts — test on both platforms |
+| `onEndReachedThreshold` | How far from the end (in visible lengths) to fire `onEndReached` | Too small shows a spinner at the bottom; too large over-fetches |
+| `extraData` | Tells the list to re-render when something outside `data` changes | Passing a frequently changing object re-renders every row |
+| `renderItem` | Row renderer | Define with `useCallback` and render a `memo` row; inline arrow functions create new references |
+
+```tsx title="src/features/contacts/ContactList.tsx"
+import { useCallback } from 'react';
+import { FlatList, type ListRenderItem } from 'react-native';
+import { ContactRow, CONTACT_ROW_HEIGHT } from './ContactRow';
+import type { Contact } from './types';
+
+export function ContactList({ contacts }: { contacts: Contact[] }) {
+  const renderItem = useCallback<ListRenderItem<Contact>>(({ item }) => <ContactRow contact={item} />, []);
+
+  return (
+    <FlatList
+      data={contacts}
+      renderItem={renderItem}
+      keyExtractor={(c) => c.id}
+      getItemLayout={(_, index) => ({ length: CONTACT_ROW_HEIGHT, offset: CONTACT_ROW_HEIGHT * index, index })}
+      initialNumToRender={12}
+      maxToRenderPerBatch={8}
+      windowSize={7}
+    />
+  );
+}
+```
+
+### FlashList v2: recycling instead of unmounting
+
+FlashList (Shopify) **recycles** row components instead of unmounting and remounting them. v2 is New-Architecture-only, needs no size estimates (it measures synchronously thanks to Fabric), and supports masonry layouts via a prop.
+
+```mermaid
+flowchart TD
+    Scroll["User scrolls down"] --> Leave["Row showing item 3 leaves<br/>the viewport plus draw distance"]
+    Leave --> Pool[("Recycle pool<br/>keyed by item type")]
+    Enter["Item 23 enters the render window"] --> Check{"Pool has a cell of<br/>item 23's type?"}
+    Pool --> Check
+    Check -->|"yes"| Reuse["Re-render the existing cell<br/>with item 23's props"]
+    Check -->|"no"| Create["Create a new cell<br/>mount native views"]
+    Reuse --> Show["Cell positioned and visible"]
+    Create --> Show
+```
+*Figure: Recycling turns "unmount + mount native views" into "update props of an existing cell", which is much cheaper on both threads.*
+
+```tsx title="src/features/feed/FeedList.tsx"
+import { useCallback } from 'react';
+import { FlashList, type ListRenderItem } from '@shopify/flash-list';
+import { PostRow } from './PostRow';
+import { AdRow } from './AdRow';
+import type { FeedItem } from './types';
+
+type Props = { items: FeedItem[]; onEndReached: () => void };
+
+export function FeedList({ items, onEndReached }: Props) {
+  const renderItem = useCallback<ListRenderItem<FeedItem>>(
+    ({ item }) => (item.kind === 'ad' ? <AdRow ad={item} /> : <PostRow post={item} />),
+    [],
+  );
+
+  return (
+    <FlashList
+      data={items}
+      renderItem={renderItem}
+      keyExtractor={(item) => item.id}
+      getItemType={(item) => item.kind} // separate pools: posts never recycle into ads
+      onEndReached={onEndReached}
+      onEndReachedThreshold={0.5}
+    />
+  );
+}
+```
+
+Recycling gotchas:
+
+- **Local state survives recycling.** A row's `useState` keeps the previous item's value when reused. Derive from props, key state by item id, or use FlashList's `useRecyclingState(initial, [item.id])`.
+- **Do not put a `key` prop on the row's root** based on the item — it forces a remount and disables recycling.
+- **Images flash the previous item's picture** while loading; pass `recyclingKey={item.id}` to `expo-image`.
+- **`getItemType`** matters whenever rows have very different structures (posts, ads, headers); otherwise a text-only row may be recycled into a video row and rebuilt.
+
+`LegendList` is another high-performance, pure-JS alternative worth benchmarking for chat-style and dynamic-height lists.
+
+### Other list rules
+
+- **Never nest a vertical virtualized list inside a vertical `ScrollView`.** The inner list renders every row (virtualization is lost) and RN warns about it. Use `ListHeaderComponent`/`ListFooterComponent`, `SectionList`, or one list with typed rows.
+- **Keep rows cheap**: no heavy computation in render, no per-row context subscriptions that change often, flatten deep view hierarchies, avoid expensive shadows on Android (use `elevation`) and large `borderRadius` + `overflow: 'hidden'` combos on images where possible.
+- **Paginate** — never render thousands of fetched items at once:
+
+```tsx title="src/features/feed/useFeed.ts"
+import { useMemo } from 'react';
+import { useInfiniteQuery } from '@tanstack/react-query';
+import { api } from '../../api/client';
+
+export function useFeed() {
+  const query = useInfiniteQuery({
+    queryKey: ['feed'],
+    queryFn: ({ pageParam }) => api.getFeed({ cursor: pageParam, limit: 20 }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+  });
+
+  const items = useMemo(() => query.data?.pages.flatMap((p) => p.items) ?? [], [query.data]);
+
+  const loadMore = () => {
+    if (query.hasNextPage && !query.isFetchingNextPage) query.fetchNextPage();
+  };
+
+  return { items, loadMore, isRefreshing: query.isRefetching, refresh: query.refetch };
+}
+```
+
+## Images
+
+Images are the most common source of both UI-thread jank (decoding) and out-of-memory crashes.
+
+**Decoded bitmaps are big**: memory ≈ width × height × 4 bytes. A 12-megapixel photo (4000 × 3000) is ~48 MB decoded — regardless of whether it is a 3 MB JPEG on disk. Twenty of those in a grid is ~1 GB.
+
+| Technique | How | Why |
+|---|---|---|
+| **Right-size at the source** | Request the display size × pixel ratio from an image CDN (`?w=360&dpr=3`) or generate thumbnails server-side | Fewer bytes over the network, far less decode time and memory |
+| **Cache** | `expo-image` with `cachePolicy="memory-disk"` (default disk + memory caching via SDWebImage/Glide) | No re-download, faster re-display |
+| **Modern formats** | WebP everywhere; AVIF where your image library and target OS versions support it | 25–50% smaller than JPEG/PNG at similar quality |
+| **Placeholders** | `blurhash` / `thumbhash` strings in your API response | Instant perceived content, no layout jump |
+| **Prefetch** | `Image.prefetch(urls)` for the next screen or next page | Content is ready when the user arrives |
+| **Downscale on device** | `expo-image` downsamples to the view size by default (`allowDownscaling`) | Protects memory when the server sends big images |
+| **Release memory** | Clear the memory cache on memory warnings; avoid holding base64 strings in JS state | Prevents OOM on image-heavy flows |
+
+```tsx title="src/components/Avatar.tsx"
+import { PixelRatio } from 'react-native';
+import { Image } from 'expo-image';
+
+type Props = { id: string; url: string; blurhash?: string; size: number };
+
+export function Avatar({ id, url, blurhash, size }: Props) {
+  const px = PixelRatio.getPixelSizeForLayoutSize(size); // ask the CDN for exactly what we draw
+  return (
+    <Image
+      source={{ uri: `${url}?w=${px}&h=${px}&fit=crop&fm=webp` }}
+      placeholder={blurhash ? { blurhash } : undefined}
+      style={{ width: size, height: size, borderRadius: size / 2 }}
+      contentFit="cover"
+      transition={150}
+      cachePolicy="memory-disk"
+      recyclingKey={id}
+    />
+  );
+}
+```
+
+```ts title="src/perf/memoryWarnings.ts"
+import { AppState } from 'react-native';
+import { Image } from 'expo-image';
+
+// iOS memory warnings; on Android the OS trims caches via onTrimMemory in the image library.
+export function registerMemoryWarningHandler() {
+  const sub = AppState.addEventListener('memoryWarning', () => {
+    Image.clearMemoryCache();
+  });
+  return () => sub.remove();
+}
+```
+
+> [!NOTE]
+> The original `react-native-fast-image` is unmaintained. Prefer `expo-image` (works in bare RN apps too) for caching, placeholders, modern formats and recycling support.
+
+## Animations
+
+The rule: **animations must not depend on the JS thread**. If a frame requires JS to compute the next value, any JS work (a render, a network callback) causes stutter.
+
+| Approach | Runs on | Use for |
+|---|---|---|
+| `Animated` with `useNativeDriver: true` | UI thread | Simple timing/spring on `transform` and `opacity` |
+| **Reanimated** worklets (`useSharedValue`, `useAnimatedStyle`) | UI thread | Gesture-driven, interruptible, complex animations; scroll-linked effects |
+| Reanimated 4 CSS-style animations/transitions | UI thread | Declarative state-to-style transitions (New Architecture only) |
+| `LayoutAnimation` / Reanimated layout animations | Native | Animating layout changes (insert/remove/reorder) |
+| `Animated` without native driver, `setState` per frame | JS thread | Avoid for anything visible |
+
+```tsx title="src/components/PressableScale.tsx"
+import type { ReactNode } from 'react';
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
+
+export function PressableScale({ children }: { children: ReactNode }) {
+  const scale = useSharedValue(1);
+
+  const tap = Gesture.Tap()
+    .onBegin(() => {
+      scale.value = withSpring(0.96); // runs on the UI thread as a worklet
+    })
+    .onFinalize(() => {
+      scale.value = withSpring(1);
+    });
+
+  const style = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
+
+  return (
+    <GestureDetector gesture={tap}>
+      <Animated.View style={style}>{children}</Animated.View>
+    </GestureDetector>
+  );
+}
+```
+
+- **Animate compositor-friendly properties**: `transform` (translate, scale, rotate) and `opacity`. Animating `width`, `height`, `top`, `margin` or `flex` forces layout on every frame for the animated view and its siblings; fake size changes with `scale` and position with `translate`.
+- **Reanimated 4** moved worklets to the separate `react-native-worklets` package (its Babel plugin, `react-native-worklets/plugin`, replaces the old Reanimated plugin and must be listed last).
+- Keep `runOnJS` / scheduling back to JS out of per-frame callbacks.
+
+### 120 Hz on ProMotion iPhones
+
+iPhones with ProMotion cap third-party apps at 60 Hz for Core Animation unless you opt in. Add to `ios/<AppName>/Info.plist`:
+
+```xml title="ios/MyApp/Info.plist"
+<key>CADisableMinimumFrameDurationOnPhone</key>
+<true/>
+```
+
+In Expo, set it via `ios.infoPlist` in `app.json`: `"infoPlist": { "CADisableMinimumFrameDurationOnPhone": true }`. After enabling it, your frame budget is **8.33 ms** — re-test animations, since work that fit at 60 Hz may now drop frames. High-refresh Android devices generally run your UI at the display rate without an opt-in, subject to OS power policies.
+
+## The JS thread
+
+Anything that blocks the JS thread for more than a frame delays touches, renders and JS-driven updates.
+
+- **Break up long tasks.** Process large arrays in chunks and yield between them:
+
+```ts title="src/utils/processInChunks.ts"
+export async function processInChunks<T, R>(
+  items: readonly T[],
+  fn: (item: T) => R,
+  chunkSize = 200,
+): Promise<R[]> {
+  const out: R[] = [];
+  for (let i = 0; i < items.length; i += chunkSize) {
+    for (let j = i; j < Math.min(i + chunkSize, items.length); j++) out.push(fn(items[j]));
+    // Yield so input events and React commits can run between chunks.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  return out;
+}
+```
+
+- **Move heavy work off JS**: crypto/hashing to native (`react-native-quick-crypto`), image manipulation to native modules, heavy parsing into SQLite queries, and CPU-bound pure functions to a background worklet runtime (`react-native-worklets`) or a Nitro/Turbo module in C++.
+- **Large JSON**: paginate at the API; avoid multi-megabyte responses; do not keep raw payloads in React state; normalize and store what you display. `JSON.parse` of a 5 MB string can block the JS thread for hundreds of milliseconds on a low-end device.
+- **Debounce and throttle** high-frequency inputs:
+
+```ts title="src/hooks/useDebouncedValue.ts"
+import { useEffect, useState } from 'react';
+
+export function useDebouncedValue<T>(value: T, delayMs = 300): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(id);
+  }, [value, delayMs]);
+  return debounced;
+}
+```
+
+- Use `scrollEventThrottle={16}` only if you really handle scroll in JS — better, use Reanimated's `useAnimatedScrollHandler` so scroll-linked effects run on the UI thread.
+- Strip `console.*` calls in release builds (e.g. `babel-plugin-transform-remove-console`); logging large objects is surprisingly expensive.
+
+## Memory
+
+Memory problems show up as slowdowns (GC pressure), background kills, and hard crashes: iOS terminates apps over the device's memory limit (jetsam) without a normal crash report, and Android throws `OutOfMemoryError` or kills the process.
+
+### Common leaks
+
+| Source | Example | Fix |
+|---|---|---|
+| Subscriptions | `AppState`, `Keyboard`, `NetInfo`, `Linking`, native event emitters never removed | Return `sub.remove()` from the effect cleanup |
+| Timers | `setInterval` polling that survives unmount | `clearInterval` in cleanup; pause polling in background |
+| Listeners and sockets | WebSocket / Firestore / store subscriptions created per screen | Unsubscribe on unmount; share one connection app-wide |
+| Closures | Module-level caches or refs that capture large arrays or screen state and keep growing | Bound caches (LRU), clear on logout, avoid capturing big objects in long-lived callbacks |
+| Navigation stacks | Repeated `push` of detail screens; every screen in a stack stays mounted | `navigate` instead of `push` where possible, `reset` after flows, `popToTopOnBlur` on tab screens |
+| Image caches | Full-resolution bitmaps in memory cache; base64 image strings in state | Right-size images, clear memory cache on warnings, store file URIs not base64 |
+| Unbounded stores | Chat messages, logs or analytics queues that only grow | Window the data; persist old items to disk |
+| Native leaks | Android singleton holding an `Activity`; iOS block capturing `self` strongly | Use application context / weak references; `__weak` / `[weak self]` |
+
+```tsx title="src/features/orders/useOrderPolling.ts"
+import { useEffect } from 'react';
+import { AppState } from 'react-native';
+import { api } from '../../api/client';
+
+export function useOrderPolling(orderId: string, onUpdate: (status: string) => void) {
+  useEffect(() => {
+    const controller = new AbortController();
+    let interval: ReturnType<typeof setInterval> | undefined;
+
+    const poll = () =>
+      api.getOrderStatus(orderId, { signal: controller.signal }).then(onUpdate).catch(() => {});
+
+    const start = () => {
+      poll();
+      interval = setInterval(poll, 10_000);
+    };
+    const stop = () => clearInterval(interval);
+
+    start();
+    const sub = AppState.addEventListener('change', (state) => (state === 'active' ? start() : stop()));
+
+    return () => {
+      stop();
+      sub.remove();
+      controller.abort(); // no setState on an unmounted screen, no dangling request
+    };
+  }, [orderId, onUpdate]);
+}
+```
+
+### Detecting leaks
+
+1. **Reproduce with a loop**: open and close the suspect screen 10–20 times (a Maestro flow makes this repeatable).
+2. **JS heap**: in React Native DevTools' Memory panel, take a heap snapshot, run the loop, force GC, take another, and compare. Look for detached component instances, growing arrays and retained closures.
+3. **iOS native**: Instruments **Allocations** (mark generations between loops — each generation should return to baseline) and **Leaks** (retain cycles). The Xcode memory graph debugger shows who retains an object.
+4. **Android native**: Android Studio Memory Profiler (heap dump, allocation tracking) and **LeakCanary**, which detects leaked Activities/Fragments/Views automatically in debug builds:
+
+```gradle title="android/app/build.gradle"
+dependencies {
+    // Debug-only leak detection. Check for the latest 2.x version.
+    debugImplementation("com.squareup.leakcanary:leakcanary-android:2.14")
+}
+```
+
+## Network
+
+Network latency usually dominates "screen load" time. The goal: fewer, smaller, cached, earlier requests.
+
+```mermaid
+sequenceDiagram
+    participant H as Header avatar
+    participant P as Profile screen
+    participant QC as QueryClient cache
+    participant API as API server
+    H->>QC: useQuery with key user me
+    P->>QC: useQuery with key user me
+    QC->>API: one GET /me request (deduplicated)
+    API-->>QC: 200 with JSON body
+    QC-->>H: data
+    QC-->>P: same data
+    Note over QC: fresh until staleTime expires
+    P->>QC: remount within staleTime
+    QC-->>P: cached data, no network request
+```
+*Figure: A query cache deduplicates concurrent requests and serves fresh data from memory, removing whole round trips.*
+
+```ts title="src/api/queryClient.ts"
+import { QueryClient, focusManager } from '@tanstack/react-query';
+import { AppState, type AppStateStatus } from 'react-native';
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 60_000,      // treat data as fresh for a minute: no refetch on every mount
+      gcTime: 10 * 60_000,    // keep unused cache entries for 10 minutes
+      retry: 2,
+    },
+  },
+});
+
+// Refetch stale queries when the app returns to the foreground (RN has no window focus).
+AppState.addEventListener('change', (status: AppStateStatus) => {
+  focusManager.setFocused(status === 'active');
+});
+```
+
+- **Prefetch** the next screen's data on `onPressIn` (`queryClient.prefetchQuery(...)`) — the 100–200 ms between press-in and navigation is often enough to hide a request.
+- **Paginate** with cursors; never fetch unbounded lists.
+- **Compress**: gzip is handled transparently by `NSURLSession` and OkHttp — make sure the server actually compresses JSON responses.
+- **Batch and aggregate**: replace per-row requests (N+1) with one list endpoint; a BFF or GraphQL endpoint shaped for the screen avoids waterfalls.
+- **HTTP caching**: `ETag` / `Cache-Control` let the native stack return `304 Not Modified` cheaply.
+- **Offline-first** screens render from local storage instantly and sync in the background — see [Offline Storage & Sync](offline-storage.html).
+
+## App size
+
+Smaller apps install more often (especially on cellular and in emerging markets) and start slightly faster.
+
+| Lever | How |
+|---|---|
+| **Hermes** | Default engine; ships compact bytecode and no separate JSC |
+| **R8 + resource shrinking** (Android) | Enable minification and `shrinkResources` in release |
+| **Android App Bundle** | Upload AAB (required by Play); Play serves per-ABI, per-density, per-language APKs |
+| **App Thinning** (iOS) | Automatic slicing by the App Store; use asset catalogs so slicing works |
+| **Assets and fonts** | Remove unused fonts and icon families; convert PNG to WebP; compress Lottie JSON; download large, rarely used assets on demand |
+| **Dependencies** | Every native SDK adds binary size — audit periodically with the tools below |
+
+```gradle title="android/app/build.gradle"
+def enableProguardInReleaseBuilds = true
+
+android {
+    buildTypes {
+        release {
+            minifyEnabled enableProguardInReleaseBuilds
+            shrinkResources enableProguardInReleaseBuilds // requires minifyEnabled
+            proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
+            signingConfig signingConfigs.release
+        }
+    }
+}
+```
+
+In Expo, enable the equivalent Android minify and resource-shrinking options through the `expo-build-properties` config plugin (option names have changed across SDKs — check its docs). After enabling R8, test the release build thoroughly and add keep rules to `proguard-rules.pro` for libraries that use reflection.
+
+```bash
+# Inspect an Android release: Android Studio > Build > Analyze APK, or estimate per-device download size
+bundletool build-apks --bundle=android/app/build/outputs/bundle/release/app-release.aab --output=/tmp/app.apks
+bundletool get-size total --apks=/tmp/app.apks
+```
+
+On iOS, export an archive with App Thinning enabled to get an *App Thinning Size Report*, and check the per-device download and install sizes App Store Connect shows for each build. For Android dev builds only, `reactNativeArchitectures=arm64-v8a` in `android/gradle.properties` speeds up compilation — ship all ABIs in the AAB.
+
+## Case studies
+
+The numbers below are representative of real optimization work, measured on a budget Android phone (4 GB RAM) in release builds, median of repeated runs. Your results will differ; the method is the point.
+
+### Case study: janky social feed
+
+**Symptoms**: stutter while scrolling, blank cells on fast flings, the like button felt sluggish.
+
+**Diagnosis**: Perf Monitor showed *both* counters dropping. The React Profiler revealed that liking a post re-rendered all ~60 mounted rows, because posts lived in a context value rebuilt on every change and `renderItem` was an inline arrow. Instruments/Perfetto showed long image decode slices: the API returned 1080 × 1350 JPEGs for 360 dp-wide thumbnails.
+
+**Changes**: FlatList → FlashList v2 with `getItemType` (post / ad / suggestion); memoized row with stable callbacks; posts moved to a Zustand store with per-row selectors; CDN resizing to the displayed width × pixel ratio in WebP, `expo-image` with `recyclingKey` and blurhash placeholders; flattened row hierarchy and replaced JS shadows with `elevation`.
+
+| Metric | Before | After |
+|---|---|---|
+| Flashlight score (scroll scenario) | 41 | 84 |
+| Average UI FPS during scroll | 43 | 58 |
+| Minimum JS FPS during scroll | 8 | 46 |
+| Render time after tapping like | 180 ms | 9 ms |
+| Peak memory on feed | 410 MB | 265 MB |
+
+### Case study: slow cold start
+
+**Symptoms**: 4.6 s from tap to interactive home on low-end Android (1.9 s on iPhone); users saw a long splash.
+
+**Diagnosis**: a Perfetto trace plus JS marks split the time: ~900 ms of native SDK init in `Application.onCreate` (ads, attribution, chat, two analytics SDKs); ~1.1 s evaluating a 7.8 MB bundle where a barrel file imported every screen and `moment` with all locales; ~950 ms reading and parsing a 4 MB `redux-persist` blob from AsyncStorage; and the splash waited for three API calls.
+
+**Changes**: only crash reporting initialized eagerly, other SDKs deferred with `requestIdleCallback` after home rendered; barrel files removed and inline requires verified; `moment` replaced with `date-fns`; persisted state reduced to session and settings in MMKV, feed cache moved to SQLite; home rendered from cached data first, then refreshed; splash hidden on first cached render.
+
+| Metric | Before | After |
+|---|---|---|
+| Cold start to interactive home (Android) | 4.6 s | 2.1 s |
+| Cold start to interactive home (iPhone) | 1.9 s | 1.1 s |
+| Hermes bundle size | 7.8 MB | 5.9 MB |
+| Persisted state read at startup | 4 MB | 40 KB |
+| Android vitals slow cold starts | 11% | 2% |
+
+### Case study: OOM crashes in an image gallery
+
+**Symptoms**: the photo gallery crashed after scrolling through a few hundred photos; iOS showed jetsam terminations with no crash log, Android reported `OutOfMemoryError`.
+
+**Diagnosis**: the grid used a `ScrollView` with `map`, so all 600 images were mounted. Instruments Allocations showed ~45 MB decoded buffers per full-resolution 12 MP photo. The full-screen viewer kept every opened photo in state as a base64 string.
+
+**Changes**: FlashList grid with fixed-size cells; 300 px server-side thumbnails (local photos use platform thumbnails and `expo-image` downscaling); the viewer loads one image at a time at screen resolution from file URIs; base64 removed from state; memory cache cleared on memory warnings.
+
+| Metric | Before | After |
+|---|---|---|
+| Peak memory scrolling 600 photos (iPhone) | 1.4 GB, then killed | 260 MB |
+| Peak memory (budget Android) | OOM crash | 310 MB |
+| Gallery sessions ending in a crash | 2.3% | 0.02% |
+| Time to first thumbnail row | 1.8 s | 0.4 s |
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Scroll is smooth but taps respond late | JS thread busy (re-render cascade, sync work) | Profile with React Profiler / Performance panel; memoize, split state, chunk work |
+| Blank cells on fast scroll | Rows too expensive or render window too small | FlashList, memoized cheap rows, tune `windowSize`/batching, right-size images |
+| Animation stutters while data loads | Animation driven from JS | Native driver or Reanimated worklets |
+| Everything is slow only in development | Dev-mode JS, no bytecode, extra checks | Measure a release build |
+| Startup regressed after adding an SDK | Eager native init or top-level JS import | Defer init; import inside the feature |
+| Memory grows every time a screen opens | Leaked subscriptions, timers, stacked screens | Heap snapshot comparison; add cleanups; `navigate`/`reset` instead of `push` |
+| Recycled rows briefly show the wrong image or state | Recycling without `recyclingKey` / local state reuse | `recyclingKey={item.id}`, `useRecyclingState`, derive from props |
+| App stuck at 60 Hz on a ProMotion iPhone | Missing Info.plist opt-in | Add `CADisableMinimumFrameDurationOnPhone` |
+| Android much slower than iOS for the same screen | Low-end CPU, overdraw, heavy shadows, large images | Perfetto trace; `elevation` instead of shadows; smaller images; fewer views |
+| Release build crashes after enabling R8 | Reflection-based library stripped | Add keep rules in `proguard-rules.pro` |
+
+## Production checklist
+
+- [ ] Performance budgets defined per device tier and reviewed each release
+- [ ] Release builds measured on a low-end Android reference device (and a mid-range iPhone)
+- [ ] APM in production: app start, slow/frozen frames, screen load traces, ANR/hang rate, with alerts
+- [ ] Hermes enabled; bundle analyzed; no `moment`-style heavy deps or barrel imports on the startup path
+- [ ] Inline requires enabled; non-critical SDKs deferred; only crash reporting initialized eagerly
+- [ ] No large synchronous storage reads or network waits before first render; splash hidden on first meaningful render
+- [ ] Lists virtualized (FlashList/FlatList), rows memoized with stable props, `getItemType` for heterogeneous rows, pagination in place
+- [ ] Images right-sized via CDN, cached (`expo-image`), WebP/AVIF, placeholders, `recyclingKey` in lists
+- [ ] Animations on the UI thread (native driver / Reanimated); only `transform` and `opacity` animated in hot paths
+- [ ] 120 Hz opt-in on iOS (`CADisableMinimumFrameDurationOnPhone`) and animations re-tested at 8.33 ms budget
+- [ ] Effects clean up subscriptions, timers and requests; leak loop test run on key screens
+- [ ] Query cache configured (`staleTime`, dedup), prefetch for key transitions, compressed responses
+- [ ] R8 + `shrinkResources` enabled; AAB uploaded; unused fonts/assets removed; size tracked per release
+- [ ] Regression guards in CI: Reassure for render counts, Flashlight (or similar) for key scenarios
+- [ ] `console.*` stripped from release bundles
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [React Native — Performance overview](https://reactnative.dev/docs/performance)
+- [React Native — Optimizing FlatList configuration](https://reactnative.dev/docs/optimizing-flatlist-configuration)
+- [React Native DevTools](https://reactnative.dev/docs/react-native-devtools)
+- [FlashList](https://shopify.github.io/flash-list/)
+- [Reanimated docs](https://docs.swmansion.com/react-native-reanimated/)
+- [Flashlight (Android performance score)](https://github.com/bamlab/flashlight)
+
+## Interview questions
+
+### A user says the app "feels slow". How do you approach it?
+
+**Short answer:** Turn the complaint into a measurable scenario, reproduce it on a low-end Android release build, classify it (startup, scroll/animation jank, slow interaction, memory growth), profile with the matching tool, fix the biggest offender, re-measure, and add a regression guard.
+
+Concretely: check APM data first (which screens, devices, OS versions); use Perf Monitor to see whether JS or UI FPS drops; React Profiler / DevTools Performance panel for JS; Perfetto / Instruments for native; heap snapshots for memory. Change one thing at a time and report before/after numbers.
+
+> [!INTERVIEW]
+> What a senior answer includes: measurement before code, release builds, device tiers, budgets, and prevention (CI guards). Red flags: jumping straight to "wrap everything in useMemo".
+
+### What is the difference between a JS thread drop and a UI thread drop, and how do you tell them apart?
+
+**Short answer:** JS thread drops mean React/JS work exceeded the frame budget: the screen keeps its last frame, native scrolling still works, but taps respond late and JS-driven animations freeze. UI thread drops mean the main thread missed VSync — scrolling and native animations stutter, and sustained blocking causes ANRs or hangs. The Perf Monitor shows JS FPS and UI FPS separately.
+
+Causes differ: JS drops come from re-render cascades, heavy computation, large `JSON.parse`, JS-driven animations; UI drops from mounting too many views, image decoding, heavy layout, shadows/overdraw or synchronous native work on the main thread. Budgets are 16.67 ms at 60 Hz and 8.33 ms at 120 Hz.
+
+### How would you reduce cold start time?
+
+**Short answer:** Measure the phases first (native init, bundle load/evaluation, state restore, first render, content ready), then: keep Hermes bytecode, shrink and analyze the bundle, enable inline requires and remove barrel imports on the startup path, defer non-critical SDK initialization, avoid large synchronous storage reads, render cached content instead of waiting for the network, and hide the splash on the first meaningful render.
+
+Mention native costs specifically: SDKs in `Application.onCreate` / `didFinishLaunching`, auto-initializing content providers on Android, Baseline Profiles. Verify with `am start -W`, Perfetto, Instruments App Launch, and production app-start metrics.
+
+### How does FlashList differ from FlatList, and what are the recycling gotchas?
+
+**Short answer:** FlatList virtualizes by mounting rows near the viewport and unmounting the rest; FlashList recycles row components — a row leaving the screen goes into a pool (per item type) and is re-rendered with new props for an entering item, which avoids creating native views. FlashList v2 is New-Architecture-only and needs no size estimates.
+
+Gotchas: local state persists across recycling (derive from props or use `useRecyclingState`), never set a `key` on the row root, use `getItemType` for heterogeneous rows, and give images a `recyclingKey` so the previous item's image does not flash. FlatList still benefits from `getItemLayout`, `windowSize` tuning and memoized rows.
+
+### How do you prevent unnecessary re-renders? Does React Compiler make manual memoization obsolete?
+
+**Short answer:** Keep state close to where it is used, split contexts by update frequency, subscribe to stores with selectors, pass stable props (memoized callbacks and objects) to `React.memo` components, and memoize expensive computations. React Compiler automates most `memo`/`useMemo`/`useCallback` work at build time, but it does not fix architecture problems.
+
+The compiler cannot help if a context value changes on every update, a store selector returns new objects each time, a list renders thousands of rows, or a single render is inherently expensive. It also requires code that follows the Rules of React. Verify with the React Profiler ("why did this render") and Reassure tests rather than assuming.
+
+### How do you make animations smooth in React Native?
+
+**Short answer:** Run them on the UI thread — `Animated` with `useNativeDriver: true` for simple cases, Reanimated worklets and shared values for gesture-driven or complex ones — and animate only `transform` and `opacity` so no layout runs per frame. Keep JS callbacks out of per-frame code.
+
+Extras: Gesture Handler keeps gesture recognition native; Reanimated 4 adds CSS-style transitions and uses `react-native-worklets`; on ProMotion iPhones opt into 120 Hz with `CADisableMinimumFrameDurationOnPhone` and re-test against the 8.33 ms budget; use layout animations for insert/remove instead of animating height manually.
+
+### How would you find and fix a memory leak or OOM crash?
+
+**Short answer:** Reproduce with a repeated loop (open/close a screen many times), compare JS heap snapshots in React Native DevTools, and use Instruments Allocations/Leaks on iOS and Android Studio's profiler plus LeakCanary on Android to find what is retained. Typical fixes: clean up subscriptions/timers/listeners in effect cleanups, bound caches, avoid ever-growing navigation stacks, and right-size images.
+
+For OOM specifically, look at image memory first: decoded size is width × height × 4 bytes, so full-resolution photos in a grid exhaust memory quickly. Virtualize, use thumbnails, let `expo-image` downscale, avoid base64 in state, and clear memory caches on memory warnings. On iOS, OOM kills appear as jetsam events, not normal crashes — watch for them in Xcode Organizer.
+
+### How do you stop performance from regressing over time?
+
+**Short answer:** Define budgets per device tier, monitor them in production with an APM (app start, slow/frozen frames, ANR/hang rates, screen load times), and add automated guards in CI: Reassure for render count and duration, Flashlight or scripted traces for key scenarios, and bundle/app size checks per release.
+
+Make ownership explicit — a failing budget blocks the release like a failing test — and include performance in code review for list, image and startup-path changes. Release notes with before/after metrics keep the team calibrated.
+
+### Why insist on release builds and low-end Android devices for measurement?
+
+**Short answer:** Debug builds run unoptimized JS with dev-only checks and no precompiled bytecode, so they are much slower and distort where time goes; and flagship phones — especially iPhones — hide problems that dominate on the budget Android devices many users own.
+
+A low-end Android device with 2–4 GB RAM and a slower CPU exposes JS thread saturation, image memory pressure and native init cost. Use it as the reference for budgets, repeat each measurement several times, and report medians.
+
+### How would you reduce app download size?
+
+**Short answer:** Keep Hermes, enable R8 minification and `shrinkResources` on Android, ship an AAB so Play delivers per-device APKs, rely on App Thinning on iOS, remove unused fonts, icon families and assets, convert images to WebP, and audit native dependencies because each SDK adds binary weight.
+
+Measure with APK Analyzer and `bundletool get-size total` on Android and the App Thinning Size Report and App Store Connect per-device sizes on iOS. Track size per release with an alert on growth, and download rarely used large assets on demand instead of bundling them.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,1578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The New Architecture · React Native Interview Handbook</title>
+<meta name="description" content="What the New Architecture is (JSI, TurboModules, Fabric, Codegen, Bridgeless mode), why it replaced the bridge, how to write Turbo Native Modules and Fabric components step by…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="The New Architecture · React Native Interview Handbook">
+<meta property="og:description" content="What the New Architecture is (JSI, TurboModules, Fabric, Codegen, Bridgeless mode), why it replaced the bridge, how to write Turbo Native Modules and Fabric components step by…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/new-architecture.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# The New Architecture
+
+What the New Architecture is (JSI, TurboModules, Fabric, Codegen, Bridgeless mode), why it replaced the bridge, how to write Turbo Native Modules and Fabric components step by step, and how to migrate a real app without breaking production. Since React Native 0.82 it is the only architecture, so this is required knowledge for any senior RN role.
+
+## Why a new architecture
+
+### How the legacy bridge worked
+
+In the legacy architecture, JavaScript and native code lived in two separate worlds that could only talk through **the bridge**: an asynchronous message queue. Every call from JS to native (and every event from native to JS) was serialized to JSON, put in a batch, shipped across, deserialized and dispatched on the other side.
+
+Rendering followed the same path. React computed a diff on the JS thread, sent a batch of `createView` / `updateView` / `setChildren` commands over the bridge to the native `UIManager`, a separate **shadow thread** ran Yoga layout, and the main thread finally created and updated the platform views.
+
+```js title="What a bridge message conceptually looked like"
+// JS -> native, batched and JSON-serialized
+[
+  [moduleIds],   // e.g. [12, 12, 7]
+  [methodIds],   // e.g. [3, 3, 0]
+  [params],      // e.g. [[42, 'RCTView', 1, {"backgroundColor": -16777216}], ...]
+  callId
+]
+```
+
+### What was wrong with it
+
+| Problem | Symptom in real apps | New Architecture fix |
+|---|---|---|
+| **Async-only** communication | You could never get a value from native "right now"; every read was a callback/Promise, even for trivial data like a stored flag | JSI allows **synchronous** calls when appropriate |
+| **JSON serialization** of every message | CPU spent encoding/decoding; large payloads (images as base64, big arrays) were expensive; types were lost | JSI passes references to C++ values; Codegen gives typed conversions |
+| **Single batched queue** | High-frequency traffic (scroll events, gestures, animations) competed with everything else; bursts caused delays and dropped frames | Direct calls, no global queue; the renderer is C++ and shared |
+| **No synchronous calls into UI** | Measuring a view required an async round trip; you could see a frame with the wrong layout before correcting it | Fabric supports synchronous layout reads (e.g. in `useLayoutEffect`) |
+| **Native modules initialized at startup** | Most modules were instantiated and their config sent to JS at launch, whether used or not; startup grew with every SDK | **TurboModules are lazy**: created on first access |
+| **Layout jumps** | Tooltips, popovers and "measure then position" UIs flickered | Layout can be read and state updated before the frame is painted |
+| **Platform-specific renderers** | iOS and Android had separate, drifting implementations of the UI manager and shadow tree | One C++ renderer shared by both platforms |
+| **Untyped boundary** | A JS/native signature mismatch was a runtime crash or silent `undefined` | Codegen generates typed glue at build time; mismatches fail the build |
+| **No concurrent React** | `startTransition`, Suspense for data and automatic batching could not work properly | Fabric's immutable, thread-safe tree supports concurrent rendering |
+
+> [!NOTE]
+> The bridge was not "slow" in every scenario. Many apps with light native traffic ran fine on it. It became a bottleneck for high-frequency communication (gestures, animations driven from JS, sensor streams), large payloads, synchronous needs, and startup cost from eager module init.
+
+### History
+
+```mermaid
+timeline
+    title React Native re-architecture milestones
+    2018 : Re-architecture announced by Meta (JSI, Fabric, TurboModules)
+    2022 : RN 0.68 makes the New Architecture opt-in
+    2023 : RN 0.71 to 0.73 improve tooling, Bridgeless mode appears as experimental
+    2024 : RN 0.74 makes Bridgeless the default when New Arch is on, Yoga 3
+         : RN 0.76 enables the New Architecture by default (October)
+    2025 : RN 0.80 freezes the legacy architecture
+         : RN 0.82 runs only on the New Architecture
+```
+*Figure: From announcement to "only architecture" took about seven years, mostly because the whole library ecosystem had to migrate.*
+
+The long runway matters for interviews: it explains why the **interop layers** exist (to let unmigrated libraries keep working), why so many apps were stuck on 0.7x for a while, and why "check your dependencies first" is the core of every migration plan.
+
+## How it works
+
+### The big picture
+
+```mermaid
+flowchart TD
+    subgraph legacy["Legacy architecture"]
+        LJS["JS thread<br/>React + app code"] -->|"JSON messages, async, batched"| LBridge["Bridge<br/>MessageQueue"]
+        LBridge --> LMods["Native modules<br/>mostly initialized at startup"]
+        LBridge --> LShadow["Shadow thread<br/>UIManager + Yoga"]
+        LShadow --> LUI["Main thread<br/>platform views"]
+    end
+    subgraph modern["New Architecture"]
+        NJS["JS thread<br/>React + app code"] <-->|"direct C++ calls, sync or async"| JSI["JSI<br/>C++ interface to the JS engine"]
+        JSI <--> TM["TurboModules<br/>lazy, typed via Codegen"]
+        JSI <--> Fabric["Fabric renderer (C++)<br/>immutable shadow tree + Yoga"]
+        Fabric --> NUI["Main thread<br/>platform views"]
+    end
+```
+*Figure: The bridge is replaced by JSI; native modules become TurboModules and the renderer becomes a shared C++ core.*
+
+The New Architecture is not one feature but a set of layered pieces:
+
+| Piece | What it is | Replaces |
+|---|---|---|
+| **JSI** (JavaScript Interface) | A C++ API for talking to the JS engine directly: create JS values, call JS functions, expose C++ objects to JS | The bridge's JSON message passing |
+| **TurboModules** | Native modules built on JSI: lazily loaded, strongly typed, support sync and async methods | Legacy `NativeModules` |
+| **Fabric** | The new C++ rendering system: shadow tree, layout, diffing and mounting | Legacy `UIManager` + shadow thread |
+| **Codegen** | Build-time generator: reads typed JS specs, emits C++/Java/Objective-C glue | Hand-written, untyped glue and runtime reflection |
+| **Bridgeless mode** | Runtime initialized without the bridge at all (`ReactHost` / `RCTHost`) | `ReactInstanceManager` / `RCTBridge` |
+| **Event loop** | A web-like, well-defined ordering of tasks, microtasks and rendering | Ad-hoc scheduling tied to bridge batches |
+| **DOM-like Node APIs** | Refs to host components expose a subset of DOM APIs | `findNodeHandle` + `UIManager` calls |
+
+### JSI
+
+JSI is a lightweight, engine-agnostic C++ API. Hermes implements it, JavaScriptCore implements it (now via a community package), and third-party V8 integrations implement it. Because React Native talks to "a `jsi::Runtime`" rather than a specific engine, the engine can be swapped without rewriting modules.
+
+The key capabilities:
+
+- **Host functions**: C++ functions exposed as callable JS functions.
+- **Host objects**: C++ objects exposed to JS, whose property reads/writes are routed to C++ `get`/`set` methods. TurboModules are host objects.
+- **Direct value access**: C++ can read JS strings, numbers, objects, ArrayBuffers and call JS functions without serialization.
+- **Memory references**: JS can hold a reference to a C++ object (and vice versa), so large data (e.g. a camera frame) can be shared instead of copied.
+
+```objectivec title="cpp/JsiExamples.cpp (C++)"
+#include <jsi/jsi.h>
+#include <functional>
+#include <string>
+
+using namespace facebook;
+
+// 1) A host function: callable from JS as global.fastHash('abc')
+void installFastHash(jsi::Runtime &rt) {
+  auto fastHash = jsi::Function::createFromHostFunction(
+      rt,
+      jsi::PropNameID::forAscii(rt, "fastHash"),
+      1,
+      [](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+        if (count < 1 || !args[0].isString()) {
+          throw jsi::JSError(rt, "fastHash expects a string");
+        }
+        std::string input = args[0].asString(rt).utf8(rt);
+        return jsi::Value(static_cast<double>(std::hash<std::string>{}(input) % 1000000007));
+      });
+  rt.global().setProperty(rt, "fastHash", std::move(fastHash));
+}
+
+// 2) A host object: property access is routed to C++
+class CounterHostObject : public jsi::HostObject {
+ public:
+  jsi::Value get(jsi::Runtime &rt, const jsi::PropNameID &name) override {
+    auto prop = name.utf8(rt);
+    if (prop == "value") {
+      return jsi::Value(count_);
+    }
+    if (prop == "increment") {
+      return jsi::Function::createFromHostFunction(
+          rt, name, 0,
+          [this](jsi::Runtime &, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+            return jsi::Value(++count_);
+          });
+    }
+    return jsi::Value::undefined();
+  }
+
+ private:
+  int count_ = 0;
+};
+```
+
+> [!WARNING]
+> A `jsi::Runtime` is **not thread-safe**. You may only touch JS values on the JS thread. Native work on another thread must hop back via React Native's `CallInvoker` (`jsInvoker->invokeAsync(...)`) before resolving a Promise or calling a JS callback. Violating this causes intermittent, hard-to-reproduce crashes — the classic bug in hand-rolled JSI libraries.
+
+In app code you rarely install raw JSI globals yourself any more. TurboModules, Nitro Modules and the Expo Modules API are all built on JSI and give you typing, lifecycle and threading for free. Raw JSI is what library authors used before those abstractions matured (early versions of MMKV, Reanimated, VisionCamera frame processors).
+
+### TurboModules
+
+A TurboModule is a native module exposed to JS as a JSI host object, with its interface defined in a typed spec.
+
+- **Lazy**: the module is created the first time JS asks for it (`TurboModuleRegistry.get/getEnforcing`), not at app start. An app with 60 native modules only pays for the ones the current screen touches.
+- **Typed**: Codegen reads the spec and generates the conversion code between JS values and native types. A mismatch between spec and implementation is a compile error.
+- **Sync and async**: a method whose spec returns a plain value is **synchronous** (runs on the JS thread and blocks it until it returns); a method returning `Promise<T>` or `void` is dispatched asynchronously to a native queue.
+- **Direct**: no JSON, no global batch. A call is a C++ function invocation plus type conversion.
+
+> [!TIP] Sync is a tool, not a default
+> Synchronous methods are perfect for cheap reads (a cached value, a feature flag, a device constant). Anything that can take more than a millisecond — disk I/O beyond tiny reads, network, crypto on big buffers — should stay async, or you move jank from "waiting for the bridge" to "blocking the JS thread".
+
+### Fabric
+
+Fabric is the new renderer. Its core (shadow tree, props parsing, layout via Yoga, diffing, view flattening) is written once in C++ and shared by iOS and Android. Only the final "mount" step — creating and updating `UIView`s / Android `View`s — is platform-specific.
+
+#### Render, commit, mount
+
+```mermaid
+sequenceDiagram
+    participant JS as JS thread
+    participant CPP as C++ renderer
+    participant BG as Layout (JS or background thread)
+    participant UI as UI main thread
+    JS->>JS: React renders components and reconciles
+    JS->>CPP: create and clone shadow nodes via JSI
+    Note over JS,CPP: Render phase builds a new immutable shadow tree
+    CPP->>BG: commit the new tree
+    BG->>BG: Yoga computes layout on cloned nodes
+    BG->>BG: promote tree as next tree to mount
+    BG->>UI: schedule mount
+    UI->>UI: diff previous and next tree, flatten layout-only views
+    UI->>UI: apply mutations to host views
+    Note over UI: Mount phase is the only step that touches platform views
+```
+*Figure: Fabric's pipeline. Render and commit happen off the main thread; mount is always on the UI thread.*
+
+1. **Render** — React executes your components on the JS thread. For every host component (`View`, `Text`, `Image`…) the renderer creates a **shadow node** in C++ synchronously via JSI. The result is a new *React Shadow Tree*.
+2. **Commit** — The new tree is committed: Yoga calculates layout (on cloned nodes, never mutating the tree currently on screen), and the tree is promoted as the "next tree to mount". Depending on the update, this runs on the JS thread or a background thread.
+3. **Mount** — On the UI thread, the renderer diffs the previously mounted tree against the new one, produces a minimal list of mutations (create, delete, insert, remove, update props/layout) and applies them to the host views.
+
+#### The immutable shadow tree and concurrent React
+
+Shadow nodes are **immutable**. An update clones only the path from the changed node to the root and shares every untouched subtree (structural sharing). That gives Fabric three properties the legacy renderer never had:
+
+- **Thread safety without locks**: the tree being mounted on the UI thread is never mutated by the JS thread working on the next one.
+- **Multiple trees in flight**: React can prepare a low-priority tree (a transition) and throw it away if an urgent update arrives — this is what makes `startTransition`, `useTransition`, `useDeferredValue` and Suspense-based data fetching work in React Native.
+- **Consistency**: a commit is atomic; you never see half an update painted.
+
+Concurrent features and automatic batching of state updates (React 18+) are only fully supported on the New Architecture.
+
+#### View flattening
+
+Many `View`s exist only to lay things out (padding, flex containers) and draw nothing. Fabric's C++ core detects these **layout-only** nodes and does not create host views for them; their children are mounted directly into the nearest "real" ancestor with adjusted coordinates. Fewer native views means less memory and faster mounting, especially in deep list rows.
+
+- A view is flattened only if it has no visual effect (no background, border, shadow, opacity, transform, `onLayout`, accessibility props, `nativeID`, etc.).
+- Opt a view out with `collapsable={false}` — needed when native code must find that exact view (e.g. a native library that snapshots or attaches to a specific view).
+
+#### Synchronous layout reads
+
+Because the shadow tree and layout live in C++ and JS can call into C++ synchronously via JSI, reading layout inside `useLayoutEffect` returns the committed layout **before the frame is painted**. That fixes the classic tooltip flicker:
+
+```tsx title="src/components/Tooltip.tsx"
+import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { View, Text, StyleSheet } from 'react-native';
+
+type Props = { label: string; children: ReactNode };
+
+export function Tooltip({ label, children }: Props) {
+  const anchorRef = useRef<View>(null);
+  const [top, setTop] = useState<number | null>(null);
+
+  useLayoutEffect(() => {
+    // New Architecture: synchronous, runs before paint, so no visible jump.
+    anchorRef.current?.measure((_x, _y, _w, height) => {
+      setTop(height + 8);
+    });
+  }, []);
+
+  return (
+    <View>
+      <View ref={anchorRef}>{children}</View>
+      {top !== null && (
+        <View style={[styles.bubble, { top }]}>
+          <Text style={styles.text}>{label}</Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  bubble: { position: 'absolute', left: 0, backgroundColor: '#111', padding: 8, borderRadius: 6 },
+  text: { color: '#fff' },
+});
+```
+
+On the legacy architecture the same code rendered one frame without the tooltip positioned (or at the wrong position), because `measure` was an async round trip over the bridge.
+
+### Threading model
+
+```mermaid
+flowchart TD
+    subgraph jsThread["JS thread"]
+        React["React render and reconcile"]
+        Handlers["Event handlers, effects, app logic"]
+        SyncTM["Sync TurboModule methods"]
+    end
+    subgraph bgThread["Background thread"]
+        Layout["Yoga layout and commit (when not done on JS thread)"]
+    end
+    subgraph uiThread["UI main thread"]
+        Mount["Mount: diff and apply view mutations"]
+        Input["Touch and gesture input"]
+        UIRuntime["Reanimated UI runtime worklets"]
+    end
+    subgraph nativeThreads["Native module queues"]
+        AsyncTM["Async TurboModule methods"]
+    end
+    React --> Layout
+    Layout --> Mount
+    Input -->|"events via JSI"| Handlers
+    Handlers -->|"async call"| AsyncTM
+    AsyncTM -->|"result via CallInvoker"| Handlers
+    Handlers --> SyncTM
+```
+*Figure: Who runs where. Only the UI thread may touch platform views; only the JS thread may touch JS values.*
+
+| Thread | Runs | Rule of thumb |
+|---|---|---|
+| **JS thread** | React render, your components, effects, event handlers, sync TurboModule methods | Anything slow here drops **JS FPS**: taps feel laggy, JS-driven animations stutter |
+| **UI (main) thread** | Mounting, native input, native animations, Reanimated worklets on the UI runtime | Anything slow here drops **UI FPS** and can trigger ANRs (Android) / hangs (iOS) |
+| **Background thread** | Layout and commit for some updates | Invisible to app code; heavy layouts (huge trees) still cost time |
+| **Native module queues** | Async TurboModule methods (iOS `methodQueue`, Android native modules thread) | Offload I/O here; resolve Promises back through the JS thread |
+
+Discrete, high-priority events (a tap on a `Pressable`, text input) can be processed with higher priority, and React can render synchronously for them, which is part of why input feels more responsive on Fabric.
+
+### Codegen
+
+```mermaid
+flowchart TD
+    Spec["Typed spec files<br/>specs/NativeX.ts, specs/XNativeComponent.ts"] --> Parser["Codegen parser<br/>TypeScript or Flow"]
+    Parser --> Schema["Intermediate JSON schema"]
+    Schema --> CppGen["C++ generators"]
+    Schema --> JavaGen["Java generators"]
+    Schema --> ObjcGen["Objective-C generators"]
+    CppGen --> CppOut["JSI bindings, Props, EventEmitters,<br/>ShadowNodes, ComponentDescriptors"]
+    JavaGen --> JavaOut["Abstract module specs,<br/>ViewManager interfaces and delegates"]
+    ObjcGen --> ObjcOut["Module protocols,<br/>component view protocols"]
+    CppOut --> Build["Native build compiles generated code<br/>plus your implementation"]
+    JavaOut --> Build
+    ObjcOut --> Build
+    Build --> Check{"Implementation matches spec?"}
+    Check -->|"yes"| Ok(["App builds"])
+    Check -->|"no"| Fail(["Compile error, not a runtime crash"])
+```
+*Figure: Codegen turns a single typed spec into native glue for both platforms at build time.*
+
+Codegen runs automatically as part of the native build:
+
+| Platform | When it runs | Where output goes (app) |
+|---|---|---|
+| Android | Gradle task `generateCodegenArtifactsFromSchema`, triggered by the build | `android/app/build/generated/source/codegen/` |
+| iOS | During `pod install` (and re-run on install after spec changes) | `ios/build/generated/ios/` |
+
+Rules worth memorizing:
+
+- Module spec files must be named **`Native<Name>.ts`** (or `.js` with Flow); component spec files must end with **`NativeComponent.ts`**. Codegen only picks up files matching those conventions inside `jsSrcsDir`.
+- Specs must use the types Codegen understands (primitives, typed objects, arrays, Promises, callbacks, `CodegenTypes` such as `Int32`, `Double`, `WithDefault`, event handler types). Arbitrary TS utility types will fail parsing.
+- Libraries can ship pre-generated code; apps generate at build time. Generated folders are build output — never commit them into your app or edit them.
+
+### Bridgeless mode
+
+Bridgeless mode is the final step: the runtime is created **without initializing the bridge at all**. On Android the entry point is `ReactHost` (replacing `ReactInstanceManager` / `ReactNativeHost`), on iOS `RCTHost` (replacing `RCTBridge`). It became the default with the New Architecture in 0.74 and is simply how React Native runs today.
+
+What it means in practice:
+
+- Startup no longer pays for bridge setup and the module config handshake.
+- Errors, timers, `NativeModules` access, event emitters and `UIManager` calls are re-implemented on top of JSI.
+- Legacy modules that reach into `RCTBridge` or `ReactInstanceManager` directly can break; the interop layer covers the common cases but not internals.
+- You can detect it at runtime with `global.RN$Bridgeless === true` (useful in library code that still supports old versions).
+
+### A well-defined event loop
+
+The New Architecture specifies an event loop modeled on the web's HTML event loop:
+
+1. Run one **task** (a timer callback, a native event dispatched to JS, a module callback).
+2. Drain the **microtask** queue (Promise continuations, `queueMicrotask`).
+3. **Update rendering**: apply the React updates produced by that task, run layout effects, and mount.
+4. Repeat.
+
+Why you care: behavior that used to depend on bridge batching timing is now deterministic. State updates from one task are batched into one render; microtasks run before the UI updates (so `await` chains inside a handler finish before paint); `useLayoutEffect` genuinely runs before the user sees anything. It also aligns RN with web semantics, which makes shared React code behave the same on both.
+
+### DOM-like Node APIs on refs
+
+Refs to host components now point to element instances that implement a **subset of the DOM API** alongside the classic RN methods (`measure`, `measureInWindow`, `measureLayout`, `focus`, `blur`). Recent versions (0.82 onward) expose traversal and layout APIs modeled on the web — for example `parentNode`, `children`, `childNodes`, `getBoundingClientRect()` and `compareDocumentPosition()` — so code that needs to walk or measure the tree no longer goes through `findNodeHandle` and `UIManager`.
+
+```tsx title="Walking and measuring the tree from a ref"
+useLayoutEffect(() => {
+  const node = cardRef.current;
+  if (!node) return;
+  const rect = node.getBoundingClientRect(); // x, y, width, height, before paint
+  const parent = node.parentNode;            // DOM-like traversal
+  setCardRect(rect);
+}, []);
+```
+
+> [!NOTE]
+> The exact set of DOM APIs has grown release by release; check the "Nodes from refs" / DOM APIs section of the reactnative.dev docs for your version before relying on a specific method.
+
+## Requirements & prerequisites
+
+| Requirement | Details |
+|---|---|
+| React Native version | 0.76+ has the New Architecture on by default; 0.82+ cannot disable it. Use the latest stable for new native code — the APIs in this guide follow current docs. |
+| Expo SDK | SDK 53+ defaults to the New Architecture; SDK 54 was the last to allow opting out. Use a **development build** (`expo-dev-client`), not Expo Go, for custom native code. |
+| Node.js | The LTS version required by your RN release (check the release notes). |
+| iOS toolchain | Xcode version required by your RN release and the current App Store upload minimum, CocoaPods via Bundler (`bundle exec pod install`). |
+| Android toolchain | Android Studio, the JDK version specified by RN (JDK 17 for recent versions), NDK/CMake (installed automatically by Gradle for most setups). |
+| Languages | TypeScript (or Flow) for specs; Kotlin or Java on Android; Objective-C++ (`.mm`) on iOS, with Swift behind an ObjC++ wrapper; optionally C++ for cross-platform modules. |
+| Scaffolding | `npx create-react-native-library@latest` for reusable libraries (Turbo module, Fabric view, or Nitro templates); `npx create-expo-module@latest` for Expo modules. |
+| Enabling (pre-0.76 only) | `newArchEnabled=true` in `android/gradle.properties`; `RCT_NEW_ARCH_ENABLED=1 bundle exec pod install` on iOS; `"newArchEnabled": true` in `app.json` for Expo SDK 51–52. |
+
+## Writing a Turbo Native Module step by step
+
+We will build the canonical example from the official "Turbo Native Modules" tutorial: a synchronous key-value store backed by `SharedPreferences` on Android and `NSUserDefaults` on iOS, used directly from an app (not a separate library). The same shape applies to libraries.
+
+```plaintext
+MyApp/
+├── specs/
+│   └── NativeLocalStorage.ts          <- Step 1: typed spec
+├── package.json                        <- Step 2: codegenConfig
+├── android/app/src/main/java/com/myapp/nativelocalstorage/
+│   ├── NativeLocalStorageModule.kt    <- Step 4
+│   └── NativeLocalStoragePackage.kt   <- Step 5
+├── ios/NativeLocalStorage/
+│   ├── RCTNativeLocalStorage.h        <- Step 6
+│   └── RCTNativeLocalStorage.mm
+└── src/storage/localStorage.ts         <- Step 9: typed JS wrapper
+```
+
+### Step 1 — Write the spec
+
+The spec is the single source of truth for both platforms. The file name **must** start with `Native`.
+
+```ts title="specs/NativeLocalStorage.ts"
+import type { TurboModule } from 'react-native';
+import { TurboModuleRegistry } from 'react-native';
+
+export interface Spec extends TurboModule {
+  // Synchronous: return plain values, run on the JS thread.
+  setItem(value: string, key: string): void;
+  getItem(key: string): string | null;
+  removeItem(key: string): void;
+  clear(): void;
+}
+
+// getEnforcing throws a clear error if the native side is missing,
+// instead of handing you `null` and crashing later.
+export default TurboModuleRegistry.getEnforcing<Spec>('NativeLocalStorage');
+```
+
+`getEnforcing` vs `get`: use `getEnforcing` for modules your app always ships; use `get` (returns `Spec | null`) for optional modules, e.g. platform-specific ones, and handle `null`.
+
+> [!NOTE]
+> In the spec above, `void` methods are technically fire-and-forget. On the New Architecture a method returning `void` is dispatched asynchronously; a method returning a value (`string | null`) is synchronous. If you need to know when a write finished, return `Promise<void>` instead.
+
+### Step 2 — Configure Codegen in package.json
+
+```json title="package.json"
+{
+  "name": "myapp",
+  "version": "1.0.0",
+  "codegenConfig": {
+    "name": "AppSpecs",
+    "type": "all",
+    "jsSrcsDir": "specs",
+    "android": {
+      "javaPackageName": "com.myapp.specs"
+    },
+    "ios": {
+      "modulesProvider": {
+        "NativeLocalStorage": "RCTNativeLocalStorage"
+      }
+    }
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | Name of the generated library. On iOS the module header is `<AppSpecs/AppSpecs.h>`; component headers live under `react/renderer/components/AppSpecs/`. |
+| `type` | `modules`, `components` or `all`. We use `all` because the Fabric section below adds a component to the same app. |
+| `jsSrcsDir` | Folder Codegen scans for `Native*.ts` and `*NativeComponent.ts`. |
+| `android.javaPackageName` | Java package of the generated abstract module classes. |
+| `ios.modulesProvider` | Maps the JS module name to the Objective-C class that implements it (used to register the module without macros). |
+
+### Step 3 — Run Codegen
+
+Codegen runs automatically during builds, but running it explicitly lets you open the generated interfaces and implement against them.
+
+```bash
+# Android: generates abstract Java specs you will extend
+cd android && ./gradlew generateCodegenArtifactsFromSchema && cd ..
+
+# iOS: Codegen runs as part of pod install
+cd ios && bundle exec pod install && cd ..
+```
+
+Look at what was generated — this is the contract you must satisfy:
+
+```java title="android/app/build/generated/source/codegen/java/com/myapp/specs/NativeLocalStorageSpec.java (generated, abridged)"
+package com.myapp.specs;
+
+public abstract class NativeLocalStorageSpec extends ReactContextBaseJavaModule implements TurboModule {
+  public static final String NAME = "NativeLocalStorage";
+
+  public NativeLocalStorageSpec(ReactApplicationContext reactContext) { super(reactContext); }
+
+  @Override public @Nonnull String getName() { return NAME; }
+
+  @ReactMethod @DoNotStrip public abstract void setItem(String value, String key);
+  @ReactMethod(isBlockingSynchronousMethod = true) @DoNotStrip @Nullable
+  public abstract String getItem(String key);
+  @ReactMethod @DoNotStrip public abstract void removeItem(String key);
+  @ReactMethod @DoNotStrip public abstract void clear();
+}
+```
+
+On iOS, the generated `AppSpecs.h` declares an Objective-C protocol `NativeLocalStorageSpec` (method signatures) and a C++ class `NativeLocalStorageSpecJSI` (the JSI host object that converts values and calls your methods).
+
+### Step 4 — Android: implement the module in Kotlin
+
+```kotlin title="android/app/src/main/java/com/myapp/nativelocalstorage/NativeLocalStorageModule.kt"
+package com.myapp.nativelocalstorage
+
+import android.content.Context
+import android.content.SharedPreferences
+import com.facebook.react.bridge.ReactApplicationContext
+import com.myapp.specs.NativeLocalStorageSpec
+
+class NativeLocalStorageModule(reactContext: ReactApplicationContext) :
+    NativeLocalStorageSpec(reactContext) {
+
+  private val prefs: SharedPreferences by lazy {
+    reactApplicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+  }
+
+  override fun getName(): String = NAME
+
+  override fun setItem(value: String, key: String) {
+    prefs.edit().putString(key, value).apply()
+  }
+
+  override fun getItem(key: String): String? = prefs.getString(key, null)
+
+  override fun removeItem(key: String) {
+    prefs.edit().remove(key).apply()
+  }
+
+  override fun clear() {
+    prefs.edit().clear().apply()
+  }
+
+  companion object {
+    const val NAME = "NativeLocalStorage"
+    private const val PREFS_NAME = "native_local_storage"
+  }
+}
+```
+
+Note the `by lazy`: even though the module itself is created lazily, keep constructors cheap — heavy work in `init` runs on whatever thread first touches the module, often the JS thread.
+
+### Step 5 — Android: create a package and register it
+
+A package tells React Native which modules exist and that they are TurboModules, without instantiating them.
+
+```kotlin title="android/app/src/main/java/com/myapp/nativelocalstorage/NativeLocalStoragePackage.kt"
+package com.myapp.nativelocalstorage
+
+import com.facebook.react.BaseReactPackage
+import com.facebook.react.bridge.NativeModule
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.module.model.ReactModuleInfo
+import com.facebook.react.module.model.ReactModuleInfoProvider
+
+class NativeLocalStoragePackage : BaseReactPackage() {
+
+  override fun getModule(name: String, reactContext: ReactApplicationContext): NativeModule? =
+      if (name == NativeLocalStorageModule.NAME) {
+        NativeLocalStorageModule(reactContext)
+      } else {
+        null
+      }
+
+  override fun getReactModuleInfoProvider(): ReactModuleInfoProvider = ReactModuleInfoProvider {
+    mapOf(
+        NativeLocalStorageModule.NAME to ReactModuleInfo(
+            name = NativeLocalStorageModule.NAME,
+            className = NativeLocalStorageModule.NAME,
+            canOverrideExistingModule = false,
+            needsEagerInit = false,
+            isCxxModule = false,
+            isTurboModule = true,
+        )
+    )
+  }
+}
+```
+
+Register the package in `MainApplication.kt`. The surrounding code differs slightly between RN versions (older templates use a `DefaultReactNativeHost`, newer ones pass the list straight to `getDefaultReactHost`), but the line you add is the same:
+
+```diff title="android/app/src/main/java/com/myapp/MainApplication.kt"
++import com.myapp.nativelocalstorage.NativeLocalStoragePackage
+ ...
+         PackageList(this).packages.apply {
+           // Packages that cannot be autolinked yet can be added manually here
++          add(NativeLocalStoragePackage())
+         }
+```
+
+> [!TIP]
+> In a library (instead of app code), you skip this step: autolinking discovers the package from the library's `react-native.config.js` / Gradle setup.
+
+### Step 6 — iOS: implement the module in Objective-C++
+
+In Xcode, create a `NativeLocalStorage` group inside your app target and add two files. The implementation **must** be a `.mm` file because the generated JSI glue is C++.
+
+```objectivec title="ios/NativeLocalStorage/RCTNativeLocalStorage.h"
+#import <Foundation/Foundation.h>
+#import <AppSpecs/AppSpecs.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+@interface RCTNativeLocalStorage : NSObject <NativeLocalStorageSpec>
+
+@end
+
+NS_ASSUME_NONNULL_END
+```
+
+```objectivec title="ios/NativeLocalStorage/RCTNativeLocalStorage.mm"
+#import "RCTNativeLocalStorage.h"
+
+static NSString *const RCTNativeLocalStorageSuite = @"native-local-storage";
+
+@interface RCTNativeLocalStorage ()
+@property (strong, nonatomic) NSUserDefaults *localStorage;
+@end
+
+@implementation RCTNativeLocalStorage
+
+- (instancetype)init
+{
+  if (self = [super init]) {
+    _localStorage = [[NSUserDefaults alloc] initWithSuiteName:RCTNativeLocalStorageSuite];
+  }
+  return self;
+}
+
+// Required: hand React Native the generated JSI host object for this module.
+- (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:
+    (const facebook::react::ObjCTurboModule::InitParams &)params
+{
+  return std::make_shared<facebook::react::NativeLocalStorageSpecJSI>(params);
+}
+
++ (NSString *)moduleName
+{
+  return @"NativeLocalStorage";
+}
+
+- (NSString *_Nullable)getItem:(NSString *)key
+{
+  return [self.localStorage stringForKey:key];
+}
+
+- (void)setItem:(NSString *)value key:(NSString *)key
+{
+  [self.localStorage setObject:value forKey:key];
+}
+
+- (void)removeItem:(NSString *)key
+{
+  [self.localStorage removeObjectForKey:key];
+}
+
+- (void)clear
+{
+  [self.localStorage removePersistentDomainForName:RCTNativeLocalStorageSuite];
+}
+
+@end
+```
+
+If you forget a method or get a selector wrong (e.g. `setItem:forKey:` instead of the generated `setItem:key:`), Xcode warns that the class does not conform to `NativeLocalStorageSpec` — treat that warning as an error.
+
+### Step 7 — iOS: register the module
+
+With `ios.modulesProvider` set in `codegenConfig` (Step 2), Codegen generates the provider mapping `NativeLocalStorage` to `RCTNativeLocalStorage`. Re-run `bundle exec pod install` after changing the spec or the provider map, then build.
+
+> [!NOTE]
+> Older guides register modules with the `RCT_EXPORT_MODULE()` macro or by overriding `getTurboModule:` on the app delegate. The `modulesProvider` approach is what current docs use for app-level modules; libraries are registered through their podspec and Codegen config.
+
+### Step 8 — Optional: write the iOS logic in Swift
+
+The generated spec is C++, which Swift cannot conform to directly. The standard pattern is a thin ObjC++ module that forwards to a Swift class.
+
+```swift title="ios/NativeLocalStorage/LocalStorageImpl.swift"
+import Foundation
+
+@objc(LocalStorageImpl)
+public final class LocalStorageImpl: NSObject {
+  private let defaults = UserDefaults(suiteName: "native-local-storage")!
+
+  @objc public func getItem(_ key: String) -> String? {
+    defaults.string(forKey: key)
+  }
+
+  @objc public func setItem(_ value: String, key: String) {
+    defaults.set(value, forKey: key)
+  }
+
+  @objc public func removeItem(_ key: String) {
+    defaults.removeObject(forKey: key)
+  }
+
+  @objc public func clear() {
+    defaults.removePersistentDomain(forName: "native-local-storage")
+  }
+}
+```
+
+```objectivec title="ios/NativeLocalStorage/RCTNativeLocalStorage.mm (Swift-backed variant)"
+#import "RCTNativeLocalStorage.h"
+#import "MyApp-Swift.h" // generated header: <ProductModuleName>-Swift.h
+
+@implementation RCTNativeLocalStorage {
+  LocalStorageImpl *_impl;
+}
+
+- (instancetype)init
+{
+  if (self = [super init]) {
+    _impl = [LocalStorageImpl new];
+  }
+  return self;
+}
+
+- (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:
+    (const facebook::react::ObjCTurboModule::InitParams &)params
+{
+  return std::make_shared<facebook::react::NativeLocalStorageSpecJSI>(params);
+}
+
++ (NSString *)moduleName { return @"NativeLocalStorage"; }
+
+- (NSString *_Nullable)getItem:(NSString *)key { return [_impl getItem:key]; }
+- (void)setItem:(NSString *)value key:(NSString *)key { [_impl setItem:value key:key]; }
+- (void)removeItem:(NSString *)key { [_impl removeItem:key]; }
+- (void)clear { [_impl clear]; }
+
+@end
+```
+
+When you add the first Swift file, let Xcode create the bridging header so the target is configured for Swift. If you want Swift without the wrapper boilerplate, that is exactly what the Expo Modules API and Nitro Modules offer (see below).
+
+### Step 9 — Use it from JavaScript
+
+Wrap the raw module in a small typed service so the rest of the app never imports the spec directly. This is where you add validation, JSON encoding and a test seam.
+
+```ts title="src/storage/localStorage.ts"
+import NativeLocalStorage from '../../specs/NativeLocalStorage';
+
+export const localStorage = {
+  getString(key: string): string | null {
+    return NativeLocalStorage.getItem(key); // synchronous
+  },
+  setString(key: string, value: string): void {
+    NativeLocalStorage.setItem(value, key);
+  },
+  getJSON<T>(key: string): T | null {
+    const raw = NativeLocalStorage.getItem(key);
+    if (raw == null) return null;
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      NativeLocalStorage.removeItem(key); // corrupted value, drop it
+      return null;
+    }
+  },
+  setJSON(key: string, value: unknown): void {
+    NativeLocalStorage.setItem(JSON.stringify(value), key);
+  },
+  remove(key: string): void {
+    NativeLocalStorage.removeItem(key);
+  },
+  clear(): void {
+    NativeLocalStorage.clear();
+  },
+};
+```
+
+Because `getItem` is synchronous, you can read it in a lazy `useState` initializer (`useState(() => localStorage.getString('onboarding.seen') === '1')`) and render the right screen on the first frame — no loading state, no flash of onboarding UI.
+
+
+In Jest, mock the spec module (`jest.mock('../../specs/NativeLocalStorage', () => ({ getItem: jest.fn(), setItem: jest.fn(), removeItem: jest.fn(), clear: jest.fn() }))`) — the native side does not exist in Node.
+
+### Async methods, callbacks and events
+
+Real modules mix sync and async methods and push events to JS.
+
+```ts title="specs/NativeDeviceVault.ts"
+import type { TurboModule } from 'react-native';
+import { TurboModuleRegistry } from 'react-native';
+import type { EventEmitter } from 'react-native/Libraries/Types/CodegenTypes';
+
+export type VaultItem = {
+  key: string;
+  updatedAt: number;
+};
+
+export interface Spec extends TurboModule {
+  isAvailable(): boolean;                                   // sync
+  readSecure(key: string): Promise<string | null>;          // async, Promise
+  writeSecure(key: string, value: string): Promise<void>;
+  listItems(): Promise<VaultItem[]>;                        // typed object array
+  readonly onItemChanged: EventEmitter<VaultItem>;          // typed event (recent RN versions)
+}
+
+export default TurboModuleRegistry.getEnforcing<Spec>('NativeDeviceVault');
+```
+
+Typed `EventEmitter` properties in module specs are a recent addition; on older versions use `NativeEventEmitter` with `addListener`/`removeListeners` methods declared in the spec. Newer RN versions also export these types from the package root as a `CodegenTypes` namespace — follow the docs for your version.
+
+```kotlin title="Android: an async method with a Promise"
+override fun readSecure(key: String, promise: Promise) {
+  try {
+    promise.resolve(vault.read(key)) // runs on the native modules thread, not the UI thread
+  } catch (e: Exception) {
+    promise.reject("E_VAULT_READ", "Could not read $key", e)
+  }
+}
+```
+
+```objectivec title="iOS: an async method with a Promise"
+- (void)readSecure:(NSString *)key
+           resolve:(RCTPromiseResolveBlock)resolve
+            reject:(RCTPromiseRejectBlock)reject
+{
+  NSError *error = nil;
+  NSString *value = [self.vault readKey:key error:&error];
+  if (error) {
+    reject(@"E_VAULT_READ", @"Could not read key", error);
+    return;
+  }
+  resolve(value ?: [NSNull null]);
+}
+```
+
+#### Type mapping cheat sheet
+
+| Spec (TypeScript) | Android (Java / Kotlin) | iOS (Objective-C) |
+|---|---|---|
+| `string` | `String` | `NSString *` |
+| `boolean` | `boolean` / `Boolean` | `BOOL` param, `NSNumber *` sync return |
+| `number` | `double` / `Double` | `double` param, `NSNumber *` sync return |
+| `Int32`, `Float`, `Double` (CodegenTypes) | `int`, `float`, `double` | `NSInteger` / `float` / `double` |
+| `T \| null` | `@Nullable T` / `T?` | `_Nullable` |
+| Typed object `{ a: string }` | `ReadableMap` | Generated C++ struct (e.g. `JS::NativeX::SpecY &`) |
+| `Object` (untyped) | `ReadableMap` | `NSDictionary *` |
+| `Array<T>` | `ReadableArray` / `WritableArray` | `NSArray *` |
+| `Promise<T>` | extra `promise: Promise` param | extra `resolve:reject:` blocks |
+| `(x: T) => void` callback | `Callback` | `RCTResponseSenderBlock` |
+
+### The TurboModule call path
+
+```mermaid
+sequenceDiagram
+    participant App as App code (JS thread)
+    participant Reg as TurboModuleRegistry
+    participant Mgr as TurboModule manager
+    participant HO as Generated JSI host object
+    participant Impl as Kotlin or ObjC module
+    participant Q as Native module queue
+    App->>Reg: getEnforcing NativeLocalStorage
+    Reg->>Mgr: first access, look up provider
+    Mgr->>Impl: instantiate lazily
+    Mgr-->>App: JSI host object
+    App->>HO: getItem(token)
+    HO->>Impl: convert jsi Value to String, call method
+    Impl-->>HO: String or null
+    HO-->>App: jsi Value returned synchronously
+    App->>HO: readSecure(token) returns Promise
+    HO->>Q: dispatch method with resolve and reject
+    Q-->>HO: resolve(value)
+    HO-->>App: Promise settles on the JS thread via CallInvoker
+```
+*Figure: Lazy instantiation on first access, then direct sync calls or queue-dispatched async calls — no JSON, no bridge.*
+
+### Expo and CNG projects
+
+In an Expo project using Continuous Native Generation you should not hand-edit `ios/` and `android/` (they are regenerated by `npx expo prebuild`). Options:
+
+- Put the Turbo Native Module in a **local package** (e.g. `modules/local-storage/` with its own `package.json`, `codegenConfig`, podspec and Gradle file). Autolinking picks it up at prebuild.
+- Or use the **Expo Modules API** (`npx create-expo-module@latest --local`), which is the path of least resistance in Expo apps.
+
+## Writing a Fabric Native Component
+
+Fabric Native Components are native views rendered by Fabric, with typed props and events generated by Codegen. We will build `BrandSlider`: a native slider (`UISlider` on iOS, `SeekBar` on Android) with a `value` prop and an `onValueChange` event. It lives in the same app and `codegenConfig` (type `all`) as the module above.
+
+### Step 1 — Write the component spec
+
+The file name **must** end in `NativeComponent.ts`.
+
+```ts title="specs/BrandSliderNativeComponent.ts"
+import type { HostComponent, ViewProps } from 'react-native';
+import type {
+  Double,
+  DirectEventHandler,
+  WithDefault,
+} from 'react-native/Libraries/Types/CodegenTypes';
+import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';
+
+type ValueChangeEvent = Readonly<{
+  value: Double;
+}>;
+
+export interface NativeProps extends ViewProps {
+  value?: WithDefault<Double, 0>;
+  minimumValue?: WithDefault<Double, 0>;
+  maximumValue?: WithDefault<Double, 1>;
+  thumbColor?: string;
+  onValueChange?: DirectEventHandler<ValueChangeEvent>;
+}
+
+export default codegenNativeComponent<NativeProps>('BrandSlider') as HostComponent<NativeProps>;
+```
+
+- `DirectEventHandler` is delivered only to the component itself; `BubblingEventHandler` bubbles through ancestors like a DOM event.
+- `WithDefault` defines the default in generated native code, so native never sees an undefined prop.
+- Recent RN versions also export `codegenNativeComponent` and a `CodegenTypes` namespace from `react-native` directly; the deep imports above still appear in many libraries. Follow your version's docs.
+
+Run Codegen again (Step 3 of the module guide). Android gets `BrandSliderManagerInterface` and `BrandSliderManagerDelegate` (package `com.facebook.react.viewmanagers`); iOS gets C++ `BrandSliderProps`, `BrandSliderEventEmitter`, `BrandSliderComponentDescriptor` and a `RCTBrandSliderViewProtocol`.
+
+### Step 2 — Android: view, event, manager, package
+
+```kotlin title="android/app/src/main/java/com/myapp/brandslider/BrandSliderView.kt"
+package com.myapp.brandslider
+
+import android.content.Context
+import android.widget.SeekBar
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.ReactContext
+import com.facebook.react.bridge.WritableMap
+import com.facebook.react.uimanager.UIManagerHelper
+import com.facebook.react.uimanager.events.Event
+
+private const val STEPS = 1000
+
+class BrandSliderView(context: Context) : SeekBar(context) {
+  var minValue = 0.0
+  var maxValue = 1.0
+  private var fromJs = false
+
+  init {
+    max = STEPS
+    setOnSeekBarChangeListener(object : OnSeekBarChangeListener {
+      override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+        if (!fromUser || fromJs) return
+        val value = minValue + (maxValue - minValue) * progress / STEPS
+        val reactContext = context as ReactContext
+        val surfaceId = UIManagerHelper.getSurfaceId(reactContext)
+        UIManagerHelper.getEventDispatcherForReactTag(reactContext, id)
+            ?.dispatchEvent(ValueChangeEvent(surfaceId, id, value))
+      }
+      override fun onStartTrackingTouch(bar: SeekBar) = Unit
+      override fun onStopTrackingTouch(bar: SeekBar) = Unit
+    })
+  }
+
+  fun setValueFromJs(value: Double) {
+    fromJs = true
+    val range = (maxValue - minValue).takeIf { it > 0 } ?: 1.0
+    progress = (((value - minValue) / range) * STEPS).toInt()
+    fromJs = false
+  }
+}
+
+class ValueChangeEvent(surfaceId: Int, viewId: Int, private val value: Double) :
+    Event<ValueChangeEvent>(surfaceId, viewId) {
+  override fun getEventName() = EVENT_NAME
+  override fun getEventData(): WritableMap = Arguments.createMap().apply { putDouble("value", value) }
+
+  companion object {
+    const val EVENT_NAME = "topValueChange"
+  }
+}
+```
+
+```kotlin title="android/app/src/main/java/com/myapp/brandslider/BrandSliderManager.kt"
+package com.myapp.brandslider
+
+import android.graphics.Color
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.module.annotations.ReactModule
+import com.facebook.react.uimanager.SimpleViewManager
+import com.facebook.react.uimanager.ThemedReactContext
+import com.facebook.react.uimanager.ViewManagerDelegate
+import com.facebook.react.uimanager.annotations.ReactProp
+import com.facebook.react.viewmanagers.BrandSliderManagerDelegate
+import com.facebook.react.viewmanagers.BrandSliderManagerInterface
+
+@ReactModule(name = BrandSliderManager.NAME)
+class BrandSliderManager(context: ReactApplicationContext) :
+    SimpleViewManager<BrandSliderView>(), BrandSliderManagerInterface<BrandSliderView> {
+
+  private val delegate = BrandSliderManagerDelegate(this)
+
+  override fun getDelegate(): ViewManagerDelegate<BrandSliderView> = delegate
+  override fun getName(): String = NAME
+  override fun createViewInstance(context: ThemedReactContext) = BrandSliderView(context)
+
+  @ReactProp(name = "value", defaultDouble = 0.0)
+  override fun setValue(view: BrandSliderView, value: Double) = view.setValueFromJs(value)
+
+  @ReactProp(name = "minimumValue", defaultDouble = 0.0)
+  override fun setMinimumValue(view: BrandSliderView, value: Double) { view.minValue = value }
+
+  @ReactProp(name = "maximumValue", defaultDouble = 1.0)
+  override fun setMaximumValue(view: BrandSliderView, value: Double) { view.maxValue = value }
+
+  @ReactProp(name = "thumbColor")
+  override fun setThumbColor(view: BrandSliderView, value: String?) {
+    value?.let { view.thumb.setTint(Color.parseColor(it)) }
+  }
+
+  override fun getExportedCustomDirectEventTypeConstants(): Map<String, Any> =
+      mapOf(ValueChangeEvent.EVENT_NAME to mapOf("registrationName" to "onValueChange"))
+
+  companion object {
+    const val NAME = "BrandSlider"
+  }
+}
+```
+
+```kotlin title="android/app/src/main/java/com/myapp/brandslider/BrandSliderPackage.kt"
+package com.myapp.brandslider
+
+import com.facebook.react.ReactPackage
+import com.facebook.react.bridge.NativeModule
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.uimanager.ViewManager
+
+class BrandSliderPackage : ReactPackage {
+  override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> =
+      listOf(BrandSliderManager(reactContext))
+
+  override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> =
+      emptyList()
+}
+```
+
+Register `BrandSliderPackage()` in `MainApplication.kt` exactly like the module package. (The `thumbColor` handling is simplified: production code should accept processed colors via Codegen's `ColorValue` type instead of parsing strings.)
+
+### Step 3 — iOS: component view
+
+```objectivec title="ios/BrandSlider/RCTBrandSlider.h"
+#import <React/RCTViewComponentView.h>
+#import <UIKit/UIKit.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+@interface RCTBrandSlider : RCTViewComponentView
+@end
+
+NS_ASSUME_NONNULL_END
+```
+
+```objectivec title="ios/BrandSlider/RCTBrandSlider.mm"
+#import "RCTBrandSlider.h"
+
+#import <react/renderer/components/AppSpecs/ComponentDescriptors.h>
+#import <react/renderer/components/AppSpecs/EventEmitters.h>
+#import <react/renderer/components/AppSpecs/Props.h>
+#import <react/renderer/components/AppSpecs/RCTComponentViewHelpers.h>
+
+using namespace facebook::react;
+
+@interface RCTBrandSlider () <RCTBrandSliderViewProtocol>
+@end
+
+@implementation RCTBrandSlider {
+  UISlider *_slider;
+}
+
++ (ComponentDescriptorProvider)componentDescriptorProvider
+{
+  return concreteComponentDescriptorProvider<BrandSliderComponentDescriptor>();
+}
+
+- (instancetype)initWithFrame:(CGRect)frame
+{
+  if (self = [super initWithFrame:frame]) {
+    static const auto defaultProps = std::make_shared<const BrandSliderProps>();
+    _props = defaultProps;
+
+    _slider = [[UISlider alloc] initWithFrame:self.bounds];
+    [_slider addTarget:self action:@selector(handleValueChanged:) forControlEvents:UIControlEventValueChanged];
+    self.contentView = _slider;
+  }
+  return self;
+}
+
+- (void)updateProps:(Props::Shared const &)props oldProps:(Props::Shared const &)oldProps
+{
+  const auto &oldViewProps = *std::static_pointer_cast<BrandSliderProps const>(_props);
+  const auto &newViewProps = *std::static_pointer_cast<BrandSliderProps const>(props);
+
+  if (oldViewProps.minimumValue != newViewProps.minimumValue) {
+    _slider.minimumValue = newViewProps.minimumValue;
+  }
+  if (oldViewProps.maximumValue != newViewProps.maximumValue) {
+    _slider.maximumValue = newViewProps.maximumValue;
+  }
+  if (oldViewProps.value != newViewProps.value) {
+    _slider.value = newViewProps.value;
+  }
+
+  [super updateProps:props oldProps:oldProps];
+}
+
+- (void)handleValueChanged:(UISlider *)sender
+{
+  if (!_eventEmitter) {
+    return;
+  }
+  std::static_pointer_cast<BrandSliderEventEmitter const>(_eventEmitter)
+      ->onValueChange(BrandSliderEventEmitter::OnValueChange{.value = sender.value});
+}
+
+@end
+```
+
+Register the view by adding `"componentProvider": { "BrandSlider": "RCTBrandSlider" }` to `codegenConfig.ios` (next to `modulesProvider`), then `bundle exec pod install`. Older setups exposed a C function `Class<RCTComponentViewProtocol> BrandSliderCls(void)` returning the class; you will still see that in libraries.
+
+> [!IMPORTANT]
+> Fabric **recycles** component views on iOS. When a `RCTBrandSlider` is unmounted it can be reused for another instance, so reset any state that did not come from props in `prepareForRecycle` (and call `super`). Forgetting this produces "ghost" values appearing in unrelated screens.
+
+### Step 4 — Use it from JavaScript
+
+```tsx title="src/components/BrandSlider.tsx"
+import { useCallback } from 'react';
+import type { NativeSyntheticEvent, StyleProp, ViewStyle } from 'react-native';
+import BrandSliderNative from '../../specs/BrandSliderNativeComponent';
+
+type Props = {
+  value: number;
+  onChange: (value: number) => void;
+  min?: number;
+  max?: number;
+  style?: StyleProp<ViewStyle>;
+};
+
+export function BrandSlider({ value, onChange, min = 0, max = 1, style }: Props) {
+  const handleChange = useCallback(
+    (e: NativeSyntheticEvent<{ value: number }>) => onChange(e.nativeEvent.value),
+    [onChange],
+  );
+
+  return (
+    <BrandSliderNative
+      style={[{ height: 40 }, style]}
+      value={value}
+      minimumValue={min}
+      maximumValue={max}
+      onValueChange={handleChange}
+    />
+  );
+}
+```
+
+For imperative operations (e.g. `reset()`), declare **commands** with `codegenNativeCommands<NativeCommands>({ supportedCommands: ['reset'] })` in the spec and call `Commands.reset(ref.current)`; this replaces `UIManager.dispatchViewManagerCommand(findNodeHandle(ref), ...)`.
+
+## Alternatives: Expo Modules API and Nitro Modules
+
+Turbo Native Modules are the official, lowest-dependency option, but they are verbose (spec + Codegen + ObjC++ + package registration). Two popular alternatives are also built on JSI.
+
+### Expo Modules API
+
+A Swift and Kotlin DSL maintained by Expo. It works in any RN app that installs `expo` (bare apps can add it with `npx install-expo-modules@latest`).
+
+```swift title="modules/local-storage/ios/LocalStorageModule.swift"
+import ExpoModulesCore
+
+public class LocalStorageModule: Module {
+  private let defaults = UserDefaults(suiteName: "native-local-storage")!
+
+  public func definition() -> ModuleDefinition {
+    Name("LocalStorage")
+
+    Function("getItem") { (key: String) -> String? in
+      self.defaults.string(forKey: key)
+    }
+
+    Function("setItem") { (key: String, value: String) in
+      self.defaults.set(value, forKey: key)
+      self.sendEvent("onChange", ["key": key])
+    }
+
+    AsyncFunction("exportAll") { () -> [String: String] in
+      self.defaults.dictionaryRepresentation().compactMapValues { $0 as? String }
+    }
+
+    Events("onChange")
+  }
+}
+```
+
+The Android side uses the same DSL in Kotlin (`class LocalStorageModule : Module()` with `override fun definition() = ModuleDefinition { Name("LocalStorage"); Function("getItem") { key: String -> ... } }`), and JS loads it by name:
+
+
+```ts title="modules/local-storage/index.ts"
+import { requireNativeModule } from 'expo-modules-core';
+
+type LocalStorageModule = {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  exportAll(): Promise<Record<string, string>>;
+};
+
+export default requireNativeModule<LocalStorageModule>('LocalStorage');
+```
+
+It also supports native views (`View(MyView::class) { Prop("url") { ... } }`), lifecycle hooks, shared objects, and config plugins for native project changes. Types on the JS side are written by hand (no Codegen), so keep them in sync.
+
+### Nitro Modules
+
+Built by Margelo (authors of MMKV and VisionCamera). You write a TypeScript interface extending `HybridObject`, run **Nitrogen** (its code generator) and implement the generated protocol in Swift, Kotlin or C++. Swift is called through Swift's native C++ interop, without an Objective-C layer.
+
+```ts title="src/specs/LocalStorage.nitro.ts"
+import type { HybridObject } from 'react-native-nitro-modules';
+
+export interface LocalStorage extends HybridObject<{ ios: 'swift'; android: 'kotlin' }> {
+  getItem(key: string): string | undefined;
+  setItem(key: string, value: string): void;
+  readonly size: number;
+  exportAll(): Promise<Record<string, string>>;
+}
+```
+
+```swift title="ios/HybridLocalStorage.swift"
+import NitroModules
+
+class HybridLocalStorage: HybridLocalStorageSpec {
+  private let defaults = UserDefaults(suiteName: "native-local-storage")!
+
+  func getItem(key: String) throws -> String? { defaults.string(forKey: key) }
+  func setItem(key: String, value: String) throws { defaults.set(value, forKey: key) }
+  var size: Double { Double(defaults.dictionaryRepresentation().count) }
+  func exportAll() throws -> Promise<[String: String]> {
+    Promise.async { self.defaults.dictionaryRepresentation().compactMapValues { $0 as? String } }
+  }
+}
+```
+
+```ts title="src/storage/nitroStorage.ts"
+import { NitroModules } from 'react-native-nitro-modules';
+import type { LocalStorage } from '../specs/LocalStorage.nitro';
+
+export const nitroStorage = NitroModules.createHybridObject<LocalStorage>('LocalStorage');
+```
+
+Hybrid objects are **instances** (you can create many, with properties and methods), and Nitro supports passing callbacks, ArrayBuffers, variants and nested objects with very low per-call overhead. Recent versions also add Hybrid Views for native components.
+
+### Comparison
+
+| | Turbo Native Module | Expo Modules API | Nitro Modules |
+|---|---|---|---|
+| Maintainer | Meta (core) | Expo | Margelo (community) |
+| Spec / typing | TS/Flow spec, Codegen, compile-time checked | Hand-written TS types, runtime-checked argument conversion | TS spec, Nitrogen codegen, compile-time checked |
+| Native languages | Java/Kotlin, ObjC++ (Swift via wrapper), C++ | Swift and Kotlin DSL | Swift, Kotlin, C++ (Swift without ObjC) |
+| Extra dependency | None | `expo` / `expo-modules-core` | `react-native-nitro-modules` |
+| Boilerplate | High | Low | Low to medium |
+| Per-call overhead | Low | Low to moderate (conversion layer) | Lowest (benchmarks show it well ahead for tight loops) |
+| Native views | Fabric Native Components | `View` DSL | Hybrid Views (newer) |
+| Instances / objects | Module singletons | Modules plus shared objects | First-class hybrid object instances |
+| Config plugins for native setup | Write your own (Expo) | Built in | Write your own (Expo) |
+| Best for | Libraries wanting zero extra deps; C++ cross-platform modules | App-level modules in Expo projects; teams fluent in Swift/Kotlin | Performance-critical, high-frequency APIs; rich object models |
+
+> [!TIP] Recommendation
+> In an Expo app, write app-specific native code with the **Expo Modules API** — the DX gain is large and the overhead is irrelevant for normal calls. Reach for **Nitro** when a module is on a hot path (called thousands of times per second, streaming buffers, per-frame work) or you want Swift without an ObjC++ layer. Choose a **Turbo Native Module** for a public library that must not impose extra dependencies, or when you need to match the official tutorial/tooling exactly. All three are New-Architecture-native; avoid writing new legacy `RCT_EXPORT_METHOD` bridge modules entirely.
+
+## Migrating an existing app
+
+On RN 0.82+ there is no "legacy mode" to fall back to, so migration is really "upgrade React Native past 0.81 with every dependency working". The architecture is chosen **at build time** — you cannot toggle it remotely per user, which shapes the rollout strategy.
+
+```mermaid
+flowchart TD
+    Audit["Audit dependencies<br/>React Native Directory, expo-doctor"] --> Blocked{"Any library without<br/>New Arch support?"}
+    Blocked -->|"yes"| Resolve["Upgrade, replace, patch<br/>or fork the library"]
+    Resolve --> Audit
+    Blocked -->|"no"| Upgrade["Upgrade RN in steps<br/>with Upgrade Helper"]
+    Upgrade --> Build["Build both platforms<br/>fix native compile errors"]
+    Build --> Fix["Fix JS breakages<br/>setNativeProps, findNodeHandle, UIManager"]
+    Fix --> Test["Automated plus manual test pass<br/>on low-end devices"]
+    Test --> Perf["Compare metrics<br/>against the old release"]
+    Perf --> Rollout["Staged rollout<br/>Play percentage, App Store phased release"]
+    Rollout --> Monitor{"Crash, ANR and perf<br/>within budget?"}
+    Monitor -->|"no"| Halt["Halt rollout, hotfix"]
+    Halt --> Test
+    Monitor -->|"yes"| Done(["100 percent rollout"])
+```
+*Figure: Migration is a dependency problem first, a code problem second, and a rollout problem last.*
+
+### Step 1 — Audit dependencies
+
+List every package with native code (`ios/`, `android/`, a podspec, or `react-native.config.js`) and classify it.
+
+```bash
+# Expo projects (and bare projects with expo installed): checks config and
+# flags libraries that are unmaintained or lack New Architecture support
+npx expo-doctor@latest
+
+# Find packages that ship native code
+ls node_modules/*/android node_modules/@*/*/android -d 2>/dev/null | sed 's|/android||' | sort -u
+```
+
+For each library, check the **React Native Directory** (reactnative.directory — filter by New Architecture support) and the library's changelog.
+
+| Status | What it means | Action |
+|---|---|---|
+| Native New Arch support | Ships TurboModule/Fabric code (or Expo/Nitro modules) | Upgrade to the supporting version |
+| Works via interop | Legacy module/component that runs through the interop layer | Acceptable short-term; open an issue, plan replacement |
+| Broken | Uses bridge internals, custom shadow nodes, synchronous bridge hacks | Replace, patch (`patch-package`), or fork |
+| Unmaintained | No release in a long time, open New Arch issue | Replace — this is also a supply-chain risk |
+
+Typical replacements: `react-native-fast-image` → `expo-image`; old storage libraries → `react-native-mmkv` v3+; hand-rolled bridge modules → Expo Modules/Nitro/Turbo modules; `react-native-reanimated` 2 → 3 or 4 (4 requires New Arch).
+
+### Step 2 — Upgrade React Native in steps
+
+- Use the **Upgrade Helper** (react-native-community.github.io/upgrade-helper) to diff the template between your version and the target. Apply native template changes by hand; they are small but important (`MainApplication`, `AppDelegate`, Gradle plugin versions, Podfile).
+- Jumping many minors at once is possible but painful. A practical path: go to the last version that still allowed opting out (0.81 / Expo SDK 54), turn the New Architecture on and stabilize, **then** upgrade to 0.82+.
+- Expo: run `npx expo install expo@^<next SDK>` followed by `npx expo install --fix`, then `npx expo prebuild --clean` for CNG projects.
+- Before 0.76, enable the New Architecture with `newArchEnabled=true` in `android/gradle.properties` and `RCT_NEW_ARCH_ENABLED=1 bundle exec pod install`; from 0.76 it is on unless explicitly disabled.
+
+### Step 3 — Understand the interop layer
+
+Two interop layers let legacy code run on the New Architecture:
+
+- **Renderer interop**: legacy view managers (`requireNativeComponent`) render inside Fabric. Since 0.74 it is automatic.
+- **TurboModule interop**: legacy `RCT_EXPORT_MODULE` / `ReactContextBaseJavaModule` modules are exposed through the new module system and `NativeModules` still resolves them in Bridgeless mode.
+
+Interop covers the common API surface, not internals: direct access to `RCTBridge`, `bridge.uiManager`, `ReactInstanceManager`, `UIManagerModule`, custom shadow nodes or synchronous bridge hacks will not work. Treat interop as a bridge (pun intended) to buy time, not a destination.
+
+### Step 4 — Fix common breakages
+
+| Legacy pattern | Why it breaks or degrades | Replacement |
+|---|---|---|
+| `ref.setNativeProps({...})` | Discouraged in Fabric: bypasses React, can be overwritten by the next render, and was unsupported in early Fabric versions | React state, component methods (`clear()`, `focus()`), or Reanimated shared values for per-frame updates |
+| `findNodeHandle(ref)` + `UIManager.measure(...)` | Deprecated path through the legacy UIManager | Call `ref.current.measure(...)` / `measureInWindow` / DOM-like APIs directly on the ref |
+| `UIManager.dispatchViewManagerCommand(...)` | Legacy command dispatch | `codegenNativeCommands` and `Commands.method(ref.current, ...)` |
+| `UIManager.getViewManagerConfig('X')` to detect a component | Config handshake no longer exists in the same form | Import the component; detect optional modules with `TurboModuleRegistry.get` |
+| `NativeModules.Foo` destructured at import time | May be `undefined` if not registered, and it is untyped | A typed spec with `TurboModuleRegistry.getEnforcing<Spec>('Foo')` |
+| `new NativeEventEmitter()` without a module | iOS requires a module that implements `addListener`/`removeListeners` | Pass the module, or migrate to typed `EventEmitter` spec properties |
+| `requireNativeComponent('RCTFoo')` | Works via interop, but untyped and transitional | `codegenNativeComponent<NativeProps>('Foo')` |
+| Measuring in `useEffect` or `setTimeout(measure, 0)` | Timing hacks written around async layout; now either unnecessary or visibly late | Measure in `useLayoutEffect`; remove timeouts |
+| Code relying on `onLayout` ordering or double-firing | Fabric batches and orders layout events differently | Make handlers idempotent; do not depend on order across siblings |
+| Library calling `RCTBridge` / `ReactInstanceManager` / `UIManagerModule` | Removed in Bridgeless mode | Update the library; on Android use `UIManagerHelper`, on iOS the module's `RCTHost`-era APIs |
+| Custom `ReactRootView` / `RCTRootView` integration (brownfield) | Root view APIs changed with `ReactHost`/`RCTHost` | Follow the current brownfield integration docs for your RN version |
+
+```diff title="src/components/SearchBar.tsx"
+- inputRef.current?.setNativeProps({ text: '' });
++ inputRef.current?.clear();
++ setQuery('');
+```
+
+```diff title="src/hooks/useAnchorPosition.ts"
+- import { findNodeHandle, UIManager } from 'react-native';
+- useEffect(() => {
+-   const handle = findNodeHandle(ref.current);
+-   if (handle) UIManager.measure(handle, (_x, _y, w, h, px, py) => setPos({ px, py, w, h }));
+- }, []);
++ useLayoutEffect(() => {
++   ref.current?.measure((_x, _y, w, h, px, py) => setPos({ px, py, w, h }));
++ }, []);
+```
+
+Also expect **Yoga 3** layout conformance fixes (shipped around the same time) to shift a few layouts that relied on old non-standard behavior. Review screenshot diffs rather than trusting "it compiles".
+
+### Step 5 — Test plan
+
+| Layer | What to cover |
+|---|---|
+| Unit / component (Jest + RNTL) | Mocks for every native module spec; run the suite unchanged — failures usually point at `NativeModules` mocks that need updating |
+| E2E (Maestro / Detox) | Critical journeys: onboarding, login, purchase, deep links, push-open, background/foreground |
+| Visual | Screenshot diffs of key screens on both platforms (layout shifts from Fabric/Yoga) |
+| Native integrations | Every library with native code: maps, camera, payments, video, WebView, keyboards, gestures |
+| Devices | Low-end Android (2–4 GB RAM), a recent iPhone, oldest supported OS versions, tablets if supported |
+| Builds | **Release** builds with R8/ProGuard and Hermes — interop and reflection problems often appear only there |
+| Performance | Cold start, scroll FPS on the heaviest lists, memory after navigating 20+ screens |
+
+### Step 6 — Staged rollout
+
+- Internal/beta first: TestFlight and Play internal/closed testing tracks, with crash reporting and performance tracing enabled.
+- Production: **Play staged rollout** (e.g. 1% → 5% → 20% → 50% → 100%) and **App Store phased release** (7-day automatic ramp you can pause).
+- OTA updates cannot deliver an architecture change — it is native. Make sure your OTA channel (EAS Update or similar) targets the new runtime version and does not ship JS built for the new binary to old binaries.
+- Define halt criteria before you start: crash-free sessions drop, ANR/hang rate increase, startup regression beyond budget.
+
+### Step 7 — Measure before and after
+
+Capture the same metrics on the same devices for the last legacy release and the first New Architecture release: cold start to first meaningful render, scroll FPS on your heaviest list, memory after a scripted navigation loop, app download/install size, crash-free rate, ANR/hang rate, and **build time** (C++ compilation makes clean native builds slower; use caching on CI). See the [Performance guide](performance.html) for tooling.
+
+## Myths vs reality
+
+| Myth | Reality |
+|---|---|
+| "The New Architecture makes every app faster." | It removes specific bottlenecks. If your jank comes from re-renders, heavy JS or oversized images, it will still be there. Some apps see neutral results on raw rendering benchmarks. |
+| "The bridge caused all our performance problems." | For most apps the biggest wins still come from rendering discipline, list virtualization, image sizing and startup hygiene. |
+| "With JSI everything is synchronous." | JSI *allows* synchronous calls. Most APIs should stay async; a slow sync call just blocks the JS thread instead. |
+| "Fabric renders on the UI thread." | React renders on the JS thread; layout/commit may run on a background thread; only mount runs on the UI thread. |
+| "Codegen generates code at runtime." | It runs at build time (Gradle task, `pod install`). At runtime there is no reflection or schema exchange. |
+| "Hermes is part of the New Architecture." | They are independent. JSI is engine-agnostic; Hermes is simply the default engine. |
+| "TurboModules cannot be written in Swift." | They need an ObjC++ entry point, which can forward to Swift; Expo Modules and Nitro support Swift directly. |
+| "Interop means we never need to migrate libraries." | Interop is transitional and does not cover bridge internals. Unmigrated libraries are technical debt with a deadline. |
+
+**Where the gains actually are:**
+
+- **Startup**: lazy TurboModules and no bridge initialization — apps with many native SDKs benefit most.
+- **Synchronous native access**: storage reads (MMKV), device info, feature flags without async waterfalls or loading states.
+- **High-frequency native communication**: gestures, sensor streams, camera frame processing, Reanimated/Gesture Handler interop.
+- **Layout correctness**: synchronous measurement removes flicker and "measure then reposition" jumps.
+- **Responsiveness under load**: concurrent React (transitions) keeps input responsive while expensive trees render.
+- **Large payloads**: no JSON serialization; ArrayBuffers and host objects can share memory.
+- **Consistency**: one C++ renderer means fewer iOS/Android behavior differences.
+
+## Edge cases & gotchas
+
+- **Sync methods block the JS thread.** A "quick" sync read that touches disk on a cold cache can take tens of milliseconds on low-end Android. Profile sync methods; keep them O(1).
+- **Threading in native code.** Async TurboModule methods run off the UI thread; if they touch UIKit/Android views, dispatch to the main thread explicitly. Conversely, never touch `jsi::Value`s off the JS thread.
+- **`getEnforcing` at module scope throws at import time.** If a module exists on only one platform, an `import` of its spec crashes the other platform at startup. Use `TurboModuleRegistry.get` plus a `null` check, or a `.ios.ts` / `.android.ts` split.
+- **Name alignment.** The string in `getEnforcing('X')`, `NAME` on Android, `moduleName` on iOS and the `modulesProvider` key must all match exactly; after any spec change re-run `pod install` and rebuild — stale generated code is the usual cause of "it doesn't see my new method".
+- **Flattening and native lookups.** A native library that finds a view by React tag may not find a flattened `View`; add `collapsable={false}` to that view.
+- **Release-only failures.** Test with R8/ProGuard enabled; some legacy modules found via reflection get stripped.
+- **Build machines.** Clean builds compile a lot of C++. Use ccache, cache Gradle and CocoaPods on CI, and limit ABIs for debug builds with `reactNativeArchitectures=arm64-v8a` in `android/gradle.properties`.
+
+## Testing & debugging
+
+Confirm what is actually running:
+
+```ts title="src/debug/architecture.ts"
+declare const global: { nativeFabricUIManager?: unknown; RN$Bridgeless?: boolean };
+
+export function describeArchitecture() {
+  return {
+    fabric: global.nativeFabricUIManager != null,
+    bridgeless: global.RN$Bridgeless === true,
+  };
+}
+```
+
+Metro also logs the startup parameters (`Running "MyApp" with {"fabric":true, ...}`), which is a quick sanity check.
+
+```bash
+# Regenerate Codegen output and rebuild from scratch
+cd android && ./gradlew clean generateCodegenArtifactsFromSchema && cd ..
+cd ios && rm -rf build Pods && bundle exec pod install && cd ..
+
+# Run release builds locally (bare RN CLI)
+npx react-native run-android --mode release
+npx react-native run-ios --mode Release
+
+# Expo equivalents
+npx expo run:android --variant release
+npx expo run:ios --configuration Release
+
+# Native logs
+adb logcat '*:E' ReactNativeJS:V ReactNative:V
+xcrun simctl spawn booted log stream --level debug --predicate 'subsystem contains "com.facebook.react"'
+```
+
+Tools: **React Native DevTools** (JS debugging, React components and profiler), Android Studio debugger with native (C++) debugging enabled for crashes inside JSI/Fabric, Xcode with exception and symbolic breakpoints, and Perfetto / Instruments to see which thread work lands on.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `TurboModuleRegistry.getEnforcing(...): 'NativeLocalStorage' could not be found` | Module not registered, name mismatch, or the app was not rebuilt | Check package registration (Android) and `modulesProvider` (iOS); align names; rebuild the native app (Metro reload is not enough) |
+| `'AppSpecs/AppSpecs.h' file not found` (iOS) | Codegen did not run or `codegenConfig.name` differs from the import | Run `bundle exec pod install`; make the import match `codegenConfig.name` |
+| `Unresolved reference: NativeLocalStorageSpec` (Android) | Codegen not run or wrong `javaPackageName` import | Run `./gradlew generateCodegenArtifactsFromSchema`; fix the import package |
+| Xcode warns class does not conform to `NativeLocalStorageSpec` | Selector mismatch with the spec | Copy signatures from the generated protocol; treat the warning as an error |
+| Codegen error "Unsupported type" / parse failure | Spec uses a TS construct Codegen does not understand | Use primitives, typed object literals, arrays, `CodegenTypes`; avoid utility types and imported complex types |
+| Native component props do not update on iOS | Missing `[super updateProps:...]` or comparing against wrong props | Compare `_props` (old) vs incoming props and call `super` at the end |
+| Native event never reaches JS | Event name / registration name mismatch, or Direct vs Bubbling type mismatch | Align `topValueChange` ↔ `onValueChange`; match the handler type in the spec |
+| `requireNativeComponent: 'X' was not found in the UIManager` | Legacy component not linked or not interop-compatible | Rebuild, upgrade the library, or migrate it to a Fabric component |
+| Random crashes in JSI code, often in release | Accessing JS values from a background thread | Hop to the JS thread via `CallInvoker` before touching `jsi::Value` / resolving Promises |
+| Layout differs after upgrading | Fabric view flattening or Yoga 3 conformance fixes | Screenshot-diff; fix styles relying on old quirks; `collapsable={false}` where native code needs the view |
+| Clean builds much slower | C++ compilation for the renderer and generated code | ccache, CI caching, prebuilt/precompiled binaries where your version offers them, fewer ABIs in debug |
+
+## Production checklist
+
+- [ ] Every native dependency verified on React Native Directory / changelogs; no library depends on bridge internals
+- [ ] No remaining `findNodeHandle`, `UIManager.*` or `setNativeProps` in app code (search the codebase)
+- [ ] All custom native modules have typed specs (Turbo, Expo Modules or Nitro); none use legacy `RCT_EXPORT_METHOD`
+- [ ] Sync TurboModule methods are O(1) and profiled on a low-end Android device
+- [ ] Async native work never touches views off the main thread or JS values off the JS thread
+- [ ] Release builds (R8/ProGuard, Hermes) tested on both platforms, including oldest supported OS versions
+- [ ] Screenshot diffs of key screens reviewed for layout changes
+- [ ] Before/after metrics captured: cold start, scroll FPS, memory, app size, crash-free rate, ANR/hang rate
+- [ ] Staged rollout plan with explicit halt criteria; OTA channel pinned to the new runtime version
+- [ ] CI caches native builds (Gradle, CocoaPods, ccache) to absorb the C++ build cost
+- [ ] Interop-dependent libraries tracked as tech debt with owners and target dates
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [React Native — Architecture overview](https://reactnative.dev/architecture/landing-page)
+- [React Native — Turbo Native Modules](https://reactnative.dev/docs/turbo-native-modules-introduction)
+- [React Native — Fabric Native Components](https://reactnative.dev/docs/fabric-native-components-introduction)
+- [The New Architecture is here (RN blog)](https://reactnative.dev/blog/2024/10/23/the-new-architecture-is-here)
+- [Expo Modules API](https://docs.expo.dev/modules/overview/)
+- [Nitro Modules](https://nitro.margelo.com/)
+
+## Interview questions
+
+### What problems did the legacy bridge have, and how does the New Architecture solve them?
+
+**Short answer:** The bridge was an asynchronous, batched, JSON-serialized message queue. That meant no synchronous calls, serialization overhead, congestion for high-frequency traffic, eager native module initialization, and layout that could only be read after a round trip. The New Architecture replaces it with JSI (direct C++ calls), TurboModules (lazy, typed modules), Fabric (a C++ renderer with synchronous layout access) and Codegen (typed glue at build time).
+
+Go one level deeper with concrete consequences: gestures and JS-driven animations dropped frames when the queue was busy; startup cost grew with every SDK because modules were created up front; "measure then position" UIs flickered; signature mismatches were runtime crashes. Then map each to its fix.
+
+> [!INTERVIEW]
+> What a senior answer includes: specific failure modes, not "the bridge was slow". Red flags: claiming the New Architecture makes everything synchronous or automatically faster. Likely follow-ups: "When would you still prefer async?", "What changed at startup?"
+
+### What is JSI, and what are host objects and host functions?
+
+**Short answer:** JSI is a C++ interface to the JavaScript engine that lets native code create and read JS values and call functions directly, without serialization. A host function is a C++ function exposed as a JS function; a host object is a C++ object whose property access is routed to C++ `get`/`set`. TurboModules are implemented as host objects.
+
+JSI is engine-agnostic: Hermes, JavaScriptCore and V8 integrations implement the same `jsi::Runtime` interface, so modules work regardless of engine. Because JS can hold references to C++ objects, large data (camera frames, buffers) can be shared instead of copied. The critical constraint: the runtime is single-threaded — JS values may only be touched on the JS thread, and background work must hop back through a `CallInvoker`.
+
+### How do TurboModules differ from legacy native modules, and when should a method be synchronous?
+
+**Short answer:** TurboModules are lazy (created on first access), strongly typed via a Codegen spec, called directly through JSI, and can expose synchronous methods. Legacy modules were mostly created at startup, untyped, and async-only over the bridge.
+
+A spec method returning a plain value is synchronous and runs on the JS thread; returning `Promise<T>` or `void` makes it async on a native queue. Make a method sync only if it is cheap and bounded — reading a cached value, a flag, a constant. Disk or network I/O, crypto on large inputs, or anything with unpredictable latency stays async, otherwise you trade bridge latency for JS thread jank.
+
+> [!INTERVIEW]
+> Likely follow-ups: "How would you emit events from a TurboModule?" (typed `EventEmitter` properties in recent versions, or `NativeEventEmitter`), "How do you mock it in Jest?" (mock the spec module).
+
+### Walk me through Fabric's render, commit and mount phases. Which threads are involved?
+
+**Short answer:** In the render phase React runs components on the JS thread and creates an immutable C++ shadow tree via JSI. In the commit phase Yoga computes layout on cloned nodes and the tree is promoted as the next tree to mount — on the JS thread or a background thread. In the mount phase, on the UI thread, the renderer diffs old and new trees and applies minimal mutations to platform views.
+
+Worth adding: immutability with structural sharing makes the tree thread-safe without locks and lets React prepare trees it may discard (concurrent rendering). View flattening removes layout-only views during mount. Synchronous JSI access to the shadow tree is why `measure` inside `useLayoutEffect` returns correct values before paint.
+
+### What does Codegen generate, and why is it important?
+
+**Short answer:** Codegen reads typed TypeScript/Flow specs (`Native*.ts` for modules, `*NativeComponent.ts` for components) at build time and generates the C++ JSI bindings, Java abstract classes/ViewManager interfaces and Objective-C protocols that native code implements. It makes the JS–native boundary type-safe: a mismatch is a compile error instead of a runtime crash.
+
+It runs in the Gradle build (`generateCodegenArtifactsFromSchema`) and during `pod install`. For components it also generates props structs, event emitters, shadow nodes and component descriptors. Practical gotchas: only supported types parse, generated output must be regenerated after spec changes, and library authors can ship pre-generated code.
+
+### What is Bridgeless mode, and what is the interop layer for?
+
+**Short answer:** Bridgeless mode initializes React Native without the bridge at all, using `ReactHost` on Android and `RCTHost` on iOS; it has been the default with the New Architecture since 0.74. The interop layers let legacy native modules and view managers keep working on top of the new systems so apps could migrate before every library did.
+
+The interop covers common public APIs (`NativeModules`, `requireNativeComponent`, event emitters) but not bridge internals like `RCTBridge`, `ReactInstanceManager` or `UIManagerModule`. It is transitional: unmigrated libraries are debt, and some behaviors (e.g. untyped access) lose the benefits of Codegen.
+
+### How would you migrate a large production app to the New Architecture?
+
+**Short answer:** Treat it as a dependency project first: audit every native library (React Native Directory, `expo-doctor`), upgrade or replace blockers, then upgrade React Native in steps with the Upgrade Helper, fix code-level breakages, test release builds on low-end devices, and ship with a staged rollout and predefined halt criteria.
+
+Details that show experience: stabilize on the last opt-out version (0.81 / SDK 54) before moving to 0.82+; grep for `findNodeHandle`, `UIManager`, `setNativeProps`, `NativeModules`; screenshot-diff key screens for Fabric/Yoga layout shifts; test with R8 enabled; remember OTA cannot ship an architecture change and runtime versions must be pinned; capture before/after metrics including build time.
+
+> [!INTERVIEW]
+> Red flags: "flip the flag and ship". Strong signals: a dependency matrix, a rollback plan (you can only roll forward on stores, so halt the staged rollout and hotfix), and ownership of interop debt.
+
+### Does the New Architecture make React Native apps faster?
+
+**Short answer:** Not automatically. It removes specific bottlenecks — startup cost from eager modules and bridge setup, serialization overhead, async-only access, layout jumps, and the lack of concurrent rendering. Apps limited by those see real gains; apps whose problems are re-renders, heavy JS or unoptimized lists will not.
+
+The gains to name: faster startup with many native SDKs, synchronous storage reads, smoother gesture/animation/camera integrations, correct first-frame layout, better responsiveness under load via transitions. Costs to mention: C++ build times and a modest native size increase. Always measure before and after on real devices in release mode.
+
+### Turbo Native Module, Expo Modules API or Nitro Modules — how do you choose?
+
+**Short answer:** In an Expo app, Expo Modules for app-specific native code (Swift/Kotlin DSL, config plugins, low boilerplate). Nitro for hot paths and rich object models where per-call overhead matters. A Turbo Native Module for public libraries that should not add dependencies, or when you want the official toolchain and C++ cross-platform modules.
+
+All three are built on JSI and support the New Architecture. Trade-offs: Turbo Modules are verbose and need an ObjC++ layer for Swift; Expo Modules add `expo-modules-core` and hand-written TS types; Nitro is a community project with its own codegen (Nitrogen) and runtime dependency but excellent performance and Swift-native interop.
+
+### Why does measuring a view in useLayoutEffect work correctly on the New Architecture but flicker on the old one?
+
+**Short answer:** On Fabric the committed shadow tree, including Yoga layout, lives in C++ and JS can read it synchronously through JSI, while the well-defined event loop guarantees layout effects run before the update is painted. So you can measure and set state before the user sees the frame. On the legacy architecture `measure` was an async bridge round trip, so the first frame always painted with the old layout.
+
+This is also why popovers, tooltips and auto-sizing components can drop `setTimeout` hacks and why state updates made inside `useLayoutEffect` are applied in the same visual frame. Caveat: synchronous work in layout effects blocks paint, so keep it small.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

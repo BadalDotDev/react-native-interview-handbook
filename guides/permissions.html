@@ -1,0 +1,1134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Permissions · React Native Interview Handbook</title>
+<meta name="description" content="Runtime permissions look like a one-liner (request(CAMERA)) but are really a small distributed system: build-time declarations, an OS-owned decision the user can change at any…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Permissions · React Native Interview Handbook">
+<meta property="og:description" content="Runtime permissions look like a one-liner (request(CAMERA)) but are really a small distributed system: build-time declarations, an OS-owned decision the user can change at any…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/permissions.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Permissions
+
+Runtime permissions look like a one-liner (`request(CAMERA)`) but are really a small distributed system: build-time declarations, an OS-owned decision the user can change at any moment, platform rules that differ sharply between iOS and Android, and store policies that reject apps for asking badly. This guide covers both permission models, `react-native-permissions` and Expo's per-module APIs, a reusable typed `usePermission` hook, primer and Settings round-trip patterns, store policy, testing commands and troubleshooting.
+
+## How it works
+
+Every permission has three phases, and bugs come from ignoring one of them:
+
+1. **Declare** at build time — an `Info.plist` purpose string (iOS) or a `<uses-permission>` in the merged manifest (Android). Without it, iOS crashes and Android silently refuses.
+2. **Request** at runtime, in context — the OS shows its dialog (iOS once, Android up to twice), and stores the decision. You never own the answer.
+3. **Observe** continuously — the user can change the decision in Settings, the OS can revoke it (one-time grants, auto-reset of unused apps), and your UI must re-check when the app returns to the foreground.
+
+```mermaid
+flowchart TD
+    subgraph build["Build time"]
+        plist["iOS: Info.plist purpose string"]
+        manifest["Android: uses-permission in merged manifest"]
+    end
+    subgraph runtime["Runtime"]
+        need(["User starts a feature that needs access"]) --> check["check() current status"]
+        check --> ask{"Requestable?"}
+        ask -->|"yes"| request["request() shows OS dialog"]
+        ask -->|"no, blocked"| settings["Explain and open app Settings"]
+        request --> decision[("Decision stored by the OS")]
+        settings --> decision
+        decision --> recheck["Re-check on mount and on AppState active"]
+    end
+    plist --> request
+    manifest --> request
+    recheck --> check
+```
+*Figure: Declare, request, observe — the permission lifecycle on both platforms.*
+
+### iOS vs Android at a glance
+
+| Aspect | iOS | Android |
+|---|---|---|
+| Declaration | `Info.plist` usage-description key per resource, with a user-facing purpose string | `<uses-permission>` in `AndroidManifest.xml` (merged with every library's manifest) |
+| Missing declaration | **App crashes** on access; App Store Connect flags uploads that link the API without a string (ITMS-90683) | Request resolves immediately as denied, no dialog |
+| How many prompts | **One.** After the first answer, `request` returns the stored decision | Up to two: from Android 11, a second denial means "don't ask again" |
+| Explaining before re-asking | Not possible — there is no second system prompt | `shouldShowRequestPermissionRationale()` is true after the first denial |
+| Partial grants | Limited photo library (iOS 14), limited contacts (iOS 18), approximate location (iOS 14), provisional notifications (iOS 12) | Approximate location (Android 12), partial photo/video access (Android 14), "Only this time" one-time grants (Android 11) |
+| Background location | "Always" requested after "When In Use"; system may re-confirm later | Separate `ACCESS_BACKGROUND_LOCATION`, granted only on the Settings page on Android 11+ |
+| Notifications | Runtime prompt, no plist key | Runtime `POST_NOTIFICATIONS` only on Android 13+; on by default before |
+| Revocation effects | Changing a privacy permission in Settings typically **terminates** the app | Revoking a runtime permission **kills the process** |
+| Automatic resets | Location "Ask Next Time" returns to not-determined | One-time grants expire; unused apps have permissions auto-reset |
+| Special access | Few (e.g. Screen Time APIs, critical alerts entitlements) | Settings-only "special app access": overlays, all-files access, exact alarms, etc. |
+| Deep link to fix | `Linking.openSettings()` → your app's page in Settings | Same call → App info; specific screens via intents |
+
+## The iOS permission model
+
+### Purpose strings
+
+Every protected resource needs an `Info.plist` key whose value is shown in the system alert. Missing keys crash the app the moment you touch the API, and vague ones get rejected by App Review.
+
+| Key | Needed for | Notes |
+|---|---|---|
+| `NSCameraUsageDescription` | Camera capture | Also required for barcode scanning |
+| `NSMicrophoneUsageDescription` | Audio recording, video with sound | |
+| `NSPhotoLibraryUsageDescription` | Reading/writing the photo library | Not needed for the system photo picker (`PHPickerViewController`), which runs out of process |
+| `NSPhotoLibraryAddUsageDescription` | Add-only access (save to Photos) | Prefer this when you only save images |
+| `NSLocationWhenInUseUsageDescription` | Location while the app is in use | Required even if you also request Always |
+| `NSLocationAlwaysAndWhenInUseUsageDescription` | Background ("Always") location | Plus `UIBackgroundModes` → `location` for continuous background updates |
+| `NSContactsUsageDescription` | Contacts | iOS 18 adds a limited-access choice |
+| `NSCalendarsFullAccessUsageDescription` | Read + write calendars (iOS 17+) | Keep legacy `NSCalendarsUsageDescription` if you support iOS 16 and below |
+| `NSCalendarsWriteOnlyAccessUsageDescription` | Add events only (iOS 17+) | Adding events via the system event editor UI may need no permission at all on iOS 17 |
+| `NSBluetoothAlwaysUsageDescription` | Core Bluetooth | The old peripheral key is deprecated |
+| `NSFaceIDUsageDescription` | Face ID via LocalAuthentication | Touch ID needs no key |
+| `NSMotionUsageDescription` | Core Motion activity / pedometer | |
+| `NSSpeechRecognitionUsageDescription` | Speech recognition | Usually paired with the microphone key |
+| `NSUserTrackingUsageDescription` | App Tracking Transparency prompt | Required before accessing the IDFA |
+| `NSLocalNetworkUsageDescription` | Local network access (Bonjour, LAN sockets, iOS 14+) | Declare Bonjour service types in `NSBonjourServices`; debug builds talking to Metro on the LAN can trigger this prompt too |
+| — (no key) | Notifications | Requested via `UNUserNotificationCenter`; see [Push Notifications](push-notifications.html) |
+
+Localise purpose strings with `InfoPlist.strings` (or an `InfoPlist.xcstrings` string catalog) — they're part of the user-facing UI.
+
+### One prompt, ever
+
+iOS shows the system alert **exactly once per resource per install**. Afterwards `request()` resolves instantly with the stored answer, and the only way back is the Settings app. This single fact drives most of the patterns in this guide: ask in context, prime the user first, and design a first-class "blocked" state.
+
+Other iOS specifics:
+
+- **Limited photo access (iOS 14+).** The user can grant access to *selected* photos. Your app sees only those; `openPhotoPicker()` (react-native-permissions) presents the system UI to change the selection. iOS may show a "select more photos" alert on launch; set `PHPhotoLibraryPreventAutomaticLimitedAccessAlert` to `YES` in `Info.plist` if you provide your own "Manage selection" button.
+- **Limited contacts (iOS 18).** Same idea for contacts.
+- **Approximate location (iOS 14+).** Users can turn off *Precise*. Check accuracy separately (`checkLocationAccuracy()`), and request temporary full accuracy with a purpose key from `NSLocationTemporaryUsageDescriptionDictionary`. Details in [Location & Maps](location.html).
+- **Always location** is a two-step flow: request When In Use first; later request Always (iOS may grant it provisionally and ask the user again at a later time).
+- **Provisional notifications (iOS 12+).** Requesting with the `provisional` option delivers quietly to Notification Center without a prompt — a good way to demonstrate value before asking.
+- **Restricted** (Screen Time or MDM) is distinct from denied natively — the user *can't* change it — but libraries generally report it as non-requestable, so your "open Settings" copy should allow for "managed by your organisation".
+- **ATT** (`requestTrackingPermission`) must be requested while the app is active (not during launch before the first UI is visible), and if the user has disabled "Allow Apps to Request to Track" globally, the request returns denied without a prompt.
+
+### Sending users to Settings
+
+`Linking.openSettings()` (core RN) or `openSettings()` (react-native-permissions) opens your app's page in Settings. Two consequences worth designing for:
+
+- When the user **revokes** a privacy permission there, iOS typically terminates your app — they come back to a cold start, not an `AppState` change.
+- When they **grant** it, the app usually keeps running, and you must re-check when it becomes `active` again.
+
+## The Android permission model
+
+### Protection levels
+
+| Level | Examples | How it's granted |
+|---|---|---|
+| **Normal** | `INTERNET`, `ACCESS_NETWORK_STATE`, `VIBRATE`, `WAKE_LOCK`, `FOREGROUND_SERVICE`, `RECEIVE_BOOT_COMPLETED` | Automatically at install; manifest only |
+| **Dangerous (runtime)** | `CAMERA`, `RECORD_AUDIO`, `ACCESS_FINE_LOCATION`/`ACCESS_COARSE_LOCATION`, `ACCESS_BACKGROUND_LOCATION`, `READ_CONTACTS`, `READ_CALENDAR`, `POST_NOTIFICATIONS` (13+), `READ_MEDIA_IMAGES`/`VIDEO`/`AUDIO` (13+), `BLUETOOTH_SCAN`/`CONNECT` (12+), `ACTIVITY_RECOGNITION` | Manifest **and** a runtime dialog |
+| **Special app access** | `SYSTEM_ALERT_WINDOW` (draw over apps), `MANAGE_EXTERNAL_STORAGE` (all files), `SCHEDULE_EXACT_ALARM`, `REQUEST_INSTALL_PACKAGES`, `WRITE_SETTINGS`, `USE_FULL_SCREEN_INTENT` (14+) | Manifest, then the user toggles it on a **Settings screen** you open via an intent; no dialog |
+| **Signature / privileged** | System-only | Not available to store apps |
+
+Dangerous permissions are grouped for the UI (e.g. fine + coarse location show one dialog), but you must request every permission you use explicitly — never rely on group side-effects.
+
+### The runtime dialog and "don't ask again"
+
+`shouldShowRequestPermissionRationale(permission)` is Android's hint for whether to explain before re-asking. It is `false` before the first request, `true` after one denial, and `false` again once the permission is permanently denied — so on its own it can't distinguish "never asked" from "blocked". Libraries resolve that ambiguity by combining it with the request result.
+
+```mermaid
+flowchart TD
+    first(["First request()"]) --> dlg1{"User choice"}
+    dlg1 -->|"Allow or Only this time"| granted(["granted"])
+    dlg1 -->|"Don't allow"| den1["denied<br/>rationale flag = true"]
+    den1 --> explain["Show in-app rationale<br/>when the user retries the feature"]
+    explain --> second["Second request()"]
+    second --> dlg2{"User choice"}
+    dlg2 -->|"Allow"| granted
+    dlg2 -->|"Don't allow"| blocked["blocked<br/>rationale flag = false"]
+    blocked --> nodialog["Further requests resolve instantly<br/>no dialog shown"]
+    nodialog --> fix(["Only fix: app Settings"])
+```
+*Figure: Android 11+ runtime dialog lifecycle — two denials mean "don't ask again".*
+
+From **Android 11** the system treats a second "Don't allow" over the lifetime of the install as permanent. Before Android 11 the dialog showed an explicit "Don't ask again" checkbox. Either way, a request after that point **resolves immediately with no UI** — your code must detect that and switch to a Settings flow.
+
+### One-time permissions and auto-reset
+
+- **One-time grants (Android 11+)** for location, camera and microphone: "Only this time" lasts while the app is in use and is revoked shortly after the app leaves the foreground (unless a foreground service keeps using it). Next time the status is back to requestable.
+- **Auto-reset (Android 11+, extended to Android 6–10 via Google Play services):** runtime permissions of apps unused for a few months are revoked; Android 12 adds app hibernation. Your app must survive finding a previously granted permission gone.
+- **Revocation kills the process.** Turning a permission off in Settings terminates the app; turning one on does not.
+
+### Version-by-version changes that matter
+
+| Android | API | Change |
+|---|---|---|
+| 6.0 | 23 | Runtime permissions introduced |
+| 10 | 29 | `ACCESS_BACKGROUND_LOCATION` split out; `ACTIVITY_RECOGNITION` becomes runtime; scoped storage begins |
+| 11 | 30 | One-time permissions; second denial = don't ask again; background location only via Settings; auto-reset |
+| 12 | 31 | Approximate location (must request `COARSE` with `FINE`); Bluetooth `SCAN`/`CONNECT`/`ADVERTISE` runtime permissions; `SCHEDULE_EXACT_ALARM` special access |
+| 13 | 33 | `POST_NOTIFICATIONS`; granular media `READ_MEDIA_IMAGES`/`VIDEO`/`AUDIO` replace `READ_EXTERNAL_STORAGE`; `NEARBY_WIFI_DEVICES` |
+| 14 | 34 | Partial media access via `READ_MEDIA_VISUAL_USER_SELECTED`; foreground service types + `FOREGROUND_SERVICE_*` permissions mandatory; full-screen intents restricted; exact alarms denied by default for most new installs |
+| 15–16 | 35–36 | Further tightening (edge-to-edge, background activity/FGS limits, health permissions); check the behaviour-changes pages for the `targetSdkVersion` Play currently requires |
+
+### Notifications (Android 13+)
+
+Apps targeting API 33+ must request `POST_NOTIFICATIONS`; new installs start with notifications **off**. On Android 12 and lower there is no runtime permission — notifications are on unless the user disabled them in Settings, so "requesting" can only mean deep-linking to notification settings. Existing installs upgrading to a build targeting 33 may be pre-granted, but don't rely on it. Full flow in [Push Notifications](push-notifications.html).
+
+### Photos and videos: granular, partial, or none at all
+
+- **Android 13:** request `READ_MEDIA_IMAGES` and/or `READ_MEDIA_VIDEO` (and `READ_MEDIA_AUDIO` for music). Keep `READ_EXTERNAL_STORAGE` only for older devices with `android:maxSdkVersion="32"`.
+- **Android 14:** also declare `READ_MEDIA_VISUAL_USER_SELECTED`. The dialog then offers "Select photos and videos" / "Allow all" / "Don't allow". Partial access shows up as `READ_MEDIA_VISUAL_USER_SELECTED` granted while `READ_MEDIA_IMAGES` is denied; re-request to let the user change the selection.
+- **Best option: don't ask.** The **Android Photo Picker** (native on Android 11+ and back-ported to older versions through Google Play system updates) and iOS's `PHPickerViewController` need **no permission**. `react-native-image-picker` and `expo-image-picker` use the system pickers in recent versions. Google Play's Photo and Video Permissions policy now expects apps with occasional media needs to use the picker instead of `READ_MEDIA_*`. See [Camera, Media & Uploads](camera.html).
+
+### Location: coarse + fine, then background separately
+
+- Request `ACCESS_FINE_LOCATION` **together with** `ACCESS_COARSE_LOCATION`; since Android 12, requesting fine alone (targeting 31+) is ignored. If the user picks *Approximate*, only coarse is granted.
+- Background location is a **separate, later** request. On Android 11+ asking for `ACCESS_BACKGROUND_LOCATION` doesn't show a dialog with "Allow all the time" — it sends the user to the Settings page, and requesting foreground and background together is ignored. Google Play additionally requires a declaration and a prominent in-app disclosure.
+
+### Foreground-service permissions (Android 14+)
+
+A foreground service must declare its `android:foregroundServiceType` and the matching normal permission (`FOREGROUND_SERVICE_LOCATION`, `FOREGROUND_SERVICE_CAMERA`, `FOREGROUND_SERVICE_MICROPHONE`, `FOREGROUND_SERVICE_DATA_SYNC`, …) — and for types like location, camera and microphone the corresponding **runtime** permission must already be granted when the service starts, or it throws. See [Background Tasks](background-tasks.html).
+
+### Special app access
+
+Special permissions are toggled on dedicated Settings screens, opened with intents such as `Settings.ACTION_MANAGE_OVERLAY_PERMISSION` or `Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM`. In RN: `openSettings('alarms')` / `canScheduleExactAlarms()` in react-native-permissions, or `Linking.sendIntent(...)` on Android. Most are policy-restricted on Google Play (`MANAGE_EXTERNAL_STORAGE`, `USE_EXACT_ALARM`, `USE_FULL_SCREEN_INTENT`) — only request them if your core use case qualifies.
+
+### `maxSdkVersion` and removing library permissions
+
+Your final manifest is **merged** from your app and every library's manifest. Two tools keep it honest:
+
+```xml title="android/app/src/main/AndroidManifest.xml"
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Legacy storage only on Android 12L and below -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- Legacy Bluetooth only on Android 11 and below; 12+ uses SCAN/CONNECT -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- Strip permissions that a dependency adds but we never use -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" tools:node="remove" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" tools:node="remove" />
+    <uses-permission android:name="com.google.android.gms.permission.AD_ID" tools:node="remove" />
+
+    <application ...>
+    </application>
+</manifest>
+```
+
+Why removal matters: Google Play evaluates the **merged** manifest. A library that declares `READ_MEDIA_IMAGES`, `ACCESS_BACKGROUND_LOCATION`, `READ_SMS` or `MANAGE_EXTERNAL_STORAGE` "just in case" makes *your* app subject to the corresponding sensitive-permission policy and declaration forms — and gets it rejected if you can't justify it. Inspect the result in Android Studio's **Merged Manifest** tab or `android/app/build/intermediates/merged_manifests/`, and remove what you don't use. Only remove a permission if you're sure the library's code path that needs it is never executed.
+
+## One status model for both platforms
+
+`react-native-permissions` normalises the platforms into five statuses. Design your UI around these rather than native enums:
+
+| Status | Meaning | iOS source | Android source |
+|---|---|---|---|
+| `unavailable` | Feature not available on this device/OS or in this context | Hardware/service missing | Permission doesn't exist on this API level, or hardware missing |
+| `denied` | Not granted, **but requestable** | Not determined yet | Never asked, denied once, one-time grant expired, auto-reset |
+| `blocked` | Not granted and **not requestable** — Settings only | Denied (and generally restricted) | Denied after "don't ask again" / second denial — only learned from `request()` |
+| `granted` | Full access | Authorized | Granted |
+| `limited` | Partial access (iOS only in the library: photos, contacts, provisional notifications) | Limited / provisional | — (derive it yourself for approximate location or Android 14 partial media) |
+
+```mermaid
+stateDiagram-v2
+    state "unavailable (no hardware or not on this OS)" as Unavailable
+    state "denied (requestable)" as Denied
+    state "blocked (Settings only)" as Blocked
+    state "granted" as Granted
+    state "limited (partial access)" as Limited
+    [*] --> Unavailable : feature missing
+    [*] --> Denied : never asked
+    Denied --> Granted : user allows
+    Denied --> Limited : selects some photos
+    Denied --> Denied : Android first denial
+    Denied --> Blocked : iOS denial or Android second denial
+    Limited --> Granted : full access in Settings
+    Limited --> Limited : selection changed
+    Granted --> Denied : one-time grant expired or auto-reset
+    Granted --> Blocked : revoked in Settings
+    Limited --> Blocked : revoked in Settings
+    Blocked --> Granted : enabled in Settings
+    Blocked --> Limited : partial access in Settings
+```
+*Figure: Permission status state machine using react-native-permissions statuses.*
+
+> [!IMPORTANT]
+> On Android, `check()` **never returns `blocked`** — the OS can't tell "never asked" from "permanently denied" without a request. A permission that shows `denied` from `check()` may resolve to `blocked` immediately, with no dialog, when you call `request()`. Your flow must handle that transition gracefully (and you may remember the last `blocked` result so the UI doesn't flip back to an "Allow" button).
+
+## Requirements & prerequisites
+
+| Item | Details |
+|---|---|
+| Library | `react-native-permissions` v5 (current major at the time of writing; supports the latest RN and the two previous minors) — or Expo's per-module permission APIs |
+| iOS | Purpose strings in `ios/<AppName>/Info.plist`; permission handlers enabled in `ios/Podfile` via `setup_permissions`; localised `InfoPlist.strings` |
+| Android | `<uses-permission>` entries in `android/app/src/main/AndroidManifest.xml`; `targetSdkVersion` at Play's current minimum (API 35 was required from Aug 2025; check the current one) |
+| Expo | Config plugin options for the library/modules; `ios.infoPlist`, `android.permissions`, `android.blockedPermissions` in `app.json`/`app.config.ts`; a development build (Expo Go can't add native permissions) |
+| Store consoles | App Store Connect privacy nutrition labels + privacy manifest; Play Console **Data safety** form and **sensitive permission declarations** (background location, photo/video, all files, SMS/Call Log, exact alarms, full-screen intent) |
+| Test devices | Simulators/emulators for most flows; a **real iPhone** for camera and realistic notification prompts |
+
+## Choosing a library / approach
+
+| Option | Coverage | Pros | Cons | Use when |
+|---|---|---|---|---|
+| **react-native-permissions** | iOS + Android (+ Windows), all common permissions, notifications, location accuracy, photo picker, exact alarms | One API and status model; `blocked` detection on Android; per-permission iOS handlers (unused ones aren't compiled in) | Extra native dependency; Podfile setup | **Default for bare RN**; also works in Expo via its config plugin |
+| `PermissionsAndroid` (core) | Android runtime permissions only | Zero dependencies | Android only; `check()` returns a boolean; you write iOS separately | Tiny apps or a single Android permission |
+| Expo module APIs (`expo-camera`, `expo-location`, `expo-media-library`, `expo-notifications`, …) | Per module | Idiomatic in Expo; plugin writes plist strings and manifest entries; `canAskAgain` flag | Scattered across modules; slightly different shapes | Expo apps already using those modules |
+| Feature library's own API (e.g. VisionCamera's `useCameraPermission`) | That feature | Co-located with the feature | Same fragmentation | When the feature library is the only consumer |
+
+**Recommendation:** use `react-native-permissions` behind a single `usePermission` hook as the app's permission layer. In Expo apps that already use `expo-camera`/`expo-location`, their hooks are fine — but wrap them behind the same hook interface so screens don't care.
+
+## Setup — iOS (bare React Native)
+
+### Step 1 — install
+
+```bash
+npm install react-native-permissions
+```
+
+### Step 2 — enable only the handlers you need
+
+```ruby title="ios/Podfile"
+def node_require(script)
+  # Resolve script with node to allow for hoisting
+  require Pod::Executable.execute_command('node', ['-p',
+    "require.resolve(
+      '#{script}',
+      {paths: [process.argv[1]]},
+    )", __dir__]).strip
+end
+
+node_require('react-native/scripts/react_native_pods.rb')
+node_require('react-native-permissions/scripts/setup.rb')
+
+platform :ios, min_ios_version_supported
+prepare_react_native_project!
+
+setup_permissions([
+  'Camera',
+  'Microphone',
+  'PhotoLibrary',
+  'LocationWhenInUse',
+  'Notifications',
+  # 'AppTrackingTransparency',
+  # 'Bluetooth',
+  # 'Contacts',
+  # 'FaceID',
+])
+
+target 'Acme' do
+  # ... use_react_native!(...) etc.
+end
+```
+
+Then `cd ios && pod install`. Each handler links the corresponding Apple framework; enabling handlers you don't use pulls in APIs App Review may ask about (and requires their purpose strings).
+
+### Step 3 — purpose strings
+
+```xml title="ios/Acme/Info.plist (excerpt)"
+<key>NSCameraUsageDescription</key>
+<string>Acme uses the camera to scan receipts so you don't have to type totals.</string>
+<key>NSMicrophoneUsageDescription</key>
+<string>Acme records audio when you add a voice note to an expense.</string>
+<key>NSPhotoLibraryUsageDescription</key>
+<string>Acme lets you attach receipt photos you've already taken.</string>
+<key>NSLocationWhenInUseUsageDescription</key>
+<string>Acme tags expenses with the city you're in so reports are grouped by trip.</string>
+```
+
+Localise them:
+
+```properties title="ios/Acme/fr.lproj/InfoPlist.strings"
+NSCameraUsageDescription = "Acme utilise l'appareil photo pour scanner vos reçus.";
+```
+
+## Setup — Android (bare React Native)
+
+### Step 1 — declare in the manifest
+
+Add every runtime permission you request to `android/app/src/main/AndroidManifest.xml` (see the manifest example above), with `maxSdkVersion` for legacy permissions and `tools:node="remove"` for unwanted library permissions.
+
+### Step 2 — verify the merged manifest
+
+```bash
+cd android && ./gradlew :app:processReleaseManifest
+grep "uses-permission" app/build/intermediates/merged_manifests/release/processReleaseManifest/AndroidManifest.xml
+
+# Or inspect a built APK/AAB's final permissions
+$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer manifest permissions app/build/outputs/apk/release/app-release.apk
+```
+
+(Intermediate paths vary slightly by Android Gradle Plugin version; the Merged Manifest tab in Android Studio is the quickest check.)
+
+### Step 3 — nothing else
+
+No Gradle changes are needed for `react-native-permissions` on Android — autolinking handles it.
+
+## Setup — Expo
+
+```json title="app.json"
+{
+  "expo": {
+    "plugins": [
+      [
+        "react-native-permissions",
+        {
+          "iosPermissions": ["Camera", "Microphone", "PhotoLibrary", "LocationWhenInUse", "Notifications"]
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Acme uses the camera to scan receipts so you don't have to type totals.",
+          "microphonePermission": "Acme records audio when you add a voice note to an expense.",
+          "recordAudioAndroid": true
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Acme tags expenses with the city you're in so reports are grouped by trip."
+        }
+      ]
+    ],
+    "ios": {
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "Acme lets you attach receipt photos you've already taken."
+      }
+    },
+    "android": {
+      "permissions": ["android.permission.CAMERA", "android.permission.POST_NOTIFICATIONS"],
+      "blockedPermissions": [
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.ACCESS_BACKGROUND_LOCATION"
+      ]
+    }
+  }
+}
+```
+
+- The `react-native-permissions` plugin enables the iOS handlers (the Podfile step); purpose strings still go in module plugins or `ios.infoPlist`.
+- `android.blockedPermissions` adds `tools:node="remove"` entries — Expo's equivalent of stripping library permissions.
+- Rebuild (`npx expo prebuild --clean` or EAS Build). Permission changes are native, so they **never ship via OTA**.
+
+## API in practice
+
+### react-native-permissions
+
+| Function | Returns | Notes |
+|---|---|---|
+| `check(permission)` | `Promise<PermissionStatus>` | Never `blocked` on Android |
+| `request(permission, rationale?)` | `Promise<PermissionStatus>` | `rationale` is Android-only: an alert config or an async function returning whether to proceed |
+| `checkMultiple(permissions)` / `requestMultiple(permissions)` | `Promise<Record<Permission, PermissionStatus>>` | One dialog for grouped Android permissions (fine + coarse) |
+| `checkNotifications()` / `requestNotifications(options?, rationale?)` | `Promise<{ status, settings }>` | iOS options: `alert`, `badge`, `sound`, `provisional`, `criticalAlert`, … |
+| `openSettings(type?)` | `Promise<void>` | `'application'` (default), `'notifications'`, `'alarms'` (Android 12+), `'fullscreen'` (Android 14+) |
+| `openPhotoPicker()` | `Promise<void>` | iOS 14+: change the limited photo selection |
+| `checkLocationAccuracy()` / `requestLocationAccuracy({ purposeKey })` | `'full'` or `'reduced'` | iOS 14+ |
+| `canScheduleExactAlarms()` | `Promise<boolean>` | Android |
+
+```ts
+import { Platform } from 'react-native';
+import { check, request, openSettings, PERMISSIONS, RESULTS } from 'react-native-permissions';
+
+const CAMERA = Platform.select({
+  ios: PERMISSIONS.IOS.CAMERA,
+  android: PERMISSIONS.ANDROID.CAMERA,
+  default: PERMISSIONS.ANDROID.CAMERA,
+});
+
+export async function ensureCamera(): Promise<boolean> {
+  const current = await check(CAMERA);
+  if (current === RESULTS.GRANTED || current === RESULTS.LIMITED) return true;
+  if (current === RESULTS.UNAVAILABLE) return false;
+  if (current === RESULTS.BLOCKED) {
+    await openSettings();
+    return false;
+  }
+  const next = await request(CAMERA);
+  return next === RESULTS.GRANTED || next === RESULTS.LIMITED;
+}
+```
+
+### Core `PermissionsAndroid`
+
+```ts
+import { PermissionsAndroid, Platform } from 'react-native';
+
+export async function requestAndroidCamera(): Promise<'granted' | 'denied' | 'blocked'> {
+  if (Platform.OS !== 'android') return 'denied';
+  const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA, {
+    title: 'Camera access',
+    message: 'Acme uses the camera to scan receipts.',
+    buttonPositive: 'Continue',
+  });
+  if (result === PermissionsAndroid.RESULTS.GRANTED) return 'granted';
+  if (result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN) return 'blocked';
+  return 'denied';
+}
+```
+
+The optional rationale object is only shown when Android says a rationale is warranted (after a first denial). `PermissionsAndroid.check()` returns a plain boolean, so you can't tell "never asked" from "blocked" without requesting.
+
+### Expo module hooks
+
+```tsx
+import { useCameraPermissions } from 'expo-camera';
+import * as Location from 'expo-location';
+
+function ScanButton() {
+  const [permission, requestPermission] = useCameraPermissions();
+  // permission: { status: 'granted' | 'denied' | 'undetermined', granted, canAskAgain, expires } | null
+  const blocked = permission?.status === 'denied' && !permission.canAskAgain;
+  // ...
+}
+
+async function getCity() {
+  const { status } = await Location.requestForegroundPermissionsAsync();
+  if (status !== 'granted') return null;
+  // Background location is a separate, later call:
+  // await Location.requestBackgroundPermissionsAsync();
+}
+```
+
+Expo's `denied` + `canAskAgain: false` corresponds to `blocked`; `undetermined` corresponds to requestable `denied`.
+
+## Implementation
+
+### Step 1 — one typed permission map
+
+Screens should ask for *capabilities* (`'camera'`, `'photoLibrary'`), not platform constants. The map hides platform and API-level differences, and the aggregator turns multi-permission results into one status.
+
+```ts title="src/permissions/permissionMap.ts"
+import { Platform } from 'react-native';
+import {
+  PERMISSIONS,
+  RESULTS,
+  type Permission,
+  type PermissionStatus,
+} from 'react-native-permissions';
+
+export type AppPermission =
+  | 'camera'
+  | 'microphone'
+  | 'photoLibrary'
+  | 'locationWhenInUse'
+  | 'locationAlways'
+  | 'contacts';
+
+const IS_ANDROID = Platform.OS === 'android';
+const ANDROID_API = IS_ANDROID ? Number(Platform.Version) : 0;
+const A = PERMISSIONS.ANDROID;
+
+const IOS_MAP: Record<AppPermission, Permission[]> = {
+  camera: [PERMISSIONS.IOS.CAMERA],
+  microphone: [PERMISSIONS.IOS.MICROPHONE],
+  photoLibrary: [PERMISSIONS.IOS.PHOTO_LIBRARY],
+  locationWhenInUse: [PERMISSIONS.IOS.LOCATION_WHEN_IN_USE],
+  locationAlways: [PERMISSIONS.IOS.LOCATION_ALWAYS],
+  contacts: [PERMISSIONS.IOS.CONTACTS],
+};
+
+function androidPermissions(p: AppPermission): Permission[] {
+  switch (p) {
+    case 'camera':
+      return [A.CAMERA];
+    case 'microphone':
+      return [A.RECORD_AUDIO];
+    case 'photoLibrary':
+      if (ANDROID_API >= 34) return [A.READ_MEDIA_IMAGES, A.READ_MEDIA_VISUAL_USER_SELECTED];
+      if (ANDROID_API >= 33) return [A.READ_MEDIA_IMAGES];
+      return [A.READ_EXTERNAL_STORAGE];
+    case 'locationWhenInUse':
+      // Android 12+ ignores a FINE-only request; always ask for both
+      return [A.ACCESS_FINE_LOCATION, A.ACCESS_COARSE_LOCATION];
+    case 'locationAlways':
+      return ANDROID_API >= 29 ? [A.ACCESS_BACKGROUND_LOCATION] : [A.ACCESS_FINE_LOCATION];
+    case 'contacts':
+      return [A.READ_CONTACTS];
+  }
+}
+
+export function resolvePermissions(p: AppPermission): Permission[] {
+  return IS_ANDROID ? androidPermissions(p) : IOS_MAP[p];
+}
+
+type StatusMap = Partial<Record<Permission, PermissionStatus>>;
+
+export function aggregateStatus(p: AppPermission, statuses: StatusMap): PermissionStatus {
+  if (IS_ANDROID && p === 'locationWhenInUse') {
+    if (statuses[A.ACCESS_FINE_LOCATION] === RESULTS.GRANTED) return RESULTS.GRANTED;
+    if (statuses[A.ACCESS_COARSE_LOCATION] === RESULTS.GRANTED) return RESULTS.LIMITED; // approximate
+  }
+  if (IS_ANDROID && p === 'photoLibrary' && ANDROID_API >= 34) {
+    if (statuses[A.READ_MEDIA_IMAGES] === RESULTS.GRANTED) return RESULTS.GRANTED;
+    if (statuses[A.READ_MEDIA_VISUAL_USER_SELECTED] === RESULTS.GRANTED) return RESULTS.LIMITED; // partial
+  }
+
+  const values = Object.values(statuses).filter((s): s is PermissionStatus => s != null);
+  if (values.length === 0) return RESULTS.UNAVAILABLE;
+  if (values.every((s) => s === RESULTS.GRANTED)) return RESULTS.GRANTED;
+  if (values.some((s) => s === RESULTS.LIMITED)) return RESULTS.LIMITED;
+  if (values.some((s) => s === RESULTS.BLOCKED)) return RESULTS.BLOCKED;
+  if (values.every((s) => s === RESULTS.UNAVAILABLE)) return RESULTS.UNAVAILABLE;
+  return RESULTS.DENIED;
+}
+```
+
+### Step 2 — a reusable `usePermission` hook
+
+Requirements: initial check on mount; re-check when the app returns to the foreground (the user may have visited Settings); don't re-check mid-request (on Android the system dialog itself moves the app out of `active`); remember an Android `blocked` result because `check()` can't report it.
+
+```ts title="src/permissions/usePermission.ts"
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AppState, Platform, type AppStateStatus } from 'react-native';
+import {
+  checkMultiple,
+  openSettings,
+  requestMultiple,
+  RESULTS,
+  type PermissionStatus,
+} from 'react-native-permissions';
+import { aggregateStatus, resolvePermissions, type AppPermission } from './permissionMap';
+
+export type PermissionState = PermissionStatus | 'checking';
+
+// Android's check() never reports 'blocked'; remember what request() told us this session.
+// A revoke in Settings kills the process, which also clears this set.
+const knownBlocked = new Set<AppPermission>();
+
+function applyAndroidMemory(p: AppPermission, next: PermissionStatus, fromRequest: boolean) {
+  if (Platform.OS !== 'android') return next;
+  if (next === RESULTS.GRANTED || next === RESULTS.LIMITED) knownBlocked.delete(p);
+  if (fromRequest && next === RESULTS.BLOCKED) knownBlocked.add(p);
+  if (!fromRequest && next === RESULTS.DENIED && knownBlocked.has(p)) return RESULTS.BLOCKED;
+  return next;
+}
+
+export function usePermission(permission: AppPermission) {
+  const permissions = useMemo(() => resolvePermissions(permission), [permission]);
+  const [status, setStatus] = useState<PermissionState>('checking');
+  const requestInFlight = useRef(false);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const commit = useCallback((next: PermissionStatus) => {
+    if (mounted.current) setStatus(next);
+    return next;
+  }, []);
+
+  const refresh = useCallback(async (): Promise<PermissionStatus> => {
+    try {
+      const result = await checkMultiple(permissions);
+      return commit(applyAndroidMemory(permission, aggregateStatus(permission, result), false));
+    } catch {
+      // Typically an iOS handler missing from setup_permissions: fail closed
+      return commit(RESULTS.UNAVAILABLE);
+    }
+  }, [commit, permission, permissions]);
+
+  const request = useCallback(async (): Promise<PermissionStatus> => {
+    requestInFlight.current = true;
+    try {
+      const result = await requestMultiple(permissions);
+      return commit(applyAndroidMemory(permission, aggregateStatus(permission, result), true));
+    } catch {
+      return commit(RESULTS.UNAVAILABLE);
+    } finally {
+      requestInFlight.current = false;
+    }
+  }, [commit, permission, permissions]);
+
+  // Initial check
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  // Re-check after returning from Settings (or anywhere else)
+  useEffect(() => {
+    let previous: AppStateStatus = AppState.currentState;
+    const sub = AppState.addEventListener('change', (next) => {
+      const cameToForeground = previous !== 'active' && next === 'active';
+      previous = next;
+      if (cameToForeground && !requestInFlight.current) void refresh();
+    });
+    return () => sub.remove();
+  }, [refresh]);
+
+  const openAppSettings = useCallback(() => openSettings('application'), []);
+
+  return {
+    status,
+    isGranted: status === RESULTS.GRANTED || status === RESULTS.LIMITED,
+    request,
+    refresh,
+    openSettings: openAppSettings,
+  } as const;
+}
+```
+
+> [!TIP] Persisting "blocked"
+> You can persist `knownBlocked` in MMKV to survive restarts, but then an auto-reset (which makes the permission requestable again) would still send users to Settings. The in-memory version plus "request resolves instantly as blocked → show Settings sheet" is usually the better trade-off.
+
+Notifications have their own API and semantics (no Android runtime permission before 13), so give them a sibling hook:
+
+```ts title="src/permissions/useNotificationPermission.ts"
+import { useCallback, useEffect, useState } from 'react';
+import { AppState } from 'react-native';
+import {
+  checkNotifications,
+  openSettings,
+  requestNotifications,
+  type PermissionStatus,
+} from 'react-native-permissions';
+
+export function useNotificationPermission() {
+  const [status, setStatus] = useState<PermissionStatus | 'checking'>('checking');
+
+  const refresh = useCallback(async () => {
+    const { status: next } = await checkNotifications();
+    setStatus(next);
+    return next;
+  }, []);
+
+  const request = useCallback(async () => {
+    // Android 12 and below: no prompt exists; this resolves to the current state
+    const { status: next } = await requestNotifications(['alert', 'sound', 'badge']);
+    setStatus(next);
+    if (next === 'blocked') await openSettings('notifications');
+    return next;
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const sub = AppState.addEventListener('change', (s) => s === 'active' && void refresh());
+    return () => sub.remove();
+  }, [refresh]);
+
+  return { status, request, refresh } as const;
+}
+```
+
+### Step 3 — ask in context, with a primer
+
+**Never request at launch.** A cold "Acme would like to access your camera" before the user has done anything gets denied — and on iOS that denial is permanent. Ask when the user taps the feature that needs it, and show a short **primer** first explaining the benefit.
+
+Why the primer matters: iOS gives you **one** system prompt, so you want it shown only to users who understand why and intend to use the feature. On Android, a denial also costs one of your two attempts.
+
+> [!WARNING] Primers and App Review
+> Apple has rejected primers that (a) use the word "Allow" on the custom button, or (b) let the user dismiss the primer without ever proceeding to the system prompt (a "Not now" or close button). The safe pattern: the primer appears **only after the user starts the feature**, has a single **"Continue"** button that always leads to the system prompt, and backing out is ordinary navigation. Alternatives such as manual entry live on the underlying screen, not on the primer.
+
+```mermaid
+flowchart TD
+    tap(["User taps a feature that needs access"]) --> chk["check()"]
+    chk --> st{"Status?"}
+    st -->|"granted or limited"| use(["Use the feature"])
+    st -->|"unavailable"| altPath["Hide entry point<br/>or offer an alternative"]
+    st -->|"blocked"| sett["Explain value<br/>show Open Settings"]
+    st -->|"denied"| primer["In-context primer<br/>why + single Continue"]
+    primer --> req["request()"]
+    req --> res{"Result?"}
+    res -->|"granted or limited"| use
+    res -->|"denied, Android first denial"| degrade["Degrade gracefully<br/>rationale on next attempt"]
+    res -->|"blocked, no dialog shown"| sett
+    sett --> back["User returns<br/>re-check on AppState active"]
+    back --> chk
+```
+*Figure: Permission request decision flow.*
+
+### Step 4 — map every status to UI
+
+| Status | UI | Copy example |
+|---|---|---|
+| `checking` | Nothing or a skeleton (avoid flashing a primer for a granted user) | — |
+| `granted` | The feature | — |
+| `limited` | The feature + a way to widen access (iOS `openPhotoPicker()`, Android 14 re-request, "Use precise location") | "You've shared 12 photos. Manage selection" |
+| `denied` | Primer → system prompt | "Scan receipts instantly. Acme needs the camera to read totals." |
+| `blocked` | Explanation + **Open Settings**, plus the degraded path | "Camera access is off. Turn it on in Settings to scan receipts, or enter the total manually." |
+| `unavailable` | Hide the entry point or explain | "This device doesn't have a camera." |
+
+A gate component keeps screens declarative:
+
+```tsx title="src/permissions/PermissionGate.tsx"
+import type { ReactNode } from 'react';
+import { Button, Platform, StyleSheet, Text, View } from 'react-native';
+import { openPhotoPicker } from 'react-native-permissions';
+import { usePermission } from './usePermission';
+import type { AppPermission } from './permissionMap';
+
+type GateCopy = {
+  primerTitle: string;
+  primerBody: string;
+  blockedBody: string;
+  unavailableBody: string;
+};
+
+type Props = {
+  permission: AppPermission;
+  copy: GateCopy;
+  children: ReactNode; // rendered for granted / limited
+};
+
+export function PermissionGate({ permission, copy, children }: Props) {
+  const { status, request, openSettings } = usePermission(permission);
+
+  switch (status) {
+    case 'checking':
+      return null;
+    case 'granted':
+      return <>{children}</>;
+    case 'limited':
+      return (
+        <>
+          {children}
+          {permission === 'photoLibrary' && Platform.OS === 'ios' ? (
+            <Button title="Manage selected photos" onPress={() => void openPhotoPicker()} />
+          ) : null}
+        </>
+      );
+    case 'denied':
+      return (
+        <View style={styles.card} accessibilityRole="summary">
+          <Text style={styles.title}>{copy.primerTitle}</Text>
+          <Text style={styles.body}>{copy.primerBody}</Text>
+          <Button title="Continue" onPress={() => void request()} />
+        </View>
+      );
+    case 'blocked':
+      return (
+        <View style={styles.card}>
+          <Text style={styles.body}>{copy.blockedBody}</Text>
+          <Button title="Open Settings" onPress={() => void openSettings()} />
+        </View>
+      );
+    case 'unavailable':
+      return <Text style={styles.body}>{copy.unavailableBody}</Text>;
+  }
+}
+
+const styles = StyleSheet.create({
+  card: { padding: 24, gap: 12, borderRadius: 16 },
+  title: { fontSize: 20, fontWeight: '600' },
+  body: { fontSize: 16, lineHeight: 22 },
+});
+```
+
+Usage: wrap only the part of the screen that needs access — the manual-entry form stays usable next to it.
+
+```tsx
+<PermissionGate
+  permission="camera"
+  copy={{
+    primerTitle: 'Scan receipts instantly',
+    primerBody: 'Acme reads totals and dates from a photo of your receipt. Nothing is uploaded until you save.',
+    blockedBody: 'Camera access is off. Turn it on in Settings to scan, or enter the total below.',
+    unavailableBody: 'This device has no camera. Enter the total below.',
+  }}
+>
+  <ReceiptScanner />
+</PermissionGate>
+<ManualEntryForm />
+```
+
+### Step 5 — the Settings round-trip
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant S as Screen
+    participant H as usePermission
+    participant OS as OS Settings
+    U->>S: Taps Scan receipt
+    S->>H: Reads status blocked
+    S-->>U: Explains and shows Open Settings
+    U->>S: Taps Open Settings
+    S->>OS: openSettings()
+    Note over S,H: App moves to background
+    U->>OS: Toggles Camera
+    alt User granted access
+        U->>S: Switches back to the app
+        S->>H: AppState becomes active
+        H->>H: checkMultiple()
+        H-->>S: granted
+        S-->>U: Scanner appears
+    else User revoked a permission instead
+        OS-->>H: OS terminates the process
+        U->>S: Next open is a cold start
+        H->>H: Initial check on mount
+    end
+```
+*Figure: "Go to Settings and come back" — handle both resume and cold start.*
+
+### Step 6 — sequencing multiple permissions
+
+- **Ask one thing at a time, when it's needed.** A video recorder needs camera and microphone: request the camera when the recorder opens; request the microphone when the user switches to video (or record silent video if denied). Two back-to-back iOS prompts at launch are the worst case.
+- **Grouped Android permissions go together** (`FINE` + `COARSE` location, `READ_MEDIA_IMAGES` + `READ_MEDIA_VISUAL_USER_SELECTED`) via `requestMultiple` — one dialog.
+- **Escalate gradually.** Foreground location first; background location only after the user has used the feature and understands why.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant App as App
+    participant OS as OS
+    U->>App: Starts a trip for mileage tracking
+    App->>OS: Request when-in-use location (fine + coarse)
+    OS-->>U: Precise or approximate dialog
+    U-->>OS: Allow while using the app
+    App-->>U: Explains why background tracking is needed
+    U->>App: Continue
+    alt iOS
+        App->>OS: Request LOCATION_ALWAYS
+        OS-->>U: Change to Always Allow prompt
+    else Android 11 and newer
+        App->>OS: Request ACCESS_BACKGROUND_LOCATION
+        OS-->>U: Opens the location permission page
+        U-->>OS: Selects Allow all the time
+    end
+    App->>App: Re-check on active, then start tracking
+```
+*Figure: Escalating from foreground to background location.*
+
+### Step 7 — graceful degradation
+
+| Denied permission | Degraded path |
+|---|---|
+| Camera | Pick an existing photo via the system photo picker (no permission), or manual entry |
+| Photo library | System photo picker for one-off selection |
+| Location | Manual city/postcode search; approximate location is often enough |
+| Contacts | Share an invite link; type a phone number or email |
+| Microphone | Text notes instead of voice notes |
+| Notifications | In-app inbox, badges from your API, email digests |
+
+The app's core must work without any non-essential permission — that's both good UX and an App Store requirement.
+
+## Store policy
+
+> [!IMPORTANT]
+> Both stores revise these policies regularly. Treat this section as the shape of the rules and re-read the current App Store Review Guidelines (§5.1) and Google Play's Permissions and User Data policies before release.
+
+### Apple App Store
+
+- **Specific purpose strings (Guideline 5.1.1).** The string must say what you access and why, ideally with an example. Vague strings are a routine rejection.
+
+| Bad | Good |
+|---|---|
+| "This app needs camera access." | "Acme uses the camera to scan receipts so totals are filled in automatically." |
+| "Location is required." | "Acme tags expenses with the city you're in so trip reports group automatically." |
+| "Allow access to photos for a better experience." | "Choose receipt photos you've already taken to attach them to an expense." |
+
+- **Don't gate the app on non-essential permissions (5.1.1).** The app must remain usable if the user declines; ask for access only for features that need it, and respect the choice.
+- **Primers must not manipulate** — no "Allow" wording on the custom button, no exit that skips the system prompt, no fake system-alert lookalikes.
+- **ATT rules (5.1.2).** Request via ATT *before* any cross-app tracking; don't offer incentives (credits, unlocks) for allowing; don't restrict functionality for users who decline; don't mimic or annotate the system alert (arrows pointing at "Allow"). If you don't track, don't show the prompt at all — and make sure your privacy nutrition label and privacy manifest match reality.
+- **SDK-referenced APIs.** App Store Connect flags binaries that link privacy-sensitive APIs without purpose strings (ITMS-90683), even when the code path belongs to an SDK you never call. Add an honest string or remove the SDK/handler.
+
+### Google Play
+
+- **Request only what current features need.** Unused or "future" permissions are policy violations and can block review.
+- **Sensitive and restricted permissions need Play Console declarations** (App content → sensitive permissions), and often a video demonstrating the feature:
+
+| Permission | Policy outline |
+|---|---|
+| `ACCESS_BACKGROUND_LOCATION` | Core feature must need it; declaration + video; **prominent in-app disclosure** before the runtime prompt |
+| `READ_SMS`, `RECEIVE_SMS`, `READ_CALL_LOG`, … | Only for the default SMS/Phone/Assistant handler or approved exceptions |
+| `MANAGE_EXTERNAL_STORAGE` (All files access) | File managers, backup, antivirus, document management and similar core use cases only |
+| `READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO` | Photo and Video Permissions policy: only apps needing broad, persistent access (galleries, editors); everyone else uses the **Photo Picker** |
+| `USE_EXACT_ALARM` / `SCHEDULE_EXACT_ALARM` | Exact alarms only for alarm/calendar-style core functionality |
+| `USE_FULL_SCREEN_INTENT` | Calling and alarm apps |
+| `QUERY_ALL_PACKAGES` | Restricted to apps that must discover all installed apps |
+
+- **Prominent disclosure and consent.** When collecting personal or sensitive data users wouldn't reasonably expect (background location is the classic case), show an in-app disclosure describing the data and its use *before* the runtime prompt, with an explicit affirmative action.
+- **Data safety form** must match what your app and SDKs collect.
+- **The merged manifest is what's reviewed** — permissions pulled in by libraries count as yours. Strip them with `tools:node="remove"` / Expo `blockedPermissions` if you don't use them.
+
+## Edge cases & gotchas
+
+- **Concurrent requests.** Android shows one permission dialog at a time; two components requesting on mount can make one request resolve as denied without UI. Serialise requests (a simple promise queue in your permission service) and never request from `useEffect` on mount anyway.
+- **Permission alerts change `AppState`.** On iOS a system alert moves the app to `inactive`; on Android the dialog pauses the activity. An app-lock or privacy overlay that triggers on `inactive`/`background` will fire on every permission prompt — ignore state changes while a request is in flight.
+- **Process death on revoke.** Both platforms kill the app when a permission is revoked in Settings. Persist drafts and navigation state before sending users to Settings.
+- **Requests need a foreground Activity.** Don't request from background tasks, headless JS or a notification handler.
+- **One-time grants expire in the background.** A camera session resumed after a few minutes away may fail; re-check on `active` before restarting capture.
+- **Approximate location is a valid answer.** Design for coarse accuracy (city-level) rather than treating it as denied.
+- **iOS restricted (Screen Time/MDM)** looks like blocked but Settings can't fix it; phrase copy accordingly.
+- **Simulators lie.** The iOS simulator has no camera (`unavailable`), and notification prompts behave differently than on devices.
+- **Expo Go** can't reflect your custom purpose strings or manifest; test permission flows in a development build.
+- **Local network prompt in debug builds.** On iOS devices, connecting to Metro can trigger the local network prompt; it's a dev artefact, not something production users see unless your app uses the LAN.
+
+## Testing & debugging
+
+### iOS Simulator
+
+```bash
+# Reset every privacy decision for the app (next access prompts again)
+xcrun simctl privacy booted reset all com.acme.app
+
+# Grant or revoke a specific service without prompting
+xcrun simctl privacy booted grant photos com.acme.app
+xcrun simctl privacy booted grant location-always com.acme.app
+xcrun simctl privacy booted revoke microphone com.acme.app
+# Services include: all, calendar, contacts, contacts-limited, location, location-always,
+# photos, photos-add, media-library, microphone, motion, reminders, siri
+# Some changes terminate the running app, just like on a device.
+```
+
+Camera isn't covered (the simulator has none), and notification permission is reset by uninstalling the app. On a physical device: **Settings → General → Transfer or Reset iPhone → Reset → Reset Location & Privacy** resets all apps.
+
+### Android emulator / device
+
+```bash
+adb shell pm grant com.acme.app android.permission.CAMERA
+adb shell pm revoke com.acme.app android.permission.CAMERA          # kills the app process
+adb shell pm grant com.acme.app android.permission.POST_NOTIFICATIONS
+
+adb shell pm reset-permissions                                      # reset runtime permissions for all apps
+adb install -g app-debug.apk                                        # install with all runtime permissions granted
+adb shell dumpsys package com.acme.app | grep -A 30 "runtime permissions"
+
+# Special app access
+adb shell appops set com.acme.app SCHEDULE_EXACT_ALARM allow
+adb shell appops set com.acme.app SYSTEM_ALERT_WINDOW allow
+
+# Reproduce "don't ask again" (recent Android versions), then undo it
+adb shell pm set-permission-flags com.acme.app android.permission.CAMERA user-fixed
+adb shell pm clear-permission-flags com.acme.app android.permission.CAMERA user-fixed user-set
+```
+
+The most faithful way to reproduce "don't ask again" is still manual: deny twice on Android 11+. Uninstall/reinstall gives a truly fresh permission state.
+
+### Automated tests
+
+```ts title="jest.setup.ts"
+jest.mock('react-native-permissions', () => require('react-native-permissions/mock'));
+```
+
+With the mock in place, override `checkMultiple`/`requestMultiple` per test to render `PermissionGate` in every status (`denied`, `blocked`, `limited`, `unavailable`) and assert the right CTA. For E2E, Detox can preset iOS permissions at launch (`device.launchApp({ permissions: { camera: 'YES', photos: 'limited' } })`) and Maestro's `launchApp` accepts a `permissions` map (e.g. `all: deny`). See [Testing Strategy](testing.html).
+
+**Manual test matrix:** fresh install → primer → allow; deny once (Android) → rationale path; blocked → Settings → grant → return; grant → revoke in Settings (cold start); limited photos (iOS) and partial media (Android 14); approximate location; one-time grant expiry; notifications on Android 12 vs 13+.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| iOS app crashes when opening the camera/photos | Missing `Info.plist` purpose string | Add the `NS…UsageDescription` key (Expo: module plugin or `ios.infoPlist`) and rebuild |
+| `check`/`request` throws or returns `unavailable` on iOS | Handler not enabled in `setup_permissions` (or Expo plugin `iosPermissions`) | Add it, `pod install` / prebuild, rebuild |
+| Request resolves immediately to `blocked` (Android) | User denied twice or chose "don't ask again" — or the permission is **missing from the merged manifest** | Check the merged manifest first; otherwise show the Settings flow |
+| Request resolves immediately to `blocked` (iOS) | User denied earlier; iOS asks only once | Explain and `openSettings()`; to retest, reset privacy on the simulator |
+| Android prompt never appears | Permission not declared, stripped by `tools:node="remove"`/`blockedPermissions`, or requested FINE location without COARSE on 12+ | Declare it, check removals, request grouped permissions together |
+| Notification prompt never shows on Android 12 and lower | No runtime permission exists before Android 13 | Check `checkNotifications()`; if disabled, `openSettings('notifications')` |
+| Notification prompt never shows on Android 13+ | `targetSdkVersion` below 33, or `POST_NOTIFICATIONS` not declared | Target current SDK, declare the permission |
+| Background location request does nothing | Requested together with foreground location, or foreground not granted yet (Android 11+) | Request foreground first; background later (opens Settings) |
+| UI shows "Allow" but tapping does nothing (Android) | `check()` reports `denied` for a blocked permission | Treat an instant `blocked` result as "go to Settings"; remember blocked for the session |
+| Play rejection for a permission you never use | A library added it to the merged manifest | Inspect the merged manifest; remove with `tools:node="remove"` or `blockedPermissions` |
+| App Review rejection under 5.1.1 | Vague purpose string, primer with "Allow"/exit button, or app gated on a non-essential permission | Specific strings, single "Continue" primer, graceful degradation |
+| Status stale after returning from Settings | No re-check on `AppState` → `active` | Use the hook's foreground re-check |
+
+## Production checklist
+
+- [ ] Every requested permission has a specific, localised purpose string (iOS) and a manifest entry (Android)
+- [ ] Only needed iOS handlers enabled in `setup_permissions` / Expo plugin
+- [ ] Merged Android manifest reviewed; unused library permissions removed; legacy permissions capped with `maxSdkVersion`
+- [ ] Photo Picker used instead of broad media permissions wherever possible
+- [ ] No permission requested at launch; each requested in context behind a compliant primer
+- [ ] All five statuses (plus `checking`) mapped to UI; blocked state offers Open Settings
+- [ ] Status re-checked on mount and on `AppState` → `active`; requests serialised
+- [ ] Core app usable with every non-essential permission denied
+- [ ] Background location, notifications and ATT requested as separate, justified steps
+- [ ] Play Console sensitive-permission declarations, Data safety form, App Store privacy labels and privacy manifest match actual usage
+- [ ] Tested: fresh install, deny, blocked → Settings → return, revoke (cold start), limited/partial, approximate, Android 12 vs 13 vs 14
+- [ ] Permission funnel analytics (primer shown → system prompt → granted) to tune copy and timing
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [react-native-permissions](https://github.com/zoontek/react-native-permissions)
+- [React Native — PermissionsAndroid](https://reactnative.dev/docs/permissionsandroid)
+- [Android — Permissions overview](https://developer.android.com/guide/topics/permissions/overview)
+- [Apple HIG — Privacy](https://developer.apple.com/design/human-interface-guidelines/privacy)
+- [App Store Review Guidelines](https://developer.apple.com/app-store/review/guidelines/)
+
+## Interview questions
+
+### How do the iOS and Android permission models differ?
+
+**Short answer:** Both require a build-time declaration and a runtime grant, but iOS prompts exactly once per resource and requires a purpose string (or the app crashes), while Android can prompt up to twice, exposes `shouldShowRequestPermissionRationale`, and treats a second denial as "don't ask again" since Android 11.
+
+Android also has special app-access permissions granted only in Settings, one-time grants, auto-reset for unused apps, and version-specific permissions (notifications on 13, granular media on 13, partial media on 14). iOS has partial grants (limited photos/contacts, approximate location, provisional notifications). On both, revoking in Settings kills the app.
+
+### Why show a pre-permission primer, and what are the rules for it?
+
+**Short answer:** Because iOS gives you one system prompt, you want it shown only when the user understands the value and is in the middle of the related task. The primer provides that context.
+
+It must appear in context (after the user taps the feature), use a single "Continue" button that always leads to the system prompt, avoid the word "Allow", and never imitate the system alert — Apple has rejected primers that break these rules. Alternatives like manual entry live on the underlying screen. Measure primer → prompt → grant conversion.
+
+> [!INTERVIEW]
+> Red flag: requesting every permission on the first launch. Strong answer: ask in context, primer, graceful degradation, and a designed blocked state.
+
+### What does "blocked" mean, and how do you detect it on Android?
+
+**Short answer:** Blocked means the OS won't show the dialog again — only Settings can change it. On iOS that's any prior denial; on Android it's a permanent denial (second denial on 11+). Android can't report it from `check()`; you learn it when `request()` resolves instantly as denied with `shouldShowRequestPermissionRationale` false.
+
+`react-native-permissions` does that combination and returns `blocked` from `request()`. Handle the instant-resolution case by switching to an Open Settings flow, and remember it for the session so the UI doesn't flip back to "Allow". The same instant result also happens when the permission is missing from the manifest — check that first when debugging.
+
+### How do you handle a user returning from Settings after changing a permission?
+
+**Short answer:** Re-check on `AppState` changing to `active`, and also check on mount, because revoking a permission terminates the app on both platforms — the user may come back to a cold start rather than a resume.
+
+Skip re-checks while a request is in flight (the system dialog itself changes `AppState`), persist drafts before sending users to Settings, and update the UI from the fresh status. The `usePermission` hook above encapsulates this.
+
+### Your iOS app crashes the first time the user opens the camera. What happened?
+
+**Short answer:** Almost certainly a missing `NSCameraUsageDescription` in `Info.plist` — iOS terminates apps that access privacy-protected resources without a purpose string.
+
+In Expo, the string must come from the module's config plugin or `ios.infoPlist`, followed by a rebuild (never an OTA update). Related: App Store Connect warns with ITMS-90683 when a linked API lacks its string, even if an SDK owns the code path.
+
+### How would you let users attach photos while requesting as few permissions as possible?
+
+**Short answer:** Use the system photo pickers — `PHPickerViewController` on iOS and the Android Photo Picker — which need no permission at all. Request library permissions only for features that need persistent, broad access, like a gallery.
+
+If you do need library access: on iOS handle `limited` and offer `openPhotoPicker()` to change the selection; on Android 13 request `READ_MEDIA_IMAGES`/`VIDEO`, on 14 also declare `READ_MEDIA_VISUAL_USER_SELECTED` and treat "user-selected only" as limited. Google Play's Photo and Video Permissions policy now expects the picker for occasional use.
+
+### Google Play rejected your app for a sensitive permission you never use. How do you fix it?
+
+**Short answer:** A dependency added it to the merged manifest. Find it in Android Studio's Merged Manifest view (it shows which library contributed each entry), then remove it with `<uses-permission ... tools:node="remove" />` or Expo's `android.blockedPermissions`, and resubmit.
+
+Before removing, confirm the library's code path that needs it is never executed; otherwise replace the library. Add a CI check that diffs the merged manifest's permissions against an allow-list so new SDKs can't silently add permissions.
+
+### How do you request background location correctly on both platforms?
+
+**Short answer:** In two steps: foreground (when-in-use) first, in context; background later, after explaining why, as a separate request. On Android 11+ the background request sends the user to Settings and can't be combined with the foreground request; on iOS you request Always after When In Use.
+
+You also need `NSLocationAlwaysAndWhenInUseUsageDescription` plus the location background mode on iOS, a location-type foreground service on Android 14+ for continuous tracking, and a Play Console declaration with prominent in-app disclosure. See [Location & Maps](location.html) and [Background Tasks](background-tasks.html).
+
+### How does notification permission differ across Android versions and iOS?
+
+**Short answer:** iOS always requires a runtime request (no plist key) and supports provisional authorization for quiet delivery. Android 13+ requires the runtime `POST_NOTIFICATIONS` permission for apps targeting 33+; on Android 12 and lower there's no prompt — notifications are on unless the user disabled them.
+
+So on older Android, "requesting" means checking `checkNotifications()` and deep-linking with `openSettings('notifications')` if disabled. Ask after the user does something that makes notifications valuable (e.g. tracking an order), not on first launch. Details in [Push Notifications](push-notifications.html).
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,1294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera, Media &amp; Uploads · React Native Interview Handbook</title>
+<meta name="description" content="This guide covers capturing, picking, processing and uploading photos and videos in React Native: choosing between VisionCamera, expo-camera and system pickers, the permission…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Camera, Media &amp; Uploads · React Native Interview Handbook">
+<meta property="og:description" content="This guide covers capturing, picking, processing and uploading photos and videos in React Native: choosing between VisionCamera, expo-camera and system pickers, the permission…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/camera.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Camera, Media & Uploads
+
+This guide covers capturing, picking, processing and uploading photos and videos in React Native: choosing between VisionCamera, expo-camera and system pickers, the permission matrix, camera lifecycle and frame processors, image and video processing, direct-to-S3 and resumable uploads, retry queues, saving to the gallery and displaying media efficiently.
+
+## How it works
+
+Every media feature is a pipeline: **acquire** a file (camera capture, library pick or document pick), **process** it on-device (resize, compress, fix orientation, strip metadata, transcode), **upload** it (multipart, presigned direct-to-storage, chunked or resumable), then **clean up** local copies. The rule that ties it together is that **media bytes stay in native land**. JavaScript passes around URIs and small metadata objects; native code reads, transforms and streams the files. The moment you pull a 12 MP photo or a 200 MB video into the JS heap (base64 strings, `ArrayBuffer`s), you pay in memory spikes, GC pauses, crashes on low-end Android devices and a 33% size inflation.
+
+```mermaid
+flowchart TD
+    subgraph acquire["Acquire"]
+        Cam["Camera capture<br/>VisionCamera / expo-camera"]
+        Pick["System photo picker<br/>PHPicker / Android Photo Picker"]
+        Doc["Document picker<br/>UIDocumentPicker / SAF"]
+    end
+    Local[("Local file in app sandbox<br/>file:// URI")]
+    Proc["Process natively<br/>resize, compress, orientation,<br/>strip GPS EXIF, HEIC to JPEG"]
+    Queue[("Persistent upload queue<br/>MMKV / SQLite")]
+    Up["Upload<br/>multipart, presigned PUT,<br/>S3 multipart or tus"]
+    API["Backend confirms, scans,<br/>generates thumbnails"]
+    Clean["Delete temp files"]
+    Cam --> Local
+    Pick --> Local
+    Doc --> Local
+    Local --> Proc --> Queue --> Up --> API
+    Up -->|"success"| Clean
+    Up -.->|"failure: backoff and retry"| Queue
+```
+*Figure: The capture, process and upload pipeline. JS only moves URIs between these stages.*
+
+### URIs you will meet
+
+| URI scheme | Where it comes from | Can you upload it directly? |
+|---|---|---|
+| `file:///…` | Camera libraries, image manipulators, copies in your sandbox | Yes. It is the most portable form |
+| `content://…` (Android) | Photo Picker, MediaStore, Storage Access Framework, document pickers | RN networking can read it, but many native libraries can't, and access grants can expire, so copy to a local file first |
+| `ph://…` / `assets-library://…` (iOS) | Photos framework asset identifiers (camera-roll libraries) | No. Export the asset to a file first |
+| `https://…` | Remote media | Download first (or let the server fetch it) |
+
+The native camera stacks underneath are **AVFoundation** on iOS and **CameraX / Camera2** on Android. The RN libraries are thin, fast bridges over them, and most behavioural differences you see are platform camera differences.
+
+## Choosing a library / approach
+
+| Option | What it gives you | Permissions needed | Expo | Choose when |
+|---|---|---|---|---|
+| `react-native-vision-camera` | Full control: device selection, constraints (fps, resolution, HDR), photo and video outputs, frame processors (worklets) for real-time ML, barcode scanning add-on, zoom / focus / exposure | Camera (+ microphone for audio) | Development build | Camera is a core feature: custom UI, scanning, real-time ML, filters, high-quality video |
+| `expo-camera` (`CameraView`) | Preview, photos, video, built-in barcode scanning, modal system scanner | Camera (+ microphone) | Yes, Expo Go included | Straightforward capture or QR / barcode scanning with modest customisation |
+| `expo-image-picker` / `react-native-image-picker` | System UI to pick from the library (PHPicker on iOS, Photo Picker on Android 13+) or launch the system camera | None for library picking; camera for capture | Yes / dev build | "Attach a photo", avatars, most upload flows. Best UX with the least permission friction |
+| Android system Photo Picker | Privacy-preserving picker; the app gets only what the user selects | **None** | Used by the pickers above | Default on Android for one-off media access. Play's photo and video policy pushes you here |
+| Document picker (`expo-document-picker`, `@react-native-documents/picker`) | Any file type (PDF, video, audio) via UIDocumentPicker / Storage Access Framework | None | Yes / dev build | Non-media files, or when users pick from Drive / Files |
+
+```mermaid
+flowchart TD
+    Q1{"Need a live camera<br/>preview in your UI?"}
+    Q2{"Real-time frame analysis,<br/>custom controls or pro video?"}
+    Q3{"Picking existing media<br/>or any file type?"}
+    VC["react-native-vision-camera"]
+    EC["expo-camera CameraView"]
+    IP["Image picker<br/>(system Photo Picker / PHPicker)"]
+    DP["Document picker"]
+    Q1 -->|"yes"| Q2
+    Q1 -->|"no"| Q3
+    Q2 -->|"yes"| VC
+    Q2 -->|"no, basic capture or QR"| EC
+    Q3 -->|"photos and videos"| IP
+    Q3 -->|"PDFs and other files"| DP
+```
+*Figure: Pick the least powerful tool that satisfies the feature, since it usually means fewer permissions.*
+
+> [!TIP] Recommendation
+> Default to **system pickers** for attaching media: no library permission prompts, familiar UI, compliant with Google Play's photo policy. Use **expo-camera** for simple capture and QR scanning. Use **VisionCamera** when the camera *is* the product (scanning at scale, document capture, real-time ML, custom video). Whatever you choose, run everything through the same processing and upload pipeline.
+
+## Requirements & prerequisites
+
+The general request-and-fallback pattern is covered in [Permissions](permissions.html); this is the media-specific matrix.
+
+### iOS Info.plist keys
+
+| Key | Needed when | Notes |
+|---|---|---|
+| `NSCameraUsageDescription` | Any camera preview or capture | **The app crashes** on first camera access if missing |
+| `NSMicrophoneUsageDescription` | Recording video with audio | Also crashes if missing when audio is enabled |
+| `NSPhotoLibraryUsageDescription` | Reading the library directly (custom gallery, camera-roll listing) | Not needed for PHPicker-based picking. Users can grant **limited** access (iOS 14+) |
+| `NSPhotoLibraryAddUsageDescription` | Saving photos or videos to the library | Add-only access, a much smaller ask than full library access |
+
+### Android manifest permissions
+
+| Permission | Needed when | API levels |
+|---|---|---|
+| `CAMERA` | In-app camera preview / capture | All. Not needed to launch the system camera app via intent, **unless** you declare `CAMERA` in the manifest, in which case the intent fails until it is granted |
+| `RECORD_AUDIO` | Video with audio | All |
+| `READ_MEDIA_IMAGES`, `READ_MEDIA_VIDEO` | Reading the shared media library yourself (custom gallery) | 33+ (Android 13) |
+| `READ_MEDIA_VISUAL_USER_SELECTED` | Supporting partial "Select photos" access in a custom gallery | 34+ (Android 14) |
+| `READ_EXTERNAL_STORAGE` with `android:maxSdkVersion="32"` | Custom gallery on Android 12 and lower | 32 and lower |
+| `WRITE_EXTERNAL_STORAGE` with `android:maxSdkVersion="28"` | Saving to shared storage on Android 9 and lower | 28 and lower. On 10+, MediaStore inserts of your own files need no permission |
+
+### Other prerequisites
+
+- **Real devices.** The iOS Simulator provides no camera feed, so camera work needs a physical iPhone. The Android emulator offers a virtual scene or webcam passthrough, which is fine for smoke tests but not for focus, exposure or performance.
+- **Google Play Photo and Video Permissions policy.** Apps that need only one-time or infrequent media access must use the system Photo Picker rather than `READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO`. Broad access requires a Play Console declaration justifying it as core functionality (galleries, editors).
+- **Storage and CDN.** An S3-compatible bucket (or GCS / Azure Blob / Cloudflare R2) with lifecycle rules that abort incomplete multipart uploads, plus a CDN or image service for resized delivery. CORS rules don't apply to native requests, only to web clients.
+- **New Architecture.** Current VisionCamera is built on Nitro Modules. Check each media library's New Architecture support if you are on RN 0.82+, where the legacy architecture can no longer be enabled.
+
+## Setup — iOS
+
+### Step 1 — Info.plist
+
+```xml title="ios/MyApp/Info.plist"
+<key>NSCameraUsageDescription</key>
+<string>The camera is used to photograph delivery proof and scan package barcodes.</string>
+<key>NSMicrophoneUsageDescription</key>
+<string>The microphone records audio for inspection videos.</string>
+<!-- Only if you read the library directly (custom gallery) -->
+<key>NSPhotoLibraryUsageDescription</key>
+<string>Choose photos from your library to attach to a report.</string>
+<!-- Only if you save to the library -->
+<key>NSPhotoLibraryAddUsageDescription</key>
+<string>Save edited photos to your library.</string>
+```
+
+To stop iOS from showing the "select more photos" prompt on every launch for limited-access users, add `PHPhotoLibraryPreventAutomaticLimitedAccessAlert` = `YES` and offer your own "Manage selection" button.
+
+### Step 2 — Install and link
+
+```bash
+npm install react-native-vision-camera react-native-nitro-modules react-native-nitro-image  # VisionCamera (Nitro-based)
+npm install react-native-worklets                       # only for frame processors
+npm install react-native-vision-camera-barcode-scanner  # only for barcode scanning
+
+npx expo install expo-camera expo-image-picker expo-image-manipulator expo-media-library  # or the simpler options
+
+cd ios && pod install
+```
+
+If you use frame processors, add the worklets Babel plugin (skip if Reanimated 4 already configured it):
+
+```js title="babel.config.js"
+module.exports = {
+  presets: ['module:@react-native/babel-preset'],
+  plugins: ['react-native-worklets/plugin'], // must be last
+};
+```
+
+### Step 3 — Test on a real device
+
+Run from Xcode or `npx react-native run-ios --device`. Camera sessions fail silently or show a black view in the Simulator.
+
+## Setup — Android
+
+### Step 1 — Manifest
+
+```xml title="android/app/src/main/AndroidManifest.xml"
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.CAMERA" />
+  <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+  <!-- Only for a custom in-app gallery; pickers don't need these -->
+  <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+  <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+  <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+  <uses-permission
+    android:name="android.permission.READ_EXTERNAL_STORAGE"
+    android:maxSdkVersion="32" />
+  <uses-permission
+    android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+    android:maxSdkVersion="28" />
+
+  <!-- Keep tablets and Chromebooks without a camera eligible on Play -->
+  <uses-feature android:name="android.hardware.camera" android:required="false" />
+  <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+</manifest>
+```
+
+Many libraries merge permissions into your manifest. If you only use pickers, strip storage and media permissions you don't need, both to avoid prompts and to avoid a Play policy declaration:
+
+```xml title="android/app/src/main/AndroidManifest.xml"
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+  xmlns:tools="http://schemas.android.com/tools">
+  <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" tools:node="remove" />
+  <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" tools:node="remove" />
+</manifest>
+```
+
+### Step 2 — Photo Picker availability
+
+The system Photo Picker is available on Android 11+ devices through Google system updates and is backported to older versions through Google Play services. `react-native-image-picker` and `expo-image-picker` use it automatically where available; to get the backport on older devices, the Android docs describe an opt-in `<service>` entry for the Play services picker module. Check your picker library's README for whether it adds this for you.
+
+### Step 3 — Runtime permissions
+
+Request `CAMERA` (and `RECORD_AUDIO` only when the user starts a video with sound) at the moment of use. On Android 14, if you build a custom gallery, request `READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO` together with `READ_MEDIA_VISUAL_USER_SELECTED` and treat "partial access" as a normal state with a way to change the selection.
+
+## Setup — Expo
+
+```json title="app.json"
+{
+  "expo": {
+    "ios": {
+      "infoPlist": {
+        "NSCameraUsageDescription": "The camera is used to photograph delivery proof and scan package barcodes.",
+        "NSMicrophoneUsageDescription": "The microphone records audio for inspection videos."
+      }
+    },
+    "android": {
+      "permissions": ["android.permission.CAMERA", "android.permission.RECORD_AUDIO"],
+      "blockedPermissions": [
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "The camera is used to photograph delivery proof and scan package barcodes.",
+          "microphonePermission": "The microphone records audio for inspection videos.",
+          "recordAudioAndroid": true
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Choose photos from your library to attach to a report.",
+          "cameraPermission": "Take a photo to attach to a report."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Access your photos to show your uploads.",
+          "savePhotosPermission": "Save edited photos to your library."
+        }
+      ]
+    ]
+  }
+}
+```
+
+- `expo-camera` works in Expo Go; VisionCamera needs a **development build** (`npx expo prebuild` or EAS Build).
+- VisionCamera's docs show permissions configured directly through `ios.infoPlist` and `android.permissions` as above; older majors also shipped a config plugin (`cameraPermissionText`, `enableMicrophonePermission`, `enableCodeScanner`). Follow the docs for the major you install.
+- Only list the plugins you use. Each one adds permission strings and possibly Android permissions that must be justified on the stores.
+
+## Camera with VisionCamera
+
+> [!IMPORTANT] Versions matter
+> VisionCamera **v5** (released April 2026) is a ground-up rewrite on Nitro Modules with an **output-based** API: you create photo, video, frame and scanner outputs and pass them to `<Camera outputs={[...]} />`. v4 is no longer actively maintained and its API (`photo` / `video` props, `takePhoto()` on the camera ref, `useCameraFormat`, `useFrameProcessor`) does not carry over. The snippets below follow the v5 documentation at the time of writing. Verify exact names against the docs for the version you install, and expect minor releases to refine them. Source and docs: [mrousavy/react-native-vision-camera](https://github.com/mrousavy/react-native-vision-camera).
+
+| Concern | v4 (legacy) | v5 (current) |
+|---|---|---|
+| Photo capture | `photo` prop + `cameraRef.takePhoto()` returns a temp file path | `usePhotoOutput()` in `outputs`; `capturePhoto()` returns an in-memory `Photo`, `capturePhotoToFile()` returns `{ filePath }` |
+| Video | `video` / `audio` props + `cameraRef.startRecording({ onRecordingFinished })` | `useVideoOutput({ enableAudio })`, then `createRecorder()` and `recorder.startRecording(onFinished, onError)` |
+| Format selection | `useCameraFormat(device, filters)` + `format` prop | `constraints` prop (for example `{ fps: 60 }`), negotiated by the library |
+| Barcode scanning | `useCodeScanner({ codeTypes, onCodeScanned })` + `codeScanner` prop | `react-native-vision-camera-barcode-scanner`: `useBarcodeScannerOutput()` or `<CodeScanner />` |
+| Frame processors | `useFrameProcessor` + `react-native-worklets-core` | `useFrameOutput({ onFrame })` + `react-native-worklets`; call `frame.dispose()` |
+| Focus and zoom | `cameraRef.focus(point)`, `zoom` prop | `cameraRef.focusTo(point)`, `zoom` (Reanimated shared value), `enableNativeZoomGesture`, `enableNativeTapToFocusGesture` |
+
+### Permissions and device
+
+```tsx title="src/camera/useCameraReady.ts"
+import { useEffect } from 'react';
+import { Linking } from 'react-native';
+import { useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
+
+export function useCameraReady() {
+  const { hasPermission, requestPermission } = useCameraPermission();
+  const device = useCameraDevice('back'); // undefined on devices without a back camera
+
+  useEffect(() => {
+    if (!hasPermission) requestPermission();
+  }, [hasPermission, requestPermission]);
+
+  return {
+    device,
+    hasPermission,
+    // After a permanent denial the request resolves false without a prompt
+    openSettings: () => Linking.openSettings(),
+  };
+}
+```
+
+Request microphone permission separately and only when the user actually records with sound. If it is denied, record without audio rather than blocking the feature.
+
+### Tie `isActive` to focus and app state
+
+A camera session is expensive: it holds the sensor, burns battery and heats the device, and on Android another app can't use the camera while you hold it. Unmounting and remounting the component on every navigation is slow (session setup takes hundreds of milliseconds), so keep the component mounted while the screen is in the stack and toggle `isActive` instead.
+
+```ts title="src/hooks/useIsForeground.ts"
+import { useEffect, useState } from 'react';
+import { AppState } from 'react-native';
+
+export function useIsForeground(): boolean {
+  const [active, setActive] = useState(AppState.currentState === 'active');
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (s) => setActive(s === 'active'));
+    return () => sub.remove();
+  }, []);
+  return active;
+}
+```
+
+### Capture screen: photo and video
+
+```tsx title="src/camera/CaptureScreen.tsx"
+import { useCallback, useRef, useState } from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { useIsFocused } from '@react-navigation/native';
+import {
+  Camera,
+  type CameraRef,
+  type Recorder,
+  usePhotoOutput,
+  useVideoOutput,
+} from 'react-native-vision-camera';
+import { useCameraReady } from './useCameraReady';
+import { useIsForeground } from '../hooks/useIsForeground';
+
+interface Props {
+  withAudio: boolean; // true only if microphone permission was granted
+  onCaptured: (media: { uri: string; kind: 'photo' | 'video' }) => void;
+}
+
+export function CaptureScreen({ withAudio, onCaptured }: Props) {
+  const camera = useRef<CameraRef>(null);
+  const { device, hasPermission, openSettings } = useCameraReady();
+  const isFocused = useIsFocused();
+  const isForeground = useIsForeground();
+  const [recorder, setRecorder] = useState<Recorder | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const photoOutput = usePhotoOutput();
+  const videoOutput = useVideoOutput({ enableAudio: withAudio });
+
+  const takePhoto = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const { filePath } = await photoOutput.capturePhotoToFile({}, {});
+      onCaptured({ uri: `file://${filePath}`, kind: 'photo' }); // filePath is a plain path
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, photoOutput, onCaptured]);
+
+  const startRecording = useCallback(async () => {
+    // A Recorder is single-use: create a new one for every recording
+    const next = await videoOutput.createRecorder({ maxDuration: 120 });
+    await next.startRecording(
+      (path) => {
+        setRecorder(null);
+        onCaptured({ uri: `file://${path}`, kind: 'video' });
+      },
+      (error) => {
+        setRecorder(null);
+        console.error('Recording failed', error);
+      },
+    );
+    setRecorder(next);
+  }, [videoOutput, onCaptured]);
+
+  const stopRecording = useCallback(() => recorder?.stopRecording(), [recorder]);
+
+  if (!hasPermission) {
+    return (
+      <View style={styles.center}>
+        <Text>Camera access is needed to take delivery photos.</Text>
+        <Pressable onPress={openSettings}><Text>Open Settings</Text></Pressable>
+      </View>
+    );
+  }
+  if (!device) return <Text style={styles.center}>No camera available on this device.</Text>;
+
+  return (
+    <View style={StyleSheet.absoluteFill}>
+      <Camera
+        ref={camera}
+        style={StyleSheet.absoluteFill}
+        device={device}
+        isActive={isFocused && isForeground}
+        outputs={[photoOutput, videoOutput]}
+        enableNativeZoomGesture
+        enableNativeTapToFocusGesture
+      />
+      <View style={styles.controls}>
+        <Pressable onPress={takePhoto} disabled={busy || recorder !== null}>
+          <Text>Photo</Text>
+        </Pressable>
+        <Pressable onPress={recorder ? stopRecording : startRecording}>
+          <Text>{recorder ? 'Stop' : 'Record'}</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  controls: { position: 'absolute', bottom: 48, left: 0, right: 0, flexDirection: 'row', justifyContent: 'space-evenly' },
+});
+```
+
+In v5, `capturePhoto()` returns an in-memory `Photo` (plus EXIF and camera metadata) that you can display or process without a disk round-trip, and you must `dispose()` it when done. Use `capturePhotoToFile()` when the next step (upload, manipulator) needs a file anyway.
+
+### Custom tap-to-focus and pinch-to-zoom
+
+The native gesture props above are the simplest option. For custom UI (a focus ring, a zoom slider), drive the camera yourself with Gesture Handler and Reanimated:
+
+```tsx title="src/camera/useCameraGestures.ts"
+import type { RefObject } from 'react';
+import { Gesture } from 'react-native-gesture-handler';
+import { useSharedValue } from 'react-native-reanimated';
+import { scheduleOnRN } from 'react-native-worklets';
+import type { CameraRef } from 'react-native-vision-camera';
+
+export function useCameraGestures(
+  camera: RefObject<CameraRef | null>,
+  minZoom: number,
+  maxZoom: number,
+) {
+  const zoom = useSharedValue(1); // start at 1x (the natural field of view), not minZoom
+  const startZoom = useSharedValue(1);
+  const upper = Math.min(maxZoom, 10); // digital zoom beyond ~10x looks terrible
+
+  const focusAt = (x: number, y: number) => {
+    camera.current?.focusTo({ x, y }).catch(() => undefined); // some devices lack focus support
+  };
+
+  const pinch = Gesture.Pinch()
+    .onBegin(() => {
+      startZoom.value = zoom.value;
+    })
+    .onUpdate((e) => {
+      zoom.value = Math.min(Math.max(startZoom.value * e.scale, minZoom), upper);
+    });
+
+  const tap = Gesture.Tap().onEnd((e) => {
+    scheduleOnRN(focusAt, e.x, e.y);
+  });
+
+  return { zoom, gesture: Gesture.Simultaneous(pinch, tap) };
+}
+// Usage: <GestureDetector gesture={gesture}><Camera zoom={zoom} ... /></GestureDetector>
+```
+
+Use either the native gesture props or custom gestures, not both.
+
+### Orientation
+
+The preview follows the UI, while the output (photo, video, frame buffers) has its own orientation. If your UI is locked to portrait, users still take landscape photos by rotating the phone, and you want those photos saved as landscape. Camera libraries handle this through output orientation settings (VisionCamera distinguishes preview and output orientation) plus EXIF orientation metadata. Two consequences:
+
+- Files may carry an EXIF orientation tag instead of rotated pixels, so anything that ignores EXIF (some servers, some image libraries) shows them sideways. Normalise during processing (below).
+- Frame buffers in frame processors arrive in sensor orientation; ML plugins need the orientation to interpret them correctly.
+
+Always verify the four device orientations on both platforms with the front and back cameras; front-camera mirroring is another place where platforms differ.
+
+### Barcode and QR scanning
+
+```tsx title="src/camera/ScannerScreen.tsx"
+import { useRef } from 'react';
+import { StyleSheet } from 'react-native';
+import { useIsFocused } from '@react-navigation/native';
+import { Camera } from 'react-native-vision-camera';
+import {
+  useBarcodeScannerOutput,
+  type BarcodeScannerOutputOptions,
+} from 'react-native-vision-camera-barcode-scanner';
+import { useIsForeground } from '../hooks/useIsForeground';
+
+// Derive the barcode type from the options so it tracks the library's definitions
+type ScannedBarcodes = Parameters<NonNullable<BarcodeScannerOutputOptions['onBarcodeScanned']>>[0];
+
+export function ScannerScreen({ onScan }: { onScan: (barcode: ScannedBarcodes[number]) => void }) {
+  const isFocused = useIsFocused();
+  const isForeground = useIsForeground(); // call hooks unconditionally, then combine
+  const isActive = isFocused && isForeground;
+  const lastScanAt = useRef(0);
+
+  const scanner = useBarcodeScannerOutput({
+    barcodeFormats: ['qr-code', 'code-128'], // narrow formats: faster and fewer false reads
+    onBarcodeScanned(barcodes) {
+      const now = Date.now();
+      if (barcodes.length === 0 || now - lastScanAt.current < 1500) return; // debounce repeats
+      lastScanAt.current = now;
+      onScan(barcodes[0]); // Barcode carries the decoded value, format and bounds
+    },
+    onError(error) {
+      console.warn('Scanner error', error);
+    },
+  });
+
+  return <Camera style={StyleSheet.absoluteFill} device="back" isActive={isActive} outputs={[scanner]} />;
+}
+```
+
+The scanner package uses ML Kit on both platforms. Debounce results (the same code is reported many times per second), validate the payload before acting on it (a QR code is untrusted input, so never open arbitrary URLs or deep links from it without checks), and give haptic feedback on success.
+
+### Frame processors and threading
+
+A frame processor is a **worklet**: a JS function that runs synchronously on the camera's frame thread for every frame, receiving a handle to the native frame buffer without copying pixels into JS. Native plugins (ML Kit, TensorFlow Lite, OpenCV, your own Nitro module) read the buffer directly through JSI. Because it runs on its own worklet runtime, it can't touch React state or closures from the JS thread directly: results go out through shared values (read by Reanimated on the UI thread) or by scheduling a callback on the JS thread.
+
+```mermaid
+flowchart TD
+    Sensor["Camera sensor"] --> Pipe["Native capture session<br/>(AVFoundation / CameraX)"]
+    Pipe --> Preview["Preview view<br/>(GPU, never touches JS)"]
+    Pipe --> Frame["Frame buffer<br/>(native memory, zero copy)"]
+    Frame --> Worklet["onFrame worklet<br/>(frame thread, worklet runtime)"]
+    Worklet --> Plugin["Native plugin via JSI<br/>(ML Kit, TFLite, Nitro module)"]
+    Plugin --> Worklet
+    Worklet -->|"shared value"| UI["UI thread<br/>(Reanimated / Skia overlay)"]
+    Worklet -->|"scheduleOnRN, throttled"| JSThread["JS thread<br/>(React state, business logic)"]
+    Worklet -->|"frame.dispose()"| Release["Buffer returned to pool"]
+```
+*Figure: Frames stay in native memory; only small results cross to the UI or JS threads.*
+
+```tsx title="src/camera/useFaceCounter.ts"
+import { useState } from 'react';
+import { useFrameOutput } from 'react-native-vision-camera';
+import { scheduleOnRN } from 'react-native-worklets';
+import { detectFaces } from 'my-face-detector-plugin'; // any frame-processor plugin
+
+export function useFaceCounter() {
+  const [faces, setFaces] = useState(0);
+
+  const frameOutput = useFrameOutput({
+    onFrame(frame) {
+      'worklet';
+      try {
+        const result = detectFaces(frame); // synchronous native call through JSI
+        scheduleOnRN(setFaces, result.length);
+      } finally {
+        frame.dispose(); // release the buffer immediately or the pipeline stalls
+      }
+    },
+  });
+
+  return { faces, frameOutput }; // pass frameOutput in <Camera outputs={[...]} />
+}
+```
+
+Rules that keep frame processors fast:
+
+- **Budget:** at 30 fps you have about 33 ms per frame, shared with everything else on the device. Frames that arrive while your worklet is busy are dropped, not queued.
+- **Dispose frames** as soon as you're done; holding them starves the capture pool and freezes the preview.
+- **Don't update React state every frame.** Emit only when the result changes, throttle, or write to a shared value and render overlays with Reanimated / Skia on the UI thread.
+- Run heavy models at a lower rate or on a lower-resolution stream, and do analysis on a background worklet thread if the library offers one.
+- Request only the outputs you use. Every extra output (video + photo + frames + scanner) costs bandwidth and, on some Android devices, forces lower resolutions.
+
+### Performance and battery tips
+
+- Keep `isActive` false whenever the preview isn't visible (screen blurred, app backgrounded, modal on top).
+- Prefer the smallest constraints that satisfy the feature: 1080p at 30 fps for most video, not 4K at 60.
+- Warm up the camera screen early (keep it mounted in a tab or preload) if time-to-preview matters, rather than remounting.
+- On Android, test mid-range devices: CameraX capabilities vary widely and some combinations of outputs are unsupported, in which case the library negotiates down.
+- Show a placeholder until the session starts, so users never stare at a black rectangle.
+
+### Camera lifecycle
+
+```mermaid
+stateDiagram-v2
+    state "Inactive (no session)" as Inactive
+    state "Initializing" as Initializing
+    state "Active (streaming)" as Active
+    state "Paused (blurred or backgrounded)" as Paused
+    state "Failed" as Failed
+    [*] --> Inactive
+    Inactive --> Initializing : permission granted and isActive true
+    Initializing --> Active : session configured, first frame
+    Initializing --> Failed : device busy or unsupported config
+    Active --> Paused : screen blur or app background
+    Paused --> Active : focused and app active again
+    Active --> Failed : camera taken by another app or runtime error
+    Failed --> Initializing : user retries or app returns to foreground
+    Active --> Inactive : component unmounted
+    Paused --> Inactive : component unmounted
+```
+*Figure: Camera session lifecycle. Drive the Active and Paused transitions from navigation focus and AppState, never leave them to chance.*
+
+Handle the error path explicitly: listen to the camera's error callback, show a "Camera unavailable, retry" state, and retry when the app returns to the foreground. Common causes are another app (a video call, the system camera) holding the device, and interruptions such as phone calls on iOS.
+
+## Camera with expo-camera
+
+For simple capture and QR scanning, `expo-camera` is less code and works in Expo Go.
+
+```tsx title="src/camera/QuickCapture.tsx"
+import { useRef, useState } from 'react';
+import { Button, StyleSheet, Text, View } from 'react-native';
+import { useIsFocused } from '@react-navigation/native';
+import { CameraView, useCameraPermissions, type BarcodeScanningResult } from 'expo-camera';
+
+export function QuickCapture({ onPhoto, onCode }: {
+  onPhoto: (uri: string) => void;
+  onCode: (data: string) => void;
+}) {
+  const [permission, requestPermission] = useCameraPermissions();
+  const cameraRef = useRef<CameraView>(null);
+  const [scanned, setScanned] = useState(false);
+  const isFocused = useIsFocused();
+
+  if (!permission) return null; // still loading
+  if (!permission.granted) {
+    return (
+      <View style={styles.center}>
+        <Text>We need camera access to scan and take photos.</Text>
+        <Button title="Grant access" onPress={requestPermission} />
+      </View>
+    );
+  }
+
+  const handleScan = ({ data }: BarcodeScanningResult) => {
+    setScanned(true); // stop further callbacks until reset
+    onCode(data);
+  };
+
+  const takePicture = async () => {
+    const photo = await cameraRef.current?.takePictureAsync({ quality: 0.8, exif: false });
+    if (photo) onPhoto(photo.uri);
+  };
+
+  return (
+    <View style={StyleSheet.absoluteFill}>
+      {isFocused && ( // release the camera when the screen is not focused
+        <CameraView
+          ref={cameraRef}
+          style={StyleSheet.absoluteFill}
+          facing="back"
+          barcodeScannerSettings={{ barcodeTypes: ['qr', 'ean13'] }}
+          onBarcodeScanned={scanned ? undefined : handleScan}
+        />
+      )}
+      <Button title="Take photo" onPress={takePicture} />
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({ center: { flex: 1, alignItems: 'center', justifyContent: 'center' } });
+```
+
+`CameraView.launchScanner()` opens the platform's own full-screen scanner (Apple's data scanner on supported iOS versions, Google's code scanner on Android), which is a good zero-UI option for one-off scans. Video uses `recordAsync()` / `stopRecording()` with `mode="video"` and the microphone permission.
+
+## Picking media and files
+
+System pickers need no library permission on modern OS versions: iOS uses `PHPickerViewController`, Android 13+ uses the Photo Picker. The app only receives what the user selected.
+
+```ts title="src/media/pickImages.ts"
+import * as ImagePicker from 'expo-image-picker';
+
+export interface LocalMedia {
+  uri: string;
+  name: string;
+  type: string;         // MIME type, required for multipart uploads
+  width?: number;
+  height?: number;
+  size?: number;
+}
+
+export async function pickImages(limit = 10): Promise<LocalMedia[]> {
+  const result = await ImagePicker.launchImageLibraryAsync({
+    mediaTypes: ['images'],
+    allowsMultipleSelection: true,
+    selectionLimit: limit,
+    quality: 1,  // don't re-encode twice; we compress in our own processing step
+    exif: false, // don't carry metadata into JS
+    // iOS: ask for a compatible representation (HEIC is transcoded to JPEG)
+    preferredAssetRepresentationMode:
+      ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible,
+  });
+  if (result.canceled) return [];
+
+  return result.assets.map((a, i) => ({
+    uri: a.uri,
+    name: a.fileName ?? `image-${Date.now()}-${i}.jpg`,
+    type: a.mimeType ?? 'image/jpeg',
+    width: a.width,
+    height: a.height,
+    size: a.fileSize,
+  }));
+}
+```
+
+The bare-RN equivalent with `react-native-image-picker`:
+
+```ts
+import { launchImageLibrary } from 'react-native-image-picker';
+
+const res = await launchImageLibrary({
+  mediaType: 'photo',
+  selectionLimit: 10,           // 0 = unlimited
+  assetRepresentationMode: 'compatible',
+});
+if (res.didCancel || res.errorCode) return [];
+const files = (res.assets ?? []).map((a) => ({ uri: a.uri!, name: a.fileName!, type: a.type! }));
+```
+
+**When pickers are not enough.** A custom in-app gallery (think Instagram's grid) needs library read access: `NSPhotoLibraryUsageDescription` and PhotoKit on iOS, where users may grant **limited** access to a subset; `READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO` plus `READ_MEDIA_VISUAL_USER_SELECTED` on Android 14+, where users may grant **partial** access. Treat both partial states as first-class: show what you have and a "manage selection" entry point. Expect Play to ask you to justify broad media access.
+
+**Documents.** For PDFs and arbitrary files use a document picker. Copy the file into your sandbox at pick time so later reads don't depend on a temporary grant:
+
+```ts
+import * as DocumentPicker from 'expo-document-picker';
+
+const res = await DocumentPicker.getDocumentAsync({
+  type: ['application/pdf', 'image/*'],
+  copyToCacheDirectory: true, // gives you a file:// URI you control
+  multiple: false,
+});
+if (!res.canceled) {
+  const { uri, name, mimeType, size } = res.assets[0];
+  await enqueueUpload({ uri, name, type: mimeType ?? 'application/octet-stream', size });
+}
+```
+
+In bare apps, `@react-native-documents/picker` (the successor of `react-native-document-picker`) offers the same with an option to keep a local copy.
+
+## Processing before upload
+
+Phone cameras produce 12–48 MP images (3–12 MB each) and high-bitrate video. Uploading originals wastes users' data, fails on weak networks and costs you storage. Process on-device first.
+
+| Step | Why | How |
+|---|---|---|
+| Resize | A 4032×3024 photo displayed at 1080 px wide is 10x the bytes you need | Longest edge 1600–2560 px for most uploads |
+| Compress | JPEG quality 0.7–0.85 is visually near-lossless and several times smaller | Image manipulator or compressor library |
+| Normalise orientation | Cameras often store pixels in sensor orientation plus an EXIF `Orientation` tag; servers and some viewers ignore the tag and show images sideways | Re-encoding through a manipulator applies the rotation to the pixels |
+| Strip GPS / EXIF | Photos can embed precise GPS coordinates, device model and timestamps: a real privacy leak for user-generated content | Re-encode without metadata; also strip server-side as a second line of defence |
+| HEIC to JPEG | iOS captures HEIC by default; many backends, browsers and Android versions don't decode it | Picker "compatible" mode, or re-encode as JPEG |
+| Video compression | A 1-minute 4K clip can be hundreds of MB | Transcode to H.264 / HEVC at 720p–1080p and a sane bitrate before upload |
+
+```ts title="src/media/prepareImage.ts"
+import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
+import type { LocalMedia } from './pickImages';
+
+const MAX_EDGE = 2048;
+
+/**
+ * Resize the longest edge, re-encode as JPEG. Re-encoding bakes EXIF orientation into
+ * the pixels and writes a new file without the original metadata block (including GPS).
+ * Verify metadata behaviour for your library version; strip server-side as well.
+ */
+export async function prepareImage(media: LocalMedia): Promise<LocalMedia> {
+  const context = ImageManipulator.manipulate(media.uri);
+
+  const { width = 0, height = 0 } = media;
+  if (Math.max(width, height) > MAX_EDGE) {
+    // Passing one dimension preserves the aspect ratio
+    context.resize(width >= height ? { width: MAX_EDGE } : { height: MAX_EDGE });
+  }
+
+  const image = await context.renderAsync();
+  const saved = await image.saveAsync({ compress: 0.8, format: SaveFormat.JPEG });
+
+  return {
+    uri: saved.uri,
+    width: saved.width,
+    height: saved.height,
+    type: 'image/jpeg',
+    name: media.name.replace(/\.\w+$/, '') + '.jpg',
+  };
+}
+```
+
+`ImageManipulator.manipulate()` is the contextual API introduced in recent Expo SDKs; older code uses `manipulateAsync(uri, actions, options)`, which is deprecated. In bare apps, `react-native-compressor` covers images and video with native encoders:
+
+```ts title="src/media/compressVideo.ts"
+import { Image as ImageCompressor, Video as VideoCompressor } from 'react-native-compressor';
+
+export const compressImage = (uri: string) =>
+  ImageCompressor.compress(uri, { compressionMethod: 'auto' }); // resizes + JPEG, returns file URI
+
+export const compressVideo = (uri: string, onProgress: (p: number) => void) =>
+  VideoCompressor.compress(uri, { compressionMethod: 'auto' }, onProgress); // 0..1
+```
+
+> [!WARNING] Never base64 large files
+> `base64: true` options, `readAsStringAsync(uri, { encoding: 'base64' })` and JSON bodies with embedded images inflate size by 33%, create huge strings in the JS heap, trigger GC pauses and crash low-memory Android devices with a few photos. Upload files by URI (multipart or binary PUT) so native code streams them from disk. Base64 is only acceptable for tiny payloads such as a 64 px avatar preview.
+
+Process **sequentially** or with a concurrency of 2 when handling many images: ten 12 MP decodes in parallel is an easy way to hit an out-of-memory crash.
+
+## Uploads
+
+### Multipart `FormData`
+
+React Native's `FormData` accepts a file descriptor `{ uri, name, type }`, which the native networking layer streams from disk.
+
+```ts title="src/upload/multipart.ts"
+import type { LocalMedia } from '../media/pickImages';
+
+export async function uploadMultipart(file: LocalMedia, url: string, token: string) {
+  const form = new FormData();
+  // RN-specific shape: TypeScript's DOM types expect a Blob, hence the cast
+  form.append('file', { uri: file.uri, name: file.name, type: file.type } as unknown as Blob);
+  form.append('caption', 'Front door');
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` }, // do NOT set Content-Type: the boundary is added for you
+    body: form,
+  });
+  if (!res.ok) throw new Error(`Upload failed with ${res.status}`);
+  return res.json();
+}
+```
+
+Gotchas: the `type` field is required (a missing MIME type is a classic cause of Android uploads failing or arriving as text); `uri` must include its scheme (`file://`); and setting `Content-Type: multipart/form-data` by hand drops the boundary and breaks parsing on the server.
+
+### Upload progress
+
+`fetch` in React Native doesn't report upload progress. Use `XMLHttpRequest` (axios's `onUploadProgress` uses it under the hood):
+
+```ts title="src/upload/xhrUpload.ts"
+export class UploadError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+interface XhrUploadOptions {
+  url: string;
+  method?: 'POST' | 'PUT';
+  body: FormData | Blob;
+  headers?: Record<string, string>;
+  onProgress?: (fraction: number) => void;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export function xhrUpload({
+  url, method = 'POST', body, headers = {}, onProgress, signal, timeoutMs = 120_000,
+}: XhrUploadOptions): Promise<{ status: number; body: string; etag: string | null }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(method, url);
+    xhr.timeout = timeoutMs;
+    Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(e.loaded / e.total);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve({ status: xhr.status, body: xhr.responseText, etag: xhr.getResponseHeader('ETag') });
+      } else {
+        reject(new UploadError(xhr.status, xhr.responseText || 'Upload rejected'));
+      }
+    };
+    xhr.onerror = () => reject(new UploadError(0, 'Network error'));
+    xhr.ontimeout = () => reject(new UploadError(0, 'Upload timed out'));
+    signal?.addEventListener('abort', () => xhr.abort());
+
+    xhr.send(body);
+  });
+}
+```
+
+For a raw binary `PUT` (presigned URLs), get a native-backed `Blob` from the file first: `const blob = await (await fetch(file.uri)).blob();`. The blob lives in native memory, not the JS heap. For very large files, prefer a native upload task that streams from disk (next section).
+
+### Direct upload to S3 with presigned URLs
+
+Proxying media through your API servers wastes their bandwidth and CPU and ties upload reliability to your app tier. Instead, the API authorises the upload and returns a short-lived **presigned URL**; the app uploads straight to object storage; the API then verifies and processes the object.
+
+```mermaid
+sequenceDiagram
+    participant App as RN app
+    participant API as Your API
+    participant S3 as Object storage
+    participant Worker as Processing worker
+    App->>API: POST /uploads with type, size, checksum
+    API->>API: authorize user, validate type and size
+    API-->>App: uploadId, presigned PUT URL, required headers
+    App->>S3: PUT file bytes with Content-Type
+    S3-->>App: 200 OK with ETag
+    App->>API: POST /uploads/uploadId/complete
+    API->>S3: HEAD object, verify size and type
+    API->>Worker: enqueue scan, thumbnails, EXIF strip
+    API-->>App: status processing
+    Worker-->>API: variants ready
+```
+*Figure: Presigned direct upload. The API never handles the bytes but stays in control of authorisation and verification.*
+
+```ts title="src/upload/presignedUpload.ts"
+import * as FileSystem from 'expo-file-system/legacy';
+import { api } from '../api';
+import { UploadError } from './xhrUpload';
+import type { LocalMedia } from '../media/pickImages';
+
+interface PresignResponse {
+  uploadId: string;
+  url: string;
+  headers: Record<string, string>; // e.g. Content-Type the URL was signed with
+}
+
+export async function uploadViaPresignedUrl(
+  file: LocalMedia,
+  onProgress: (fraction: number) => void,
+): Promise<string> {
+  const presign = await api.post<PresignResponse>('/uploads', {
+    contentType: file.type,
+    size: file.size,
+    fileName: file.name,
+  });
+
+  // Native upload task: streams from disk, reports progress, no JS-heap copy
+  const task = FileSystem.createUploadTask(
+    presign.url,
+    file.uri,
+    {
+      httpMethod: 'PUT',
+      uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+      headers: presign.headers, // must match what was signed, or S3 returns 403
+      sessionType: FileSystem.FileSystemSessionType.BACKGROUND, // iOS background URLSession
+    },
+    ({ totalBytesSent, totalBytesExpectedToSend }) =>
+      onProgress(totalBytesSent / totalBytesExpectedToSend),
+  );
+
+  const result = await task.uploadAsync();
+  if (!result || result.status < 200 || result.status >= 300) {
+    throw new UploadError(result?.status ?? 0, 'Storage upload failed or was cancelled');
+  }
+
+  await api.post(`/uploads/${presign.uploadId}/complete`, {});
+  return presign.uploadId;
+}
+```
+
+Expo SDK 54 made a new object-oriented `expo-file-system` API the default and moved the previous API (including `createUploadTask`) to `expo-file-system/legacy`. Check which upload APIs your SDK version offers.
+
+**Security checklist for presigned uploads**
+
+- Short expiry (5–15 minutes), one object key per upload generated **server-side** (never let the client choose the key or path).
+- Sign the `Content-Type`; enforce size limits. A presigned `PUT` can't enforce a size range on its own, so either sign `Content-Length` or use a **presigned POST** with a `content-length-range` policy.
+- Treat the object as untrusted until verified: check size and magic bytes, virus-scan, re-encode images server-side (which also strips metadata), then mark the record ready.
+- Keep uploads in a private bucket or prefix and serve through a CDN with signed URLs if content is private.
+- Instead of relying on the client's "complete" call, you can also react to storage events (S3 event notifications into a queue or function), which survives the app dying right after the upload.
+
+### Chunked and resumable uploads
+
+For large videos on mobile networks, restarting a 300 MB upload from zero after a dropped connection is unacceptable. Split the file and resume from the last acknowledged chunk.
+
+| Approach | How it works | Notes |
+|---|---|---|
+| **S3 multipart upload** | Server calls `CreateMultipartUpload`, returns presigned `UploadPart` URLs; the client PUTs parts (3–4 in parallel) and records each part's `ETag`; server calls `CompleteMultipartUpload` with the part list | Parts are at least 5 MiB (except the last), up to 10,000 parts. Add a lifecycle rule to abort incomplete uploads, or orphaned parts cost money forever |
+| **tus protocol** | Open resumable-upload protocol: `POST` creates an upload, `PATCH` appends bytes at an offset, `HEAD` asks the server for the current offset after a failure | `tus-js-client` supports React Native file objects; you need a tus server (tusd or a managed service). Persist the upload URL so you can resume after an app restart |
+| Vendor SDKs | Managed services (video platforms, file-upload SaaS) wrap one of the above | Least work; vendor lock-in and cost |
+
+Reading a byte range from a file must also happen natively (a file-system library that supports offset reads or slicing), never by base64-decoding the whole file in JS.
+
+### Background uploads
+
+Be careful with promises here, because both platforms limit what an app can do once it leaves the foreground:
+
+- **iOS:** a **background `URLSession`** upload task that reads from a file continues while the app is suspended, and even if the system terminates the app; iOS relaunches the app to deliver completion events. If the **user force-quits** the app, background transfers are cancelled. The `sessionType: BACKGROUND` option above maps to this on iOS.
+- **Android:** use **WorkManager** with a network constraint, retries and backoff; long transfers run as foreground work with a visible notification (a `dataSync` foreground service type on Android 14+, which newer Android versions also time-limit). Android 14 added **user-initiated data transfer jobs** specifically for uploads the user started. These require native code or a library that wraps them.
+- Libraries such as `react-native-background-upload` wrap both platforms, but check maintenance and New Architecture status before adopting.
+- Whatever the platform does, design the JS side so an interrupted upload is **resumed or retried on next launch** from a persistent queue. Background execution is an optimisation, not a guarantee. See [Background Tasks](background-tasks.html).
+
+### A persistent retry queue
+
+```mermaid
+stateDiagram-v2
+    state "Queued" as Queued
+    state "Processing (resize, compress)" as Processing
+    state "Uploading" as Uploading
+    state "Waiting to retry" as Waiting
+    state "Confirming with API" as Confirming
+    state "Done (temp files deleted)" as Done
+    state "Failed permanently" as Failed
+    [*] --> Queued
+    Queued --> Processing : worker picks item
+    Processing --> Uploading : processed file ready
+    Uploading --> Confirming : storage returned 2xx
+    Uploading --> Waiting : network error, 5xx, timeout
+    Waiting --> Uploading : backoff elapsed and online
+    Uploading --> Failed : 4xx or max attempts
+    Confirming --> Done : API acknowledged
+    Confirming --> Waiting : API unreachable
+    Done --> [*]
+```
+*Figure: Upload item state machine. Every state is persisted so the queue survives app restarts.*
+
+```ts title="src/upload/uploadQueue.ts"
+import NetInfo from '@react-native-community/netinfo';
+import { storage } from '../storage'; // your MMKV instance
+import { prepareImage } from '../media/prepareImage';
+import { uploadViaPresignedUrl } from './presignedUpload';
+import { deleteLocalFile } from './files';
+import { UploadError } from './xhrUpload';
+import type { LocalMedia } from '../media/pickImages';
+
+type Status = 'queued' | 'uploading' | 'waiting' | 'done' | 'failed';
+
+interface UploadItem {
+  id: string;            // client-generated idempotency key, sent to the API
+  media: LocalMedia;     // file copied into the app's document directory
+  status: Status;
+  attempts: number;
+  nextAttemptAt: number;
+  error?: string;
+}
+
+const KEY = 'upload-queue';
+const MAX_ATTEMPTS = 8;
+// Retrying won't help: bad request, too large, unsupported type, rejected content.
+// 401/403 are retried because each attempt re-authenticates and re-presigns.
+const PERMANENT_STATUSES = new Set([400, 413, 415, 422]);
+let running = false;
+
+const load = (): UploadItem[] => JSON.parse(storage.getString(KEY) ?? '[]');
+const save = (items: UploadItem[]) => storage.set(KEY, JSON.stringify(items));
+const update = (id: string, patch: Partial<UploadItem>) =>
+  save(load().map((i) => (i.id === id ? { ...i, ...patch } : i)));
+
+export function enqueue(item: Pick<UploadItem, 'id' | 'media'>) {
+  save([...load(), { ...item, status: 'queued', attempts: 0, nextAttemptAt: 0 }]);
+  void processQueue();
+}
+
+const backoffMs = (attempt: number) =>
+  Math.min(30 * 60_000, 2 ** attempt * 1_000) * (0.5 + Math.random()); // jittered exponential
+
+export async function processQueue(onProgress?: (id: string, f: number) => void) {
+  if (running) return;
+  running = true;
+  try {
+    while (true) {
+      if (!(await NetInfo.fetch()).isConnected) return;
+      const now = Date.now();
+      const next = load().find(
+        (i) => (i.status === 'queued' || i.status === 'waiting') && i.nextAttemptAt <= now,
+      );
+      if (!next) return;
+
+      update(next.id, { status: 'uploading' });
+      try {
+        const processed = await prepareImage(next.media);
+        await uploadViaPresignedUrl(processed, (f) => onProgress?.(next.id, f));
+        update(next.id, { status: 'done' });
+        await deleteLocalFile(processed.uri);
+        await deleteLocalFile(next.media.uri);
+      } catch (e) {
+        const attempts = next.attempts + 1;
+        const message = e instanceof Error ? e.message : String(e);
+        const permanent =
+          attempts >= MAX_ATTEMPTS ||
+          (e instanceof UploadError && PERMANENT_STATUSES.has(e.status));
+        update(next.id, {
+          status: permanent ? 'failed' : 'waiting',
+          attempts,
+          nextAttemptAt: Date.now() + backoffMs(attempts),
+          error: message,
+        });
+      }
+    }
+  } finally {
+    running = false;
+  }
+}
+
+// Resume when connectivity returns and on app start
+NetInfo.addEventListener((state) => {
+  if (state.isConnected) void processQueue();
+});
+```
+
+Production versions add: resetting items stuck in `uploading` back to `waiting` on app start (the app died mid-upload), removing `done` items after a while, surfacing `failed` items in the UI with a retry button, and sending the item `id` as an idempotency key so a retried "complete" call doesn't create duplicates.
+
+### Android `content://` URIs and iOS asset URIs
+
+Pickers on Android return `content://` URIs backed by a content provider. React Native's networking can read them, but:
+
+- Many native libraries (compressors, some uploaders, FFmpeg wrappers) require a real `file://` path.
+- Access can be **temporary**: grants from pickers may not survive a process restart, so a queue that stores the `content://` URI and retries tomorrow fails with a `SecurityException` or "file not found".
+- Name and MIME type aren't encoded in the URI; take them from the picker result.
+
+The robust fix is to **copy into your sandbox at pick time** and queue the copy. iOS `ph://` asset identifiers from camera-roll libraries likewise need exporting to a file before upload.
+
+```ts title="src/upload/files.ts"
+import * as FileSystem from 'expo-file-system/legacy';
+
+const UPLOAD_DIR = `${FileSystem.documentDirectory}pending-uploads/`; // not cache: the OS may purge cache
+
+export async function copyToSandbox(uri: string, name: string): Promise<string> {
+  await FileSystem.makeDirectoryAsync(UPLOAD_DIR, { intermediates: true });
+  const dest = `${UPLOAD_DIR}${Date.now()}-${name.replace(/[^\w.-]/g, '_')}`;
+  await FileSystem.copyAsync({ from: uri, to: dest }); // works with content:// on Android
+  return dest;
+}
+
+export async function deleteLocalFile(uri: string): Promise<void> {
+  await FileSystem.deleteAsync(uri, { idempotent: true });
+}
+```
+
+### Cleaning up temporary files
+
+Camera captures, picker copies and manipulator outputs accumulate in cache and document directories, and users notice when your app uses gigabytes of storage.
+
+- Delete processed and original copies after the upload is confirmed (the queue above does this).
+- On app start, sweep `pending-uploads/` and cache subfolders for files older than a few days that no queue item references.
+- Keep originals only as long as the product needs them (for example until the server confirms thumbnails exist).
+- Remember that the OS can purge the cache directory under storage pressure, so anything that must survive until upload belongs in the document directory.
+
+## Saving to the gallery
+
+Ask for the **smallest** permission that works:
+
+| Platform | What you need to save | Notes |
+|---|---|---|
+| iOS | Add-only access: `NSPhotoLibraryAddUsageDescription` | Don't request full library read access just to save |
+| Android 10+ | No permission for inserting your own files through MediaStore | Libraries handle MediaStore for you |
+| Android 9 and lower | `WRITE_EXTERNAL_STORAGE` (declare with `maxSdkVersion="28"`) | |
+
+```ts title="src/media/saveToGallery.ts"
+import * as MediaLibrary from 'expo-media-library';
+
+export async function saveToGallery(uri: string): Promise<boolean> {
+  const { granted } = await MediaLibrary.requestPermissionsAsync(true); // writeOnly: add-only on iOS
+  if (!granted) return false;
+  await MediaLibrary.saveToLibraryAsync(uri); // local file:// URI of a photo or video
+  return true;
+}
+```
+
+In bare apps, `@react-native-camera-roll/camera-roll` does the same with `CameraRoll.saveAsset(uri, { type: 'photo', album: 'MyApp' })` (older versions call it `save`). Saving into a named album may require broader access on some platforms and versions, so check the library docs if you need albums.
+
+## Displaying media
+
+**Images.** Use `expo-image` (works in bare apps too): memory and disk caching, `blurhash` / `thumbhash` placeholders, smooth transitions, `recyclingKey` for list cells, and prefetching. Most importantly, request **resized variants** from your CDN or image service: downloading a 12 MP original to render a 120 px thumbnail wastes data and memory, and decoding many large images is a top cause of list jank and OOM crashes.
+
+```tsx title="src/media/Thumbnail.tsx"
+import { Image } from 'expo-image';
+
+export function Thumbnail({ id, blurhash, size = 120 }: { id: string; blurhash?: string; size?: number }) {
+  const px = Math.round(size * 3); // cover 3x screens; let the CDN resize
+  return (
+    <Image
+      source={{ uri: `https://cdn.example.com/media/${id}?w=${px}&h=${px}&fit=cover` }}
+      placeholder={blurhash ? { blurhash } : undefined}
+      style={{ width: size, height: size, borderRadius: 8 }}
+      contentFit="cover"
+      cachePolicy="memory-disk"
+      recyclingKey={id}
+      transition={150}
+    />
+  );
+}
+```
+
+**Video.** Use `expo-video` (`useVideoPlayer` + `<VideoView />`) or `react-native-video` (v6+). The old `expo-av` video component is deprecated in favour of `expo-video`. Serve long videos as HLS with multiple renditions, show a poster frame, pause and release players that scroll off screen, and never autoplay many videos at once in a feed.
+
+```tsx title="src/media/Clip.tsx"
+import { useVideoPlayer, VideoView } from 'expo-video';
+
+export function Clip({ uri }: { uri: string }) {
+  const player = useVideoPlayer(uri, (p) => {
+    p.loop = true;
+    p.muted = true;
+  });
+  return <VideoView player={player} style={{ width: '100%', aspectRatio: 16 / 9 }} nativeControls />;
+}
+```
+
+See [Performance](performance.html) for list virtualisation and image memory tuning.
+
+## Edge cases & gotchas
+
+- **Camera held by another app.** Video calls or the system camera can hold the device; handle the error state and retry on foreground.
+- **iOS interruptions.** Phone calls and Siri interrupt capture sessions (especially audio). Recordings may end early; handle the finished-with-reason callback.
+- **Front camera mirroring** differs between preview and output and between platforms. Decide what users expect (selfies usually mirrored in preview, not in the saved photo) and test it.
+- **Low storage.** Recording can fail mid-way; check free space before long recordings and handle errors.
+- **Permission revoked mid-session (Android)** kills the process, so restore state on relaunch.
+- **Limited / partial library access** is a normal state, not an error.
+- **Huge selections.** Users can select hundreds of photos; process and upload with bounded concurrency and show aggregate progress.
+- **HEIC and HEVC** outputs from iPhones may not play or render on older Android devices or in browsers; transcode server-side or on-device.
+- **Duplicate uploads** from retries: use idempotency keys and content hashes.
+- **QR codes are untrusted input.** Validate before navigating or calling APIs.
+
+## Testing & debugging
+
+- **iOS:** test camera features on a physical device. Push sample media into the Simulator for picker flows with `xcrun simctl addmedia booted ~/fixtures/sample.heic ~/fixtures/clip.mov`, and pre-grant permissions with `xcrun simctl privacy booted grant photos com.example.myapp`.
+- **Android emulator:** AVD settings let the back camera use a **VirtualScene** or your webcam. Push fixtures with `adb push sample.jpg /sdcard/Pictures/` (the media scanner may need a moment, or a reboot of the emulator, before pickers see them).
+- **Permissions:** `adb shell pm grant com.example.myapp android.permission.CAMERA` and `adb shell pm revoke …` (revoking kills the app, which is a good test of state restoration).
+- **Network:** use Network Link Conditioner (iOS) or emulator network throttling, toggle airplane mode mid-upload, and kill the app mid-upload to verify the queue resumes. Inspect multipart bodies and headers with a proxy such as Proxyman or Charles.
+- **Memory:** select 30 full-resolution photos and watch Xcode's memory gauge and the Android Studio profiler during processing.
+- **Automation:** unit-test processing and queue logic with mocked native modules; E2E-test picker flows with Maestro or Detox (system pickers are hard to drive, so stub the picker in E2E builds). See [Testing Strategy](testing.html).
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Black camera preview | `isActive` false, permission not granted, running in iOS Simulator, another app holds the camera, or the view has zero size | Check permission and focus / AppState wiring, test on a device, give the camera explicit dimensions, handle the error callback |
+| Crash on first camera or library access (iOS) | Missing `NSCameraUsageDescription` / `NSMicrophoneUsageDescription` / photo library key | Add the key (via Info.plist or config plugin) and rebuild the native app |
+| Photos appear rotated on the server or web | EXIF orientation tag not applied by the consumer | Re-encode on-device (manipulator bakes rotation), and normalise server-side too |
+| Memory spikes or OOM crashes with multiple images | Base64 conversions, parallel decodes of full-size images, displaying originals in lists | Upload by URI, process sequentially, resize before display, use CDN variants |
+| Upload fails only on Android with a picker URI | `content://` URI unsupported by a native library, expired grant, missing MIME `type` | Copy to a sandbox `file://` at pick time, always pass `name` and `type` |
+| Multipart upload arrives empty or server can't parse it | Manually set `Content-Type` header without boundary, or wrong field shape | Let RN set the header; append `{ uri, name, type }` |
+| S3 returns 403 on presigned PUT | `Content-Type` differs from the signed one, URL expired, clock skew on the signer | Send exactly the signed headers, shorten the time between presign and upload, re-presign on retry |
+| "Camera in use" / session error | Another app or a previous screen still holds the camera | Deactivate the camera on blur, release sessions on unmount, retry on foreground |
+| Recorded video has no sound | Microphone permission denied or audio not enabled on the output | Request microphone before recording; enable audio on the video output |
+| Scanner fires the same code repeatedly | Callback runs on every frame the code is visible | Debounce or pause scanning after a successful read |
+| HEIC files rejected by backend | iOS default capture format | Use picker compatible mode or re-encode to JPEG |
+| App storage grows without bound | Temp captures and processed files never deleted | Delete after confirmed upload, sweep stale files on startup |
+
+## Production checklist
+
+- [ ] System pickers used for one-off media access; broad media permissions removed unless essential (and declared on Play)
+- [ ] All required iOS usage strings present and specific; microphone requested only for audio recording
+- [ ] Android `uses-feature` camera marked `required="false"` where the camera is optional
+- [ ] Camera `isActive` tied to navigation focus and AppState; error state with retry
+- [ ] VisionCamera version pinned and APIs verified against that major's docs
+- [ ] Frame processors dispose frames and stay within the frame budget; no per-frame React state updates
+- [ ] Images resized and compressed; orientation normalised; GPS and EXIF stripped on-device and server-side
+- [ ] HEIC and HEVC handled (transcoded or supported end to end)
+- [ ] No base64 for anything larger than a tiny preview
+- [ ] Direct-to-storage uploads with short-lived presigned URLs, server-generated keys, signed content type and size limits
+- [ ] Uploaded objects verified, scanned and re-encoded server-side before use
+- [ ] Resumable or multipart uploads for large videos; lifecycle rule aborts incomplete multipart uploads
+- [ ] Persistent upload queue with backoff, idempotency keys, resume after restart and visible failed state
+- [ ] Picker `content://` files copied into the sandbox; temp files cleaned after upload
+- [ ] Saving uses add-only permissions
+- [ ] Media displayed through a caching image component with CDN-resized variants; video players released offscreen
+- [ ] Tested on real low-end Android devices and iPhones, on slow and flaky networks, with large selections
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [react-native-vision-camera docs](https://react-native-vision-camera.com/)
+- [Expo Camera](https://docs.expo.dev/versions/latest/sdk/camera/)
+- [Android — Photo picker](https://developer.android.com/training/data-storage/shared/photopicker)
+- [react-native-image-picker](https://github.com/react-native-image-picker/react-native-image-picker)
+
+## Interview questions
+
+### How would you design photo uploads for a field-service app used on flaky networks?
+
+Capture or pick, then immediately copy the file into the app's document directory and write an item to a persistent queue (MMKV or SQLite) with a client-generated idempotency key. A queue worker processes items with bounded concurrency: resize and compress natively, normalise orientation, strip GPS, then upload directly to object storage via a presigned URL with progress. Failures move to a waiting state with jittered exponential backoff; the queue resumes on connectivity changes and app start, and items stuck mid-upload are reset. The API confirms and verifies each object, then temp files are deleted. Large videos use multipart or tus so they resume instead of restarting. The UI shows per-item and aggregate progress plus a clear failed state with retry.
+
+### Why upload directly to S3 with presigned URLs, and what are the security considerations?
+
+It keeps media bytes off your API servers (bandwidth, memory, timeouts) and lets the storage service handle throughput and retries, while the API still controls who can upload what. Security: presigned URLs are short-lived and scoped to one server-generated key; sign the content type and enforce size limits (sign `Content-Length` or use a presigned POST with `content-length-range`); keep the bucket private; and treat uploaded objects as untrusted until the server has verified size and type, virus-scanned and re-encoded them. Confirm completion through the API or storage event notifications rather than trusting the client blindly.
+
+### Why is base64 a bad idea for uploading images and video in React Native?
+
+Base64 inflates payloads by about 33% and forces the entire file into the JS heap as a string, often more than once as it crosses into native code and gets concatenated into a body. With a few 12 MP photos or any real video, that means memory spikes, GC pauses and OOM crashes on low-end Android devices, plus slower uploads. Passing a file URI in `FormData` or a native upload task lets native code stream the file from disk with constant memory. Base64 is only reasonable for tiny payloads.
+
+### How do VisionCamera frame processors work, and what are the threading implications?
+
+A frame processor is a worklet executed synchronously on the camera's frame thread for each frame, with a handle to the native buffer and no pixel copy into JS. Native plugins read the buffer through JSI, for example ML Kit or a TFLite model. Because it runs on a separate worklet runtime, it can't use React state directly: results go to the UI thread through shared values or to the JS thread through a scheduled callback, ideally throttled. You must stay within the frame budget (about 33 ms at 30 fps) or frames are dropped, and you must dispose frames promptly or the pipeline stalls. In VisionCamera v5 this is the frame output (`useFrameOutput`) built on `react-native-worklets`.
+
+### A user wants to attach a profile photo. Which permissions do you request on Android 13 and 14?
+
+None for the library: use the system Photo Picker (through `expo-image-picker` or `react-native-image-picker`), which returns only the selected image without any storage or media permission. Only request `CAMERA` if the user chooses to take a new photo in-app. `READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO` (and `READ_MEDIA_VISUAL_USER_SELECTED` on Android 14 for partial access) are for apps that genuinely need ongoing library access, such as galleries, and Google Play's photo and video policy requires a declaration justifying them. Strip any such permissions merged in by libraries.
+
+### Users report that uploaded photos appear sideways on the website. What is happening and how do you fix it?
+
+The camera stored pixels in sensor orientation and recorded the intended rotation in the EXIF `Orientation` tag. The app's image view honours the tag, but the web pipeline or an image library ignores it. Fix it on-device by re-encoding through an image manipulator, which bakes the rotation into the pixels (and drops the EXIF, including GPS, which is a privacy win), and normalise again server-side when generating variants, so every client is protected regardless of app version.
+
+### How do you implement upload progress and resumable uploads for large videos?
+
+`fetch` in React Native has no upload progress, so use `XMLHttpRequest` with `xhr.upload.onprogress` (or axios `onUploadProgress`), or a native upload task that reports bytes sent. For resumability, split the upload: S3 multipart (server creates the upload and presigns part URLs, the client uploads 5 MiB+ parts in parallel and records ETags, the server completes it) or the tus protocol (the client asks the server for the current offset and continues from there). Persist the upload identifiers in the queue so a restart resumes rather than restarts, compress the video first, and add a lifecycle rule to abort abandoned multipart uploads.
+
+### How do you manage the camera lifecycle to avoid black screens and battery drain?
+
+Keep the camera component mounted while its screen is in the navigation stack, and drive `isActive` from navigation focus combined with AppState, so the session pauses on blur and backgrounding and resumes quickly without a full re-initialisation. Show a placeholder until the session has started, handle errors (device busy, interrupted, unsupported configuration) with a retry state, and retry when the app returns to the foreground. Request only the outputs and constraints you need, and never leave a hidden camera running: it drains battery, heats the device and blocks other apps from using the camera.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

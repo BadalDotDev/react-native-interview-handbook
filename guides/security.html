@@ -1,0 +1,1448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security · React Native Interview Handbook</title>
+<meta name="description" content="A practical, threat-model-first guide to securing React Native apps: what the client can and cannot protect, where secrets and tokens belong, network hardening and pinning,…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Security · React Native Interview Handbook">
+<meta property="og:description" content="A practical, threat-model-first guide to securing React Native apps: what the client can and cannot protect, where secrets and tokens belong, network hardening and pinning,…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/security.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Security
+
+A practical, threat-model-first guide to securing React Native apps: what the client can and cannot protect, where secrets and tokens belong, network hardening and pinning, attestation, biometrics, on-device data protection, supply chain and security testing. It is written for engineers who need to both *build* these controls and *defend the design* in a senior interview.
+
+## How it works
+
+The single most important mental model: **the app runs on a device you do not control**. Everything shipped in the binary — JS bundle, native code, assets, config — is readable by a motivated attacker, and every runtime check can be patched out on a rooted or jailbroken device. Mobile security therefore has two jobs:
+
+1. **Protect the legitimate user** from other parties — thieves with the phone, malicious apps, hostile Wi-Fi, shoulder surfers, leaky logs and backups. The OS gives you strong tools for this (sandbox, Keychain/Keystore, ATS, FLAG_SECURE), and you should use all of them.
+2. **Protect your backend and business** from a user (or bot) who controls the client. Here the client can only *raise the cost* of abuse and provide *signals* (attestation, RASP). Real enforcement always lives on the server.
+
+Senior answers keep these two apart. "We added jailbreak detection" is not a defence of your API; "the server enforces authorization per request and treats client signals as risk inputs" is.
+
+### Threat model
+
+| Threat actor | Capability | What they want | Primary mitigations |
+|---|---|---|---|
+| Thief / finder of an unlocked or locked device | Physical access, maybe the passcode | Tokens, PII, account takeover | Keychain/Keystore with `ThisDeviceOnly` classes, biometric gates, short sessions, remote session revocation, hide sensitive screens |
+| Owner of a rooted/jailbroken device (often the "user" themselves) | Full control of the process: Frida hooks, memory dumps, patched binaries | Bypass paywalls, cheat, scrape, fraud, reverse-engineer APIs | Server-side authorization, attestation, RASP signals, rate limiting — accept you cannot fully prevent it |
+| Network attacker (MITM) | Hostile Wi-Fi, rogue CA, corporate proxy, DNS hijack | Read/modify traffic, steal tokens | TLS everywhere, ATS / network security config, optional pinning, no secrets in URLs |
+| Reverse engineer | Unzips APK/IPA, decompiles Hermes bytecode and native code | Secrets, hidden endpoints, business logic, clones | No secrets in the binary, R8, server-side logic, attestation to detect repackaged apps |
+| Malicious app on the same device | Registers your URL scheme, reads shared storage/clipboard, overlays, exported components | Intercept deep links / OAuth redirects, read leaked data | Universal/App Links, PKCE, `android:exported="false"`, no world-readable files, clipboard hygiene |
+| Backend/API abuser | Scripts your API directly, credential stuffing, enumeration | Free resources, data scraping, account takeover | AuthN/AuthZ per request, rate limits, bot detection, attestation tokens, anomaly detection |
+| Supply-chain attacker | Compromised npm package or native SDK | Code execution in your build or your users' devices | Lockfiles, review of new deps and install scripts, scanning, delayed adoption of fresh versions |
+
+### Trust boundaries
+
+```mermaid
+flowchart TD
+    subgraph device["User device (untrusted)"]
+        JS["JS bundle / Hermes bytecode<br/>(readable, patchable)"]
+        Native["Native code + SDKs<br/>(readable, hookable)"]
+        Store[("Keychain / Keystore<br/>(hardware-backed keys)")]
+        Files[("Sandbox files, MMKV, SQLite")]
+        OtherApps["Other apps<br/>(URL schemes, clipboard, IPC)"]
+    end
+    subgraph net["Network (hostile)"]
+        TLS["TLS 1.2+ channel<br/>(optionally pinned)"]
+    end
+    subgraph backend["Your backend (trusted)"]
+        GW["API gateway<br/>rate limits, attestation check"]
+        API["Services<br/>authN + authZ per request"]
+        Secrets[("Secrets, third-party keys,<br/>business rules")]
+    end
+    ThirdParty["Third-party APIs<br/>(Maps, AI, payments)"]
+    JS --> Native
+    Native --> Store
+    Native --> Files
+    OtherApps -.->|"deep links, intents"| Native
+    Native --> TLS
+    TLS --> GW
+    GW --> API
+    API --> Secrets
+    API -->|"server-side keys"| ThirdParty
+```
+*Figure: Trust boundaries. Everything left of the TLS channel is attacker-reachable; secrets and authorization decisions belong on the backend.*
+
+### OWASP MASVS and the Mobile Top 10
+
+The **OWASP Mobile Application Security Verification Standard (MASVS)** defines *what* to verify; the **Mobile Application Security Testing Guide (MASTG)** defines *how* to test it. MASVS v2 groups controls into eight categories. The **OWASP Mobile Top 10 (2024)** lists the most common real-world failures. Knowing how they map is a strong interview signal.
+
+| MASVS category | Covers | Mobile Top 10 (2024) | Where in this guide |
+|---|---|---|---|
+| MASVS-STORAGE | Sensitive data at rest, logs, backups | M9 Insecure Data Storage | Secure storage, Data protection |
+| MASVS-CRYPTO | Correct algorithms, key management, randomness | M10 Insufficient Cryptography | Secure storage (MMKV key), Biometrics |
+| MASVS-AUTH | Authentication, session management, local auth | M3 Insecure Authentication/Authorization, M1 Improper Credential Usage | Biometrics, [Authentication & Sessions](authentication.html) |
+| MASVS-NETWORK | TLS, certificate validation, pinning | M5 Insecure Communication | Network security |
+| MASVS-PLATFORM | IPC, deep links, WebViews, UI exposure | M4 Insufficient Input/Output Validation, M8 Security Misconfiguration | Deep links, WebView, exported components |
+| MASVS-CODE | Up-to-date platform/deps, input validation, secure updates | M2 Inadequate Supply Chain Security, M4 | Supply chain, Secrets |
+| MASVS-RESILIENCE | Anti-tamper, anti-debug, obfuscation, device integrity | M7 Insufficient Binary Protections | Code protection, Attestation |
+| MASVS-PRIVACY | Data minimisation, transparency, user control | M6 Inadequate Privacy Controls | Privacy compliance |
+
+> [!INTERVIEW]
+> When asked "how would you secure this app?", start with the threat model (assets, actors, trust boundaries), then walk the MASVS categories. Red flags: leading with obfuscation or jailbreak detection, or claiming a secret "hidden" in native code is safe.
+
+## Requirements & prerequisites
+
+| Item | Needed for | Notes |
+|---|---|---|
+| react-native-keychain **or** expo-secure-store | Tokens, keys, small secrets | Both wrap iOS Keychain + Android Keystore. Expo-managed apps usually pick expo-secure-store. |
+| react-native-mmkv (v3+) | Fast encrypted key-value storage | Encryption key must itself live in the Keychain/Keystore. |
+| react-native-ssl-public-key-pinning (or native config) | Public-key pinning | Works with Expo via a development build + prebuild. |
+| Google Play Console + Google Cloud project | Play Integrity API | Link the Cloud project in Play Console; check default daily quotas. |
+| Apple Developer Program | App Attest / DeviceCheck | App Attest capability on the App ID, entitlement per environment. |
+| Firebase project (optional) | Firebase App Check | Wraps Play Integrity and App Attest; debug provider for dev/CI. |
+| freeRASP / jail-monkey (optional) | Tamper, hook, root/jailbreak signals | Treat as signals, not guarantees. |
+| Proxy tool: Proxyman, Charles, mitmproxy, or Burp Suite | MITM testing | Install the proxy CA on a test device/emulator. |
+| MobSF, Frida, objection | Static/dynamic testing of your own builds | Use a rooted emulator or jailbroken test device. Only test apps you own or are authorised to test. |
+| Socket / Snyk / `npm audit`, Renovate or Dependabot | Supply chain | Run in CI on every PR. |
+
+## Choosing a library / approach
+
+| Need | Options | Recommendation |
+|---|---|---|
+| Tokens & small secrets | react-native-keychain, expo-secure-store, AsyncStorage | **react-native-keychain** in bare apps (rich access-control options, biometrics, security level); **expo-secure-store** in Expo apps (simple API, config plugin). **Never AsyncStorage.** |
+| Larger sensitive data (cached profile, drafts) | Encrypted MMKV, SQLCipher (op-sqlite supports it), file encryption | Encrypted MMKV for key-value; SQLCipher for relational data. Key in Keychain. |
+| Pinning | react-native-ssl-public-key-pinning, native OkHttp `CertificatePinner` + TrustKit/`NSPinnedDomains`, Android `network_security_config` `pin-set` | The library for most apps (one JS config covering `fetch`/axios on both platforms). Native config if you want zero JS dependency. |
+| Integrity | Firebase App Check, direct Play Integrity + App Attest | App Check if you already use Firebase; direct APIs if you need raw verdicts or custom policy. |
+| Tamper/root signals | freeRASP, jail-monkey, commercial RASP (e.g. Promon, Guardsquare, Appdome) | freeRASP for a broad free baseline; commercial RASP only for high-risk domains (banking, gaming, DRM). |
+| Biometrics | react-native-keychain access control, expo-local-authentication, react-native-biometrics | Keychain access control for "unlock the stored token"; signature-based keys when the server must verify the biometric step. |
+
+## Secrets: nothing in the app is secret
+
+Any string that ships in the app can be extracted — this includes values "hidden" in native code, `BuildConfig`, `Info.plist`, `strings.xml`, or split and XOR'ed in JS. It takes minutes:
+
+```bash
+# Android: an APK/AAB is a zip; the bundle lives in assets/
+unzip -o app-release.apk 'assets/index.android.bundle' -d extracted
+file extracted/assets/index.android.bundle   # "Hermes JavaScript bytecode"
+strings extracted/assets/index.android.bundle | grep -iE 'api[_-]?key|secret|sk_live'
+
+# iOS: an IPA is a zip; the bundle sits next to the executable
+unzip -o MyApp.ipa -d ipa
+strings ipa/Payload/MyApp.app/main.jsbundle | grep -i key
+```
+
+Hermes bytecode is **not** protection: string literals remain in the string table and open-source tools (for example `hermes-dec` and `hbctool`) disassemble or decompile bundles back into readable pseudo-JS. Native code can be decompiled with jadx (Android) or Ghidra/Hopper (iOS), and at runtime Frida can simply hook the function that *uses* the secret.
+
+### Config values are public by definition
+
+| Mechanism | Where the value ends up | Secret? |
+|---|---|---|
+| `react-native-config` (`.env`) | `BuildConfig` fields, generated Obj-C/Swift constants, JS | **No** — readable from the binary |
+| `EXPO_PUBLIC_*` env vars | Inlined as string literals into the JS bundle at build time | **No** — the prefix literally means public |
+| `app.config.ts` `extra` / `expo-constants` | Embedded manifest in the app | **No** |
+| EAS Secrets / environment variables without `EXPO_PUBLIC_` | Only available during the build (e.g. to config plugins, Gradle) | Yes, as long as nothing writes them into the app |
+| Your backend's environment | Server only | **Yes** |
+
+> [!CAUTION]
+> A secret key for OpenAI/Anthropic, Stripe (`sk_live_…`), Twilio, SendGrid, AWS IAM, or a Firebase service account in the app is a **data breach waiting to happen**. Bots scrape public app binaries for exactly these patterns. Rotate any key that has ever shipped in a build, even an internal one.
+
+### Proxy third-party APIs through your backend
+
+Instead of calling a paid API with a secret from the device, call your own endpoint, which authenticates the user, applies quotas, and adds the secret server-side:
+
+```ts title="server/routes/ai.ts"
+import { Router } from 'express';
+import { requireUser } from '../auth/requireUser';
+import { rateLimit } from '../middleware/rateLimit';
+
+export const aiRouter = Router();
+
+aiRouter.post(
+  '/ai/summarise',
+  requireUser,                                   // verifies the access token
+  rateLimit({ key: (req) => req.user.id, perMinute: 10 }),
+  async (req, res) => {
+    const text = String(req.body?.text ?? '').slice(0, 8000); // validate + cap input
+    const upstream = await fetch('https://api.example-ai.com/v1/summarise', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.AI_API_KEY}`, // never leaves the server
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ text }),
+    });
+    if (!upstream.ok) return res.status(502).json({ error: 'upstream_failed' });
+    res.json(await upstream.json());
+  },
+);
+```
+
+### Keys that are public by design — restrict them
+
+Some keys are *designed* to ship in clients: Google Maps SDK keys, Firebase config (`google-services.json`, `GoogleService-Info.plist`), Stripe **publishable** keys, Sentry DSNs, Algolia search-only keys. These are identifiers, not credentials; protect them by restricting what they can do.
+
+| Key | Restriction |
+|---|---|
+| Google Maps / Places (Android) | Application restriction "Android apps": package name + **SHA-1 of each signing cert** (debug, upload, and Play App Signing key). API restriction: only the SDKs you use. |
+| Google Maps / Places (iOS) | Application restriction "iOS apps": bundle ID. Separate key per platform. |
+| Firebase | Security Rules (Firestore/Storage/RTDB) and App Check enforcement — the config itself is not a secret. |
+| Stripe | Only the publishable key on device; PaymentIntents created server-side with the secret key. |
+| Any key | Quotas, budget alerts, and a rotation runbook. |
+
+> [!NOTE]
+> Platform restrictions on Google keys are enforced via request headers (package name, cert fingerprint, bundle ID) that a scripted client can spoof. They stop casual reuse, not a determined attacker — which is why quotas and server-side proxies still matter.
+
+## Secure storage
+
+The app sandbox already stops *other apps* from reading your files on a non-rooted device. Secure storage adds protection against the harder cases: a rooted/jailbroken device, forensic extraction, backups, and a stolen phone. The rule of thumb: **credentials and keys go into the Keychain (iOS) or Keystore-backed encryption (Android); everything else sensitive is encrypted with a key that lives there.**
+
+### iOS Keychain
+
+The Keychain is an encrypted database managed by `securityd`, with keys protected by the Secure Enclave. Each item has an **accessibility class** that decides *when* it can be decrypted and whether it can *migrate* to another device through backups:
+
+| Class (`kSecAttrAccessible…`) | Readable when | Migrates via backup to a new device | Use for |
+|---|---|---|---|
+| `WhenUnlocked` | Device unlocked | Yes | Rarely what you want for tokens |
+| `WhenUnlockedThisDeviceOnly` | Device unlocked | **No** | High-sensitivity secrets used only in the foreground |
+| `AfterFirstUnlock` | After first unlock since boot | Yes | Values background tasks need |
+| `AfterFirstUnlockThisDeviceOnly` | After first unlock since boot | **No** | **Refresh tokens** that silent push / background fetch must read |
+| `WhenPasscodeSetThisDeviceOnly` | Unlocked **and** a passcode is set; item is destroyed if the passcode is removed | **No** | Highest-assurance keys (e.g. signing keys for payments) |
+| `Always` / `AlwaysThisDeviceOnly` | Always | — | Deprecated — do not use |
+
+Access control flags (`kSecAccessControlBiometryCurrentSet`, `.userPresence`, `.devicePasscode`) can be layered on top so reading the item requires Face ID/Touch ID or the passcode — see *Biometrics done right* below and the [Authentication & Sessions](authentication.html) guide.
+
+> [!WARNING]
+> `WhenUnlocked*` items cannot be read while the device is locked. If a background task or a notification service extension tries, you get `errSecInteractionNotAllowed` (-25308) and — if your code treats "no token" as "logged out" — a spurious logout. Pick `AfterFirstUnlockThisDeviceOnly` for tokens needed in the background.
+
+### Android Keystore
+
+The Android Keystore generates and holds keys inside the TEE (or a dedicated secure element, **StrongBox**, on supporting devices since Android 9). Keys are **non-exportable**: the app can ask the Keystore to encrypt/decrypt/sign, but can never read the key material, even on a rooted device (the attacker can still *use* the key while hooked into your process). Libraries generate an AES-GCM key in the Keystore, encrypt your value with it, and store the ciphertext in SharedPreferences or DataStore.
+
+Keys can be bound to user authentication (`setUserAuthenticationRequired(true)`) and invalidated when a new fingerprint is enrolled (`setInvalidatedByBiometricEnrollment(true)`). Note that Jetpack Security's `EncryptedSharedPreferences` has been deprecated — prefer a maintained RN library or the Keystore directly.
+
+### Library comparison
+
+| | react-native-keychain | expo-secure-store | Encrypted MMKV | AsyncStorage |
+|---|---|---|---|---|
+| Backing | Keychain / Keystore | Keychain / Keystore | File encrypted with AES (key supplied by you) | Plain SQLite/files |
+| Size | Small values (tokens, keys) | Small values (historically ~2 KB guidance) | Large, fast, synchronous | Large, async |
+| Accessibility classes | Yes (`ACCESSIBLE.*`) | Yes (`keychainAccessible`) | n/a | n/a |
+| Biometric access control | Yes (`ACCESS_CONTROL.*`, `authenticationPrompt`) | Yes (`requireAuthentication`) | No | No |
+| Expo | Works with a dev build | First-party, config plugin | Works with a dev build | Yes |
+| Use for | Tokens, keys, credentials | Tokens, keys | Cached sensitive data, key in Keychain | Non-sensitive prefs only |
+
+### Storing tokens
+
+```ts title="src/security/secureStore.ts"
+import * as Keychain from 'react-native-keychain';
+
+const SESSION_SERVICE = 'com.example.app.session';
+
+export type StoredSession = { refreshToken: string; userId: string };
+
+export async function saveSession(session: StoredSession): Promise<void> {
+  await Keychain.setGenericPassword(session.userId, session.refreshToken, {
+    service: SESSION_SERVICE,
+    accessible: Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+  });
+}
+
+export async function loadSession(): Promise<StoredSession | null> {
+  try {
+    const creds = await Keychain.getGenericPassword({ service: SESSION_SERVICE });
+    if (!creds) return null;
+    return { userId: creds.username, refreshToken: creds.password };
+  } catch (error) {
+    // Decryption failures happen after backup restores or key invalidation.
+    // Treat as "no session" and clean up, never crash the launch path.
+    await Keychain.resetGenericPassword({ service: SESSION_SERVICE });
+    return null;
+  }
+}
+
+export async function clearSession(): Promise<void> {
+  await Keychain.resetGenericPassword({ service: SESSION_SERVICE });
+}
+```
+
+The Expo equivalent:
+
+```ts title="src/security/secureStore.expo.ts"
+import * as SecureStore from 'expo-secure-store';
+
+const OPTIONS: SecureStore.SecureStoreOptions = {
+  keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+};
+
+export const saveRefreshToken = (token: string) =>
+  SecureStore.setItemAsync('refreshToken', token, OPTIONS);
+
+export const loadRefreshToken = () => SecureStore.getItemAsync('refreshToken', OPTIONS);
+
+export const clearRefreshToken = () => SecureStore.deleteItemAsync('refreshToken', OPTIONS);
+```
+
+```json title="app.json (excerpt)"
+{
+  "expo": {
+    "plugins": [
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": true,
+          "faceIDPermission": "Allow $(PRODUCT_NAME) to use Face ID to unlock your account."
+        }
+      ]
+    ]
+  }
+}
+```
+
+`configureAndroidBackup` excludes SecureStore data from Android Auto Backup — important because Keystore keys are never backed up, so restored ciphertext would be undecryptable.
+
+### Encrypted MMKV with the key in the Keychain
+
+MMKV encryption is only as strong as the key's storage. Generate a random key on first launch, keep it in the Keychain, and open MMKV with it:
+
+```ts title="src/security/secureMmkv.ts"
+import 'react-native-get-random-values'; // polyfills crypto.getRandomValues on Hermes
+import * as Keychain from 'react-native-keychain';
+import { createMMKV, type MMKV } from 'react-native-mmkv';
+
+const KEY_SERVICE = 'com.example.app.mmkv-key';
+let instance: MMKV | null = null;
+
+function randomHex(byteCount: number): string {
+  const bytes = new Uint8Array(byteCount);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function getOrCreateKey(): Promise<string> {
+  const existing = await Keychain.getGenericPassword({ service: KEY_SERVICE });
+  if (existing) return existing.password;
+  const key = randomHex(16); // 32 hex chars, 128 bits of entropy
+  await Keychain.setGenericPassword('mmkv', key, {
+    service: KEY_SERVICE,
+    accessible: Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+  });
+  return key;
+}
+
+export async function getSecureStorage(): Promise<MMKV> {
+  if (instance) return instance;
+  const encryptionKey = await getOrCreateKey();
+  instance = createMMKV({ id: 'secure', encryptionKey, encryptionType: 'AES-256' });
+  return instance;
+}
+```
+
+> [!NOTE]
+> This uses the react-native-mmkv v4 factory (`createMMKV`). On v3 the equivalent is `new MMKV({ id, encryptionKey })`, where the key is limited to 16 bytes (AES-128). If the Keychain key is ever lost while the MMKV file survives (restore, reinstall edge cases), the file is unreadable — treat encrypted MMKV as a **cache** you can wipe and rebuild, not as the source of truth.
+
+### What to store where
+
+```mermaid
+flowchart TD
+    Start(["New piece of data"]) --> Need{"Must it be on the device at all?"}
+    Need -->|"no"| Server["Keep server-side, fetch on demand"]
+    Need -->|"yes"| Cred{"Credential, token or crypto key?"}
+    Cred -->|"yes"| KC["Keychain / Keystore<br/>ThisDeviceOnly class"]
+    Cred -->|"no"| Sens{"Sensitive or PII?"}
+    Sens -->|"no"| Plain["Plain MMKV / AsyncStorage"]
+    Sens -->|"yes"| Shape{"Key-value or relational?"}
+    Shape -->|"key-value"| EncKV["Encrypted MMKV<br/>(key in Keychain)"]
+    Shape -->|"relational / large"| EncDB["SQLCipher DB<br/>(key in Keychain)"]
+    Shape -->|"files"| EncFile["Sandbox files with<br/>iOS file protection, delete after use"]
+```
+*Figure: Deciding where a piece of data belongs.*
+
+| Data | Where | Notes |
+|---|---|---|
+| Refresh token | Keychain/Keystore, `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY`, optionally biometric-bound | Device-bound; wiped on logout |
+| Access token | Memory (optionally Keychain for cold start) | Short-lived (5–15 min); never in AsyncStorage |
+| Encryption keys (MMKV, SQLCipher) | Keychain/Keystore | Generated on device with a CSPRNG |
+| User password | **Nowhere** | Let the OS password manager autofill (`textContentType="password"` / `autoComplete="password"`) |
+| Card numbers / CVV | **Nowhere** | Tokenise via Stripe/Braintree SDKs (PCI scope) |
+| Cached PII (profile, messages, health data) | Encrypted MMKV / SQLCipher | Minimise; set retention; wipe on logout |
+| Downloaded documents (statements, IDs) | App sandbox with file protection; delete when done | Never external/shared storage |
+| Preferences, feature flags, onboarding state | Plain MMKV / AsyncStorage | Nothing that grants access |
+| Biometric templates | Never accessible to apps | OS-managed; you only get a yes/no or a key release |
+
+### Wiping on logout
+
+Logout must remove *everything* tied to the user, not just the token:
+
+```ts title="src/security/wipeLocalData.ts"
+import * as Keychain from 'react-native-keychain';
+import { Paths, Directory } from 'expo-file-system';
+import { getSecureStorage } from './secureMmkv';
+import { queryClient } from '../api/queryClient';
+
+const KEYCHAIN_SERVICES = ['com.example.app.session', 'com.example.app.mmkv-key'];
+
+export async function wipeLocalData(): Promise<void> {
+  queryClient.clear();                                  // in-memory server cache
+  (await getSecureStorage()).clearAll();                // encrypted user cache
+  await Promise.all(
+    KEYCHAIN_SERVICES.map((service) => Keychain.resetGenericPassword({ service })),
+  );
+  const userFiles = new Directory(Paths.document, 'user');
+  if (userFiles.exists) userFiles.delete();             // downloaded documents
+}
+```
+
+> [!TIP]
+> Keep an explicit list of every Keychain service, MMKV instance, database and directory the app writes. A "data inventory" makes logout, account deletion and privacy-label answers straightforward. The full logout sequence (server revocation, push token, navigation reset) is in [Authentication & Sessions](authentication.html).
+
+### The iOS reinstall problem
+
+On iOS, **Keychain items survive app uninstall**. A user who deletes the app and reinstalls it (or sells the phone without wiping it) can find the app "already logged in" with a stale token. Android removes Keystore keys and app data on uninstall, so this is iOS-specific. The standard fix is a "first launch" flag stored somewhere that *is* deleted on uninstall:
+
+```ts title="src/security/clearKeychainOnFreshInstall.ts"
+import * as Keychain from 'react-native-keychain';
+import { createMMKV } from 'react-native-mmkv';
+
+// Plain MMKV lives in the app container, which iOS deletes on uninstall.
+const installFlags = createMMKV({ id: 'install-flags' });
+const FLAG = 'hasLaunchedBefore';
+
+const KEYCHAIN_SERVICES = ['com.example.app.session', 'com.example.app.mmkv-key'];
+
+/** Call first thing during bootstrap, before any Keychain read. */
+export async function clearKeychainOnFreshInstall(): Promise<void> {
+  if (installFlags.getBoolean(FLAG)) return;
+  await Promise.all(
+    KEYCHAIN_SERVICES.map((service) => Keychain.resetGenericPassword({ service })),
+  );
+  installFlags.set(FLAG, true);
+}
+```
+
+Edge case: restoring an iPhone backup onto a *new* device restores the flag but not `ThisDeviceOnly` Keychain items — so the bootstrap must treat "flag present, token missing" as a normal signed-out state, not an error.
+
+## Network security
+
+### HTTPS only — iOS App Transport Security
+
+ATS blocks cleartext HTTP and weak TLS by default. The React Native template keeps ATS on and only allows local networking (for Metro). Keep it that way:
+
+```xml title="ios/MyApp/Info.plist (excerpt)"
+<key>NSAppTransportSecurity</key>
+<dict>
+    <key>NSAllowsArbitraryLoads</key>
+    <false/>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+</dict>
+```
+
+> [!CAUTION]
+> `NSAllowsArbitraryLoads = true` disables ATS for the whole app and must be justified in App Review. If one legacy host truly needs HTTP, add a narrow `NSExceptionDomains` entry for that host only — and plan to remove it.
+
+In Expo, set the same keys under `ios.infoPlist.NSAppTransportSecurity` in `app.json`.
+
+### HTTPS only — Android network security config
+
+Since Android 9 cleartext is disabled by default for apps targeting API 28+, but an explicit config documents intent and lets you add pinning and debug-only overrides. The RN template toggles `android:usesCleartextTraffic` per build type; once you add a `networkSecurityConfig`, that attribute is ignored, so you must allow Metro's cleartext traffic in a **debug-only** config:
+
+```xml title="android/app/src/main/res/xml/network_security_config.xml"
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
+```
+
+```xml title="android/app/src/debug/res/xml/network_security_config.xml"
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="user" />
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>
+```
+
+```xml title="android/app/src/main/AndroidManifest.xml (excerpt)"
+<application
+    android:name=".MainApplication"
+    android:networkSecurityConfig="@xml/network_security_config"
+    android:allowBackup="false"
+    ...>
+```
+
+`debug-overrides` trusts user-installed CAs (your proxy's) only in debuggable builds, so release builds reject a proxy CA installed by the user. In Expo, apply the manifest attribute and copy the XML files with a small config plugin (`withAndroidManifest` + `withDangerousMod`), or a maintained community plugin.
+
+### Certificate and public-key pinning
+
+TLS validation asks "is this certificate chain signed by *any* CA the OS trusts?" Pinning adds "…and does it contain a key *I* expect?". It defends against mis-issued certificates, compromised or coerced CAs, and — most commonly in practice — users or malware installing a custom root CA to inspect your traffic.
+
+**Pin the public key (SPKI), not the certificate.** A certificate is re-issued on every renewal; if the server keeps its key pair (or you pin an intermediate CA key), the SPKI hash stays valid across renewals.
+
+| Pin target | Survives leaf renewal | Risk |
+|---|---|---|
+| Leaf SPKI | Only if the key pair is reused | Breaks when ops rotate keys or a CDN changes certs |
+| Intermediate CA SPKI | Yes | Breaks if the CA changes intermediates (it happens) |
+| Root CA SPKI | Yes | Weakest protection — any cert from that CA passes |
+| Whole certificate | No | Breaks every renewal — avoid |
+
+```mermaid
+flowchart TD
+    Req(["App opens HTTPS connection to api.example.com"]) --> Hs["TLS handshake:<br/>server presents certificate chain"]
+    Hs --> Sys{"Chain valid against<br/>OS trust store?"}
+    Sys -->|"no"| Fail["Abort: TLS error"]
+    Sys -->|"yes"| Hash["SHA-256 of each cert's SPKI,<br/>base64-encoded"]
+    Hash --> Match{"Any hash in the pin set<br/>for this host?"}
+    Match -->|"yes"| Ok["Send request"]
+    Match -->|"no"| Block["Abort connection"]
+    Block --> Report["Emit pin-failure event<br/>to analytics"]
+    Report --> UX["Show network error<br/>or update prompt"]
+```
+*Figure: Public-key pinning decision on each new TLS connection.*
+
+#### Getting the SPKI hash
+
+```bash
+openssl s_client -servername api.example.com -connect api.example.com:443 </dev/null 2>/dev/null \
+  | openssl x509 -pubkey -noout \
+  | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary \
+  | openssl enc -base64
+```
+
+For a **backup pin**, generate a spare key pair (or CSR) now, store it offline, and pin its SPKI hash in addition to the live key. Alternatively pin intermediates from two different CAs.
+
+#### Option A — react-native-ssl-public-key-pinning (recommended for most apps)
+
+One JS configuration pins traffic that goes through React Native's networking layer (`fetch`, `XMLHttpRequest`, axios) on both platforms, using TrustKit on iOS and OkHttp's `CertificatePinner` on Android. It works in Expo with a development build.
+
+```ts title="src/security/pinning.ts"
+import {
+  addSslPinningErrorListener,
+  initializeSslPinning,
+  isSslPinningAvailable,
+} from 'react-native-ssl-public-key-pinning';
+import { track } from '../monitoring/analytics';
+
+export async function setupPinning(): Promise<void> {
+  if (!isSslPinningAvailable()) return; // e.g. Expo Go or unsupported environment
+  await initializeSslPinning({
+    'api.example.com': {
+      includeSubdomains: true,
+      publicKeyHashes: [
+        'CURRENT_KEY_SPKI_SHA256_BASE64=', // current key
+        'BACKUP_KEY_SPKI_SHA256_BASE64=', // backup key (offline)
+      ],
+    },
+  });
+  addSslPinningErrorListener((error) => {
+    track('ssl_pinning_failure', { host: error.serverHostname });
+  });
+}
+```
+
+Call `setupPinning()` before the first API request (at the top of your bootstrap). iOS/TrustKit **requires at least two hashes** per domain — a deliberate nudge towards backup pins.
+
+> [!WARNING]
+> Library pinning only covers traffic through RN's networking stack. Native SDKs with their own HTTP clients (analytics, crash reporting, some image loaders) and WebViews are **not** pinned. Decide consciously which hosts need pinning — usually just your own API and auth domains.
+
+#### Option B — native configuration
+
+**Android, declarative** (applies to all app traffic that uses the platform TLS stack, including OkHttp):
+
+```xml title="android/app/src/main/res/xml/network_security_config.xml"
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config>
+        <domain includeSubdomains="true">api.example.com</domain>
+        <pin-set expiration="2027-06-30">
+            <pin digest="SHA-256">CURRENT_KEY_SPKI_SHA256_BASE64=</pin>
+            <pin digest="SHA-256">BACKUP_KEY_SPKI_SHA256_BASE64=</pin>
+        </pin-set>
+    </domain-config>
+</network-security-config>
+```
+
+After `expiration`, pins are no longer enforced — a fail-open safety net for users who never update.
+
+**Android, programmatic** via React Native's OkHttp factory:
+
+```kotlin title="android/app/src/main/java/com/example/app/PinnedOkHttpFactory.kt"
+package com.example.app
+
+import com.facebook.react.modules.network.OkHttpClientFactory
+import com.facebook.react.modules.network.OkHttpClientProvider
+import okhttp3.CertificatePinner
+import okhttp3.OkHttpClient
+
+class PinnedOkHttpFactory : OkHttpClientFactory {
+    override fun createNewNetworkModuleClient(): OkHttpClient {
+        val pinner = CertificatePinner.Builder()
+            .add("api.example.com", "sha256/CURRENT_KEY_SPKI_SHA256_BASE64=")
+            .add("api.example.com", "sha256/BACKUP_KEY_SPKI_SHA256_BASE64=")
+            .build()
+        return OkHttpClientProvider.createClientBuilder()
+            .certificatePinner(pinner)
+            .build()
+    }
+}
+```
+
+```kotlin title="android/app/src/main/java/com/example/app/MainApplication.kt (excerpt)"
+override fun onCreate() {
+    super.onCreate()
+    OkHttpClientProvider.setOkHttpClientFactory(PinnedOkHttpFactory())
+    // ... existing loadReactNative / SoLoader setup
+}
+```
+
+**iOS, declarative** — ATS supports pinning via `NSPinnedDomains` (iOS 14+), no library needed:
+
+```xml title="ios/MyApp/Info.plist (excerpt)"
+<key>NSAppTransportSecurity</key>
+<dict>
+    <key>NSPinnedDomains</key>
+    <dict>
+        <key>api.example.com</key>
+        <dict>
+            <key>NSIncludesSubdomains</key>
+            <true/>
+            <key>NSPinnedLeafIdentities</key>
+            <array>
+                <dict>
+                    <key>SPKI-SHA256-BASE64</key>
+                    <string>CURRENT_KEY_SPKI_SHA256_BASE64=</string>
+                </dict>
+                <dict>
+                    <key>SPKI-SHA256-BASE64</key>
+                    <string>BACKUP_KEY_SPKI_SHA256_BASE64=</string>
+                </dict>
+            </array>
+        </dict>
+    </dict>
+</dict>
+```
+
+Use `NSPinnedCAIdentities` instead to pin intermediate/root keys. TrustKit (used by the library) adds reporting and expiration on top.
+
+#### Rotation plan — pinning's real cost
+
+A wrong pin **bricks every installed copy** of the app until users update — and if your force-update check goes through the pinned API, they will never see the prompt. Before shipping pinning, agree a runbook with the backend/ops team:
+
+1. Ship **at least two pins**: the live key and an offline backup key (or two CA intermediates).
+2. Monitor pin failures (`ssl_pinning_failure` events) per app version and host — a spike means a proxy population, an attack, or an ops change.
+3. To rotate: release an app version that adds the *new* pin, wait until adoption is high (enforce a minimum version), then rotate the server key, then remove the old pin in a later release.
+4. Make sure certificate automation (Let's Encrypt, cloud load balancers, CDNs) is configured to **reuse the key** or that you pinned the CA level instead — auto-renewal with a new key is the classic outage.
+5. Keep the minimum-version / force-update endpoint reachable (e.g. on a host you do not pin), so a bad pin can still be recovered from.
+6. Consider an Android `pin-set expiration` so very old installs fail open rather than dying.
+
+> [!INTERVIEW]
+> Pinning questions test judgement more than syntax. A senior answer: pin SPKI hashes with backups, only on your own hosts, with monitoring and a rotation runbook — and acknowledges pinning is bypassable on a rooted device with Frida/objection, so it protects *users* from MITM rather than protecting your API from the device owner.
+
+### Testing MITM with a proxy
+
+Use Proxyman, Charles, mitmproxy or Burp to verify your network posture:
+
+```bash
+# Android emulator: route traffic through a proxy on the host machine
+adb shell settings put global http_proxy 10.0.2.2:8888
+# ...install the proxy CA as a user certificate in the emulator settings...
+# remove the proxy afterwards
+adb shell settings put global http_proxy :0
+```
+
+On iOS, install the proxy's CA profile on the device/simulator and enable it under *Settings → General → About → Certificate Trust Settings* (Proxyman can install it into simulators automatically).
+
+| Test | Expected result |
+|---|---|
+| Debug build + proxy CA (user store) | Traffic visible (thanks to `debug-overrides`) |
+| Android release build + proxy CA (user store) | TLS fails — release builds do not trust user CAs |
+| iOS release build + trusted proxy CA, no pinning | Traffic visible — iOS honours user-trusted profiles |
+| Any release build with pinning + proxy | TLS fails on pinned hosts; pin-failure event reported |
+| `http://` request to your API | Blocked by ATS / cleartext policy |
+| Tokens in URLs or query strings | None — tokens only in `Authorization` headers |
+
+## Code protection and anti-tamper
+
+Code protection raises the **cost** of reverse engineering and tampering. It never makes client code secret or trustworthy. Spend here in proportion to what an attacker gains (a banking or gaming app vs. a recipe app).
+
+### R8 / ProGuard on Android
+
+R8 shrinks, optimises and obfuscates Java/Kotlin bytecode and removes unused resources. It does nothing for the JS bundle, but it makes native modules and SDK glue harder to read and the APK smaller.
+
+```gradle title="android/app/build.gradle (excerpt)"
+def enableProguardInReleaseBuilds = true
+
+android {
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled enableProguardInReleaseBuilds
+            shrinkResources enableProguardInReleaseBuilds
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+}
+```
+
+- Add `-keep` rules for libraries that use reflection (most RN libraries ship consumer rules; check each crash in a release build).
+- Upload `app/build/outputs/mapping/release/mapping.txt` to Play Console and your crash reporter (Sentry/Crashlytics) or stack traces become unreadable.
+- Expo: enable minify/shrink in release via `expo-build-properties` (the Android minify/shrink flags) and rebuild with EAS.
+
+### Hermes bytecode and JS obfuscation
+
+Hermes precompiles JS to bytecode for faster startup — a *performance* feature. It hides nothing meaningful: strings, API paths and logic are recoverable with public disassemblers.
+
+| Approach | Protection gained | Costs |
+|---|---|---|
+| Hermes bytecode only | Casual `cat` of the bundle no longer shows source | None — you have it by default |
+| JS obfuscation (e.g. javascript-obfuscator via a Metro plugin) | Slows manual analysis; string encoding hides literals | Larger bundle, slower startup and runtime, harder crash symbolication, occasional breakage with Hermes and minified source maps |
+| Moving sensitive logic to native (C/C++) | Somewhat harder to read than JS | Still decompilable/hookable; maintenance cost |
+| Moving sensitive logic to the server | Real protection | Latency, backend work — **the correct answer for secrets and business rules** |
+
+My recommendation: rely on Hermes + R8 + server-side logic, and add JS obfuscation only if a threat model (e.g. anti-cheat, licensing) justifies the performance and debuggability cost.
+
+### RASP and tamper signals
+
+Runtime Application Self-Protection libraries detect hostile environments at runtime: root/jailbreak, hooking frameworks (Frida, Xposed), debuggers, emulators, repackaged/re-signed binaries, installs from unofficial stores. **freeRASP** (by Talsec) is a widely used free option with an RN SDK:
+
+```tsx title="src/security/SecuritySignals.tsx"
+import { useFreeRasp } from 'freerasp-react-native';
+import { reportRiskSignal } from './riskSignals';
+
+const config = {
+  androidConfig: {
+    packageName: 'com.example.app',
+    certificateHashes: ['BASE64_SHA256_OF_PLAY_APP_SIGNING_CERT='],
+  },
+  iosConfig: {
+    appBundleId: 'com.example.app',
+    appTeamId: 'ABCDE12345',
+  },
+  watcherMail: 'security@example.com',
+  isProd: !__DEV__,
+};
+
+const actions = {
+  privilegedAccess: () => reportRiskSignal('root_or_jailbreak'),
+  debug: () => reportRiskSignal('debugger_attached'),
+  simulator: () => reportRiskSignal('simulator'),
+  appIntegrity: () => reportRiskSignal('binary_tampered'),
+  unofficialStore: () => reportRiskSignal('unofficial_store'),
+  hooks: () => reportRiskSignal('hooking_framework'),
+  deviceBinding: () => reportRiskSignal('device_binding_changed'),
+  passcode: () => reportRiskSignal('no_device_passcode'),
+  secureHardwareNotAvailable: () => reportRiskSignal('no_secure_hardware'),
+  obfuscationIssues: () => reportRiskSignal('not_obfuscated'),
+  devMode: () => reportRiskSignal('developer_mode'),
+};
+
+export function SecuritySignals() {
+  useFreeRasp(config, actions);
+  return null;
+}
+```
+
+Check the current freeRASP docs for the exact callback list and its data-collection terms (threat reports are sent to the vendor by default — disclose that in your privacy labels).
+
+### Root and jailbreak detection
+
+`jail-monkey` offers simple checks (known files, writable system paths, su binaries, mock location, hooks on Android):
+
+```ts title="src/security/deviceSignals.ts"
+import JailMonkey from 'jail-monkey';
+
+export type DeviceSignals = {
+  jailbrokenOrRooted: boolean;
+  canMockLocation: boolean;
+  hookDetected: boolean;
+  debuggerAttached: boolean;
+};
+
+export async function collectDeviceSignals(): Promise<DeviceSignals> {
+  return {
+    jailbrokenOrRooted: JailMonkey.isJailBroken(),
+    canMockLocation: JailMonkey.canMockLocation(),
+    hookDetected: JailMonkey.hookDetected(), // Android-focused check
+    debuggerAttached: await JailMonkey.isDebuggedMode(),
+  };
+}
+```
+
+Treat these as **risk signals, not guarantees**:
+
+- Every client-side check is a function returning a boolean — Frida or objection can make it return `false` in one line. Modern root hiding (Magisk DenyList, Zygisk modules) defeats file-based checks.
+- False positives are real (custom ROMs, developer devices, some OEM builds). Hard-blocking punishes legitimate users and generates one-star reviews.
+- Better policy: send signals to the backend, combine them with attestation verdicts and behaviour, and **degrade** high-risk features (payments, payouts, rewards) or require step-up authentication, instead of crashing the app.
+
+## Attestation — proving the request came from your genuine app
+
+Client-side checks can be patched; **attestation** moves the verdict to a party the attacker cannot patch — Google or Apple — and lets *your server* verify it. It answers: "Is this request from my unmodified app binary, installed from the store, on a genuine device?"
+
+| Service | Platform | What it attests | Notes |
+|---|---|---|---|
+| **Play Integrity API** | Android | App recognised by Play (unmodified, correct signing), device integrity level, Play licensing, optional environment signals | Replaced SafetyNet Attestation (fully shut down). *Standard* requests are low-latency with a `requestHash`; *classic* requests use a server nonce for rare high-value actions. Daily quotas apply — request increases before launch. |
+| **App Attest** (`DCAppAttestService`) | iOS 14+ | A key pair generated in the Secure Enclave belongs to a genuine instance of your app; subsequent assertions sign requests | Not available on simulators. Needs the App Attest entitlement (`development`/`production` environment). Server verifies the attestation against Apple's App Attestation root CA, then verifies assertions and counters. |
+| **DeviceCheck** (`DCDevice`) | iOS 11+ | Two bits of per-device state stored by Apple, surviving reinstall | Useful for "trial already used", "device previously banned". |
+| **Firebase App Check** | Both | Wraps Play Integrity and App Attest (with DeviceCheck fallback) into short-lived App Check tokens | Enforced natively for Firebase services; verify tokens on your own backend with the Admin SDK. Debug provider for emulators/CI. |
+
+```mermaid
+sequenceDiagram
+    participant App as RN App
+    participant OS as Play Integrity / App Attest
+    participant BE as Backend
+    participant V as Google / Apple
+    App->>BE: POST /attest/challenge
+    BE-->>App: nonce (single use, short TTL)
+    App->>OS: request token bound to nonce or requestHash
+    OS-->>App: signed integrity token or assertion
+    App->>BE: API request + token header
+    BE->>V: decode / verify token
+    Note over BE,V: Play Integrity is decoded by Google. App Attest is verified by the server against the Apple root CA.
+    V-->>BE: verdict for app, device, licence
+    alt verdict ok and nonce matches
+        BE-->>App: 200 allow
+    else missing, replayed or failed
+        BE-->>App: 403 or step-up challenge
+    end
+```
+*Figure: Attestation — the client obtains a platform-signed token, the backend verifies it and decides.*
+
+### Firebase App Check in React Native
+
+```ts title="src/security/appCheck.ts"
+import { getApp } from '@react-native-firebase/app';
+import {
+  getToken,
+  initializeAppCheck,
+  ReactNativeFirebaseAppCheckProvider,
+  type AppCheck,
+} from '@react-native-firebase/app-check';
+
+let appCheck: AppCheck | null = null;
+
+export async function initAppCheck(): Promise<void> {
+  const provider = new ReactNativeFirebaseAppCheckProvider();
+  provider.configure({
+    android: { provider: __DEV__ ? 'debug' : 'playIntegrity' },
+    apple: { provider: __DEV__ ? 'debug' : 'appAttestWithDeviceCheckFallback' },
+  });
+  appCheck = await initializeAppCheck(getApp(), { provider, isTokenAutoRefreshEnabled: true });
+}
+
+/** Attach to requests to your own backend. */
+export async function appCheckHeader(): Promise<Record<string, string>> {
+  if (!appCheck) return {};
+  const { token } = await getToken(appCheck, false);
+  return { 'X-Firebase-AppCheck': token };
+}
+```
+
+```ts title="server/middleware/requireAppCheck.ts"
+import type { NextFunction, Request, Response } from 'express';
+import { getAppCheck } from 'firebase-admin/app-check';
+
+export async function requireAppCheck(req: Request, res: Response, next: NextFunction) {
+  const token = req.header('X-Firebase-AppCheck');
+  if (!token) return res.status(401).json({ error: 'missing_app_check' });
+  try {
+    await getAppCheck().verifyToken(token);
+    next();
+  } catch {
+    res.status(401).json({ error: 'invalid_app_check' });
+  }
+}
+```
+
+For replay-sensitive endpoints, request a **limited-use token** on the client and verify it with `verifyToken(token, { consume: true })` so each token works once.
+
+### Rolling out attestation safely
+
+- Start in **monitor mode**: log verdicts server-side for weeks before enforcing. Measure how many legitimate users fail (old devices, custom ROMs, regions without Play Services, Huawei devices).
+- Enforce per endpoint, beginning with the most abusable (sign-up, OTP send, rewards, checkout).
+- Decide explicitly how to treat `UNEVALUATED`/unavailable verdicts: fail open with extra rate limiting, or fail closed with a support path.
+- Bind tokens to the request (nonce or `requestHash`) and reject replays — an unbound token can be harvested from one genuine device and replayed by a bot farm.
+- Device-integrity verdict semantics change over time (Google tightened them in 2025 with more hardware-backed signals on newer Android versions) — re-read the current verdict documentation when you design policy.
+
+## Biometrics done right
+
+There are two fundamentally different ways to "use Face ID", and interviewers love the distinction:
+
+| | Local gate | Keychain/Keystore-bound secret | Server-bound key (signature) |
+|---|---|---|---|
+| How | `LocalAuthentication.authenticateAsync()` returns `success: true` | Token stored with biometric access control; OS releases it only after a successful match | Private key in Secure Enclave / StrongBox; biometric required to sign a server challenge |
+| What an attacker with Frida does | Forces `success` to `true` — trivial bypass | Cannot decrypt the item without the OS-verified biometric (key use is enforced in secure hardware) | Cannot produce a valid signature without the key and a biometric match |
+| Server knows biometrics happened? | No | Indirectly (token was usable) | **Yes** — verifies signature over its own nonce |
+| Good for | Hiding content / "app lock" UX | Biometric unlock of an existing session | Passwordless login, step-up for payments or transfers |
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant App as RN App
+    participant KS as Secure Enclave / Keystore
+    participant BE as Backend
+    Note over App,BE: Enrolment, after a full login
+    App->>KS: create key pair, biometry required, non-exportable
+    KS-->>App: public key
+    App->>BE: register public key for this device
+    BE-->>App: keyId
+    Note over App,BE: Later, sign in or step-up
+    App->>BE: request challenge for keyId
+    BE-->>App: random nonce, short TTL
+    App->>KS: sign nonce
+    KS->>U: Face ID / fingerprint prompt
+    U-->>KS: match
+    KS-->>App: signature
+    App->>BE: keyId + signature
+    BE->>BE: verify with stored public key, mark nonce used
+    BE-->>App: session tokens or step-up grant
+```
+*Figure: Server-bound biometrics — the server verifies proof of possession and user presence instead of trusting a boolean.*
+
+```ts title="src/security/biometricKeys.ts"
+import { Platform } from 'react-native';
+import ReactNativeBiometrics from 'react-native-biometrics';
+import { api } from '../api/client';
+
+const biometrics = new ReactNativeBiometrics({ allowDeviceCredentials: false });
+
+export async function enrollBiometricKey(): Promise<void> {
+  const { available } = await biometrics.isSensorAvailable();
+  if (!available) throw new Error('biometrics_unavailable');
+  const { publicKey } = await biometrics.createKeys();
+  await api.post('/auth/biometric-keys', { publicKey, platform: Platform.OS });
+}
+
+export async function signChallenge(purpose: 'login' | 'payment'): Promise<string> {
+  const { data } = await api.post<{ challengeId: string; challenge: string }>(
+    '/auth/biometric-challenge',
+    { purpose },
+  );
+  const { success, signature } = await biometrics.createSignature({
+    promptMessage: purpose === 'login' ? 'Sign in' : 'Confirm payment',
+    payload: data.challenge,
+  });
+  if (!success || !signature) throw new Error('biometric_cancelled');
+  const res = await api.post<{ grant: string }>('/auth/biometric-verify', {
+    challengeId: data.challengeId,
+    signature,
+  });
+  return res.data.grant;
+}
+```
+
+Implementation notes:
+
+- The server verifies an RSA-SHA256 signature over the exact challenge string. The public-key encoding differs by platform in this library (normalise it at enrolment and test both), and check its maintenance status — a small custom module using `SecKeyCreateRandomKey` with `kSecAttrTokenIDSecureEnclave` (EC P-256) and Android `KeyGenParameterSpec` with `setUserAuthenticationRequired(true)` / `setIsStrongBoxBacked(true)` is a reasonable alternative.
+- Invalidate keys when biometric enrolment changes (`BiometryCurrentSet` on iOS, `setInvalidatedByBiometricEnrollment(true)` on Android) so someone who adds their own fingerprint cannot use your key; fall back to full login.
+- Always provide a non-biometric fallback (password/OTP) and handle "biometrics not enrolled", lockout after failed attempts, and user cancellation.
+
+For the session side of biometric unlock (storing the refresh token behind access control, step-up re-auth), see [Authentication & Sessions](authentication.html).
+
+## Data protection on the device
+
+### Hide sensitive screens in the app switcher
+
+The OS snapshots your UI for the app switcher (and Android allows screenshots/recording by default). Banking, health and messaging apps should hide sensitive content.
+
+**Android — `FLAG_SECURE`** blocks screenshots and screen recording and shows a blank thumbnail in Recents:
+
+```kotlin title="android/app/src/main/java/com/example/app/MainActivity.kt (excerpt)"
+import android.os.Bundle
+import android.view.WindowManager
+
+override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(null) // RN apps pass null (react-native-screens guidance)
+    window.setFlags(
+        WindowManager.LayoutParams.FLAG_SECURE,
+        WindowManager.LayoutParams.FLAG_SECURE,
+    )
+}
+```
+
+To protect only specific screens, toggle it at runtime — `expo-screen-capture` (usable in bare apps too) exposes `usePreventScreenCapture()`, which sets `FLAG_SECURE` on Android while the screen is mounted.
+
+**iOS — overlay on resign-active.** iOS has no `FLAG_SECURE`; you cover the UI when the app is about to be snapshotted. A JS overlay driven by `AppState` works for most apps:
+
+```tsx title="src/security/PrivacyShield.tsx"
+import { useEffect, useState } from 'react';
+import { AppState, Platform, StyleSheet } from 'react-native';
+import { BlurView } from 'expo-blur';
+
+export function PrivacyShield() {
+  const [obscured, setObscured] = useState(false);
+
+  useEffect(() => {
+    if (Platform.OS !== 'ios') return; // Android uses FLAG_SECURE
+    const sub = AppState.addEventListener('change', (state) => {
+      setObscured(state !== 'active'); // 'inactive' fires when the switcher opens
+    });
+    return () => sub.remove();
+  }, []);
+
+  if (!obscured) return null;
+  return <BlurView intensity={90} tint="systemMaterial" style={StyleSheet.absoluteFill} />;
+}
+```
+
+Because JS renders asynchronously, the snapshot can occasionally be taken before the overlay paints. For guaranteed coverage, add the view natively:
+
+```swift title="ios/MyApp/AppDelegate.swift (excerpt)"
+private var privacyView: UIView?
+
+func applicationWillResignActive(_ application: UIApplication) {
+  guard let window = window, privacyView == nil else { return }
+  let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemMaterial))
+  blur.frame = window.bounds
+  blur.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+  window.addSubview(blur)
+  privacyView = blur
+}
+
+func applicationDidBecomeActive(_ application: UIApplication) {
+  privacyView?.removeFromSuperview()
+  privacyView = nil
+}
+```
+
+Screenshots on iOS can be *detected* (`UIApplication.userDidTakeScreenshotNotification`, `addScreenshotListener` in expo-screen-capture) but not reliably prevented; Android 14+ also offers screenshot detection callbacks.
+
+### Clipboard and keyboard
+
+- Do not copy secrets to the clipboard. If users must copy an OTP secret or recovery code, clear it after ~60 seconds and mark it sensitive (Android 13+ `ClipDescription.EXTRA_IS_SENSITIVE` hides the preview).
+- Any app can read the clipboard when foregrounded (iOS shows a paste banner; Android 10+ restricts background reads). Never auto-read the clipboard yourself without a user action.
+- Use `secureTextEntry` for secrets — it disables copy, keyboard learning and, on iOS, third-party keyboards. For other sensitive fields (card, SSN) set `autoCorrect={false}`, `autoComplete="off"`, `spellCheck={false}`.
+
+### Strip logs in production
+
+React Native forwards `console.*` to **logcat** (`ReactNativeJS` tag) and the iOS system log even in release builds — anyone with a USB cable or a malicious logging SDK can read them.
+
+```js title="babel.config.js"
+module.exports = {
+  presets: ['module:@react-native/babel-preset'], // 'babel-preset-expo' in Expo apps
+  env: {
+    production: {
+      plugins: [['transform-remove-console', { exclude: ['error', 'warn'] }]],
+    },
+  },
+};
+```
+
+Install `babel-plugin-transform-remove-console` as a dev dependency. Also make network loggers (axios interceptors that print requests) `__DEV__`-only, and never log tokens, OTPs, full request bodies, or PII even in development builds you share with QA.
+
+### Scrub crash reports and analytics
+
+Crash reporters capture breadcrumbs, request URLs, headers, and sometimes screenshots or session replays. Configure scrubbing explicitly (see [Monitoring](monitoring.html)):
+
+```ts title="src/monitoring/sentry.ts"
+import * as Sentry from '@sentry/react-native';
+
+Sentry.init({
+  dsn: 'https://publicKey@o0.ingest.sentry.io/0', // DSNs are public identifiers
+  sendDefaultPii: false,
+  beforeSend(event) {
+    if (event.request?.headers) {
+      delete event.request.headers.Authorization;
+      delete event.request.headers.Cookie;
+    }
+    if (event.user) event.user = { id: event.user.id }; // no email, IP or name
+    return event;
+  },
+  beforeBreadcrumb(breadcrumb) {
+    if (breadcrumb.category === 'fetch' || breadcrumb.category === 'xhr') {
+      const url = String(breadcrumb.data?.url ?? '');
+      breadcrumb.data = { ...breadcrumb.data, url: url.split('?')[0] }; // drop query strings
+    }
+    return breadcrumb;
+  },
+});
+```
+
+If you use session replay, keep text and images masked by default and unmask selectively. Use opaque user IDs in analytics, never emails or phone numbers.
+
+### Backups
+
+Backups copy app data off the device — to Google Drive, iCloud, or a computer — where your in-app protections do not apply.
+
+**Android.** Either disable backup (`android:allowBackup="false"`) or exclude sensitive paths. Exclusion is **mandatory** for Keystore-encrypted data: Keystore keys are never backed up, so restored ciphertext cannot be decrypted and your library throws on first read.
+
+```xml title="android/app/src/main/res/xml/data_extraction_rules.xml"
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="mmkv/" />
+        <exclude domain="database" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="mmkv/" />
+        <exclude domain="database" path="." />
+    </device-transfer>
+</data-extraction-rules>
+```
+
+```xml title="android/app/src/main/AndroidManifest.xml (excerpt)"
+<application
+    android:allowBackup="true"
+    android:dataExtractionRules="@xml/data_extraction_rules"
+    android:fullBackupContent="@xml/backup_rules"
+    ...>
+```
+
+`dataExtractionRules` applies on Android 12+; `fullBackupContent` (a `full-backup-content` file with the same excludes) covers Android 11 and lower.
+
+**iOS.** Files are encrypted at rest with a **data protection class**. The default is `CompleteUntilFirstUserAuthentication`; setting the `com.apple.developer.default-data-protection` entitlement to `NSFileProtectionComplete` makes files unreadable while the device is locked — stronger, but it breaks background work that reads those files (background fetch, silent push handlers), so apply it deliberately. Put regenerable data in `Library/Caches` (not backed up) or mark files with `NSURLIsExcludedFromBackupKey`. Keychain items with `ThisDeviceOnly` classes never migrate to another device.
+
+### Temp files and caches
+
+Sensitive data leaks through places developers forget:
+
+- Camera captures, scanned IDs and generated PDFs written to the cache directory — delete them after upload.
+- Image disk caches holding private photos — clear on logout (for example `Image.clearDiskCache()` in expo-image).
+- WebView cookies, `localStorage` and HTTP cache — clear on logout, or use `incognito` WebViews for sensitive flows.
+- Files shared to other apps — use a `FileProvider` (Android) with temporary URI grants, never world-readable paths or external storage.
+
+### WebView hardening
+
+A WebView is a browser inside your app with a bridge to native code. Lock it down to the content you control:
+
+```tsx title="src/screens/HelpCenterScreen.tsx"
+import { useCallback } from 'react';
+import { Linking } from 'react-native';
+import { WebView, type WebViewMessageEvent } from 'react-native-webview';
+import type { ShouldStartLoadRequest } from 'react-native-webview/lib/WebViewTypes';
+
+const ORIGIN = 'https://help.example.com';
+const isOwnUrl = (url: string) => url === ORIGIN || url.startsWith(`${ORIGIN}/`);
+
+type HelpMessage = { type: 'close' } | { type: 'openTicket'; ticketId: string };
+
+function parseMessage(raw: string): HelpMessage | null {
+  try {
+    const msg = JSON.parse(raw) as Partial<HelpMessage> & { ticketId?: unknown };
+    if (msg.type === 'close') return { type: 'close' };
+    if (msg.type === 'openTicket' && typeof msg.ticketId === 'string' && /^[A-Z0-9-]{1,32}$/.test(msg.ticketId)) {
+      return { type: 'openTicket', ticketId: msg.ticketId };
+    }
+  } catch {
+    // ignore malformed payloads
+  }
+  return null;
+}
+
+export function HelpCenterScreen({ onClose, onOpenTicket }: {
+  onClose: () => void;
+  onOpenTicket: (id: string) => void;
+}) {
+  const onShouldStartLoadWithRequest = useCallback((req: ShouldStartLoadRequest) => {
+    if (isOwnUrl(req.url)) return true;
+    if (req.url.startsWith('https://')) void Linking.openURL(req.url); // external links leave the app
+    return false; // block javascript:, file:, intent:, custom schemes
+  }, []);
+
+  const onMessage = useCallback((event: WebViewMessageEvent) => {
+    if (!isOwnUrl(event.nativeEvent.url)) return; // only trust our own pages
+    const msg = parseMessage(event.nativeEvent.data);
+    if (msg?.type === 'close') onClose();
+    if (msg?.type === 'openTicket') onOpenTicket(msg.ticketId);
+  }, [onClose, onOpenTicket]);
+
+  return (
+    <WebView
+      source={{ uri: `${ORIGIN}/app` }}
+      originWhitelist={['https://*']}
+      onShouldStartLoadWithRequest={onShouldStartLoadWithRequest}
+      onMessage={onMessage}
+      allowFileAccess={false}
+      allowFileAccessFromFileURLs={false}
+      allowUniversalAccessFromFileURLs={false}
+      mixedContentMode="never"
+      setSupportMultipleWindows={false}
+      webviewDebuggingEnabled={__DEV__}
+    />
+  );
+}
+```
+
+- Never inject access tokens into pages you do not fully control; prefer a short-lived, single-purpose session exchanged server-side.
+- Expose a small, typed message protocol — never a generic "call any native function" bridge.
+- React Native's built-in `URL` implementation is minimal (several properties are unimplemented), which is why the example uses strict prefix checks with a trailing slash; add `react-native-url-polyfill` if you need full URL parsing.
+
+### Deep links, URL schemes and exported components
+
+Deep links are **untrusted input from other apps and websites**:
+
+```ts title="src/navigation/parseDeepLink.ts"
+type DeepLinkTarget =
+  | { screen: 'Product'; params: { id: string } }
+  | { screen: 'Order'; params: { id: string } }
+  | { screen: 'ResetPassword'; params: { token: string } };
+
+const ID = /^[a-zA-Z0-9_-]{1,64}$/;
+const HOSTS = ['https://example.com/', 'myapp://'];
+
+export function parseDeepLink(url: string): DeepLinkTarget | null {
+  const prefix = HOSTS.find((h) => url.startsWith(h));
+  if (!prefix) return null;
+  const [path, query = ''] = url.slice(prefix.length).split('?');
+  const [section, value] = path.split('/');
+  const params = new Map(query.split('&').filter(Boolean).map((kv) => {
+    const [k, v = ''] = kv.split('=');
+    return [decodeURIComponent(k), decodeURIComponent(v)] as const;
+  }));
+
+  if (section === 'product' && value && ID.test(value)) return { screen: 'Product', params: { id: value } };
+  if (section === 'order' && value && ID.test(value)) return { screen: 'Order', params: { id: value } };
+  const token = params.get('token');
+  if (section === 'reset-password' && token && ID.test(token)) {
+    return { screen: 'ResetPassword', params: { token } };
+  }
+  return null; // unknown or malformed: go to home, never guess
+}
+```
+
+- **Never perform state-changing actions directly from a link** (`myapp://transfer?to=…&amount=…`). Navigate to a screen that shows details, requires authentication, and asks for confirmation.
+- Do not forward link parameters into WebView URLs or redirects without allow-listing (open redirect / phishing).
+- **Custom URL schemes can be claimed by any app.** On iOS the winner is undefined; on Android a malicious app can appear in the chooser. Use **Universal Links / App Links** (domain-verified) for magic links, password resets, and payment returns — see [Deep Linking & Universal Links](deep-linking.html). OAuth redirects on custom schemes must use PKCE.
+- **Android components:** since Android 12, any activity/service/receiver with an intent filter must declare `android:exported` explicitly. Set `android:exported="false"` for everything not meant for other apps, and inspect the **merged manifest** (Android Studio → Merged Manifest, or `android/app/build/intermediates/merged_manifests/`) because libraries add components too.
+
+## Supply chain security
+
+A typical RN app pulls in 1,000+ npm packages plus CocoaPods and Gradle artifacts, and many RN libraries ship **native code that runs with your app's full permissions**. 2025 saw several high-profile npm compromises (phished maintainer accounts publishing malicious versions of very popular packages, and a self-propagating worm that stole tokens from developer machines and CI), so this is no longer theoretical.
+
+| Control | How |
+|---|---|
+| Reproducible installs | Commit `package-lock.json` / `yarn.lock` / `pnpm-lock.yaml`, `Podfile.lock` and the Gradle wrapper; use `npm ci`, `yarn install --immutable` or `pnpm install --frozen-lockfile` in CI. |
+| Known vulnerabilities | `npm audit --omit=dev --audit-level=high` (or the Yarn/pnpm equivalent) in CI; triage rather than blindly `audit fix --force`. Use `overrides`/`resolutions` for transitive fixes. |
+| Malicious packages | Socket or Snyk on every PR — flags new install scripts, obfuscated code, network/file access, typosquats, maintainer changes. |
+| Install scripts | Review `postinstall` scripts of new deps; pnpm 10 does not run dependency lifecycle scripts unless allow-listed (`onlyBuiltDependencies`) — a sane default to copy. |
+| Native code review | Before adding a library, skim its `ios/`, `android/`, podspec (`script_phases`), and Gradle plugins; prefer maintained libraries with many users. |
+| Update cadence | Renovate or Dependabot with grouped PRs and a **minimum release age** (e.g. 3–7 days) so freshly published — possibly compromised — versions are not auto-adopted. |
+| Secrets in the repo | gitleaks/trufflehog or GitHub secret scanning in CI; signing keys and store credentials in the CI secret store (EAS secrets, GitHub Actions secrets), never in the repo. |
+| Build integrity | Protected branches, required reviews, least-privilege CI tokens, pinned versions of CI actions. See [Deployment, Signing & CI/CD](deployment.html). |
+
+```json title="renovate.json"
+{
+  "extends": ["config:recommended"],
+  "minimumReleaseAge": "5 days",
+  "packageRules": [
+    { "matchPackagePatterns": ["^@react-native", "^react-native$"], "groupName": "react-native core" },
+    { "matchDepTypes": ["devDependencies"], "matchUpdateTypes": ["patch"], "automerge": true }
+  ]
+}
+```
+
+## Privacy compliance
+
+Privacy is a MASVS category and a store-review gate, not just legal text.
+
+- **Data minimisation.** Collect only what a feature needs (approximate location instead of precise, age range instead of birth date), set retention periods, and delete data on account deletion.
+- **Consent before collection.** In GDPR/CCPA regions, initialise analytics/ads SDKs only after consent (Google's UMP SDK for ads). Many SDKs start collecting on `init`, so gate the `init` call, not just events.
+- **App Tracking Transparency (iOS).** Cross-app tracking (IDFA, sharing data with data brokers or ad networks for targeting) requires the ATT prompt (`NSUserTrackingUsageDescription`; `expo-tracking-transparency` or `react-native-tracking-transparency`). Do not gate features or offer rewards for allowing tracking.
+- **Apple privacy manifests.** `PrivacyInfo.xcprivacy` declares tracking domains, collected data types, and reasons for "required reason" APIs (UserDefaults, file timestamps, system boot time, disk space). RN core and major SDKs ship their own; your app manifest must cover your code. Generate Xcode's privacy report from an archive to review the aggregate.
+- **Google Play Data safety.** The form must reflect every SDK's collection and sharing — mismatches are a common rejection/removal reason.
+- **Account deletion.** Both stores require in-app account deletion for apps with account creation (Google Play also requires a web deletion link). See [Authentication & Sessions](authentication.html).
+
+```json title="app.json (excerpt) — Expo privacy manifest"
+{
+  "expo": {
+    "ios": {
+      "privacyManifests": {
+        "NSPrivacyTracking": false,
+        "NSPrivacyAccessedAPITypes": [
+          {
+            "NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryUserDefaults",
+            "NSPrivacyAccessedAPITypeReasons": ["CA92.1"]
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+> [!NOTE]
+> Store privacy requirements change every year. Verify the current App Store Review Guidelines (§5.1), Apple's privacy manifest documentation, and Google Play's User Data policy before each major release.
+
+## Testing & debugging
+
+### Static and dynamic analysis
+
+```bash
+# MobSF: static analysis of an APK/AAB/IPA (manifest, exported components,
+# cleartext, hardcoded secrets, weak crypto, binary protections)
+docker run -it --rm -p 8000:8000 opensecurity/mobile-security-framework-mobsf:latest
+
+# Frida / objection against YOUR OWN build on a rooted emulator or jailbroken test device
+frida-ps -Uai                                   # list installed apps
+objection -g com.example.app explore            # attach an interactive session
+# inside objection:
+#   android sslpinning disable   |  ios sslpinning disable
+#   android root disable         |  ios jailbreak disable
+#   ios keychain dump            |  env   (then inspect data directories)
+```
+
+Running these against your own app is eye-opening: in minutes you will see pinning disabled, root checks bypassed, and every Keychain item your app stores. That is the point — it shows which controls protect the *user* and which were only ever speed bumps for the *device owner*.
+
+**OWASP MASTG** provides test cases for every MASVS control; use its checklist as the backbone of internal reviews and vendor pentests.
+
+### Pentest checklist
+
+| Area | Check |
+|---|---|
+| Binary | No secrets via `strings`/decompiled bundle; R8 enabled; debuggable flag off; no test endpoints or feature flags exposing admin features |
+| Storage | Sandbox files, MMKV, SQLite, caches and logs contain no tokens or unencrypted PII; Keychain items use `ThisDeviceOnly` classes |
+| Network | TLS only, pinning on critical hosts, no tokens in URLs, server rejects expired/revoked tokens |
+| Auth | Refresh rotation and reuse detection, logout revokes server-side, rate limiting and lockout, biometric bypass attempts fail server-side |
+| Platform | Exported components, deep link fuzzing, WebView origin checks, custom scheme hijack of OAuth redirect |
+| Resilience | Attestation enforced on sensitive endpoints; RASP signals reach the backend |
+| Privacy | Screens hidden in app switcher, no PII in crash reports/analytics, backup exclusions verified |
+
+## Edge cases & gotchas
+
+- **Storage lifecycle quirks** — iOS Keychain survives reinstall, Android Keystore keys do not survive backup/restore, `WhenUnlocked*` items are unreadable while locked, and biometric enrolment changes invalidate bound keys. Design the launch path so every one of these degrades to "signed out", never to a crash (details in Troubleshooting).
+- **Pinning and corporate proxies** — enterprise users behind TLS-inspecting proxies will fail pinned connections; decide whether that is acceptable for your audience.
+- **Attestation on non-Play devices** (Huawei, some regions, sideloaded enterprise builds) — needs an explicit policy.
+- **OTA updates change JS, not native protections** — pins in native config (`network_security_config`, `NSPinnedDomains`) need a store release to change, while pins set from JS can be corrected with an OTA update (the updater downloads through its own native client, not the pinned RN networking layer — verify this for your setup). See [OTA Updates](ota-updates.html).
+- **`__DEV__` builds leak more** (dev menu, debugger, verbose logs) — never distribute debug builds outside the team.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| All API calls fail after a server certificate renewal | New key pair or new intermediate not in the pin set | Roll back the server cert/key, ship backup pins, pin CA-level or reuse keys on renewal; monitor pin-failure events |
+| Pinning works on Android but not iOS (or vice versa) | Different config paths (TrustKit vs OkHttp), missing second hash on iOS, subdomain flag | Use one JS config; verify `includeSubdomains`; test both platforms with a proxy |
+| Keychain returns nothing after restoring to a new iPhone | `ThisDeviceOnly` items are not migrated | Expected — treat as signed out and show login |
+| iOS app is "already logged in" after reinstall | Keychain survives uninstall | Clear Keychain on first launch (flag in app container) |
+| Android `KeyPermanentlyInvalidatedException` / decryption errors on launch | Biometric enrolment changed, or backup restored ciphertext without its Keystore key | Catch, reset the entry, require login; exclude secure storage from backups |
+| Random logouts from background tasks (iOS) | `WhenUnlocked*` item read while the device is locked (`-25308`) | Use `AfterFirstUnlockThisDeviceOnly` for tokens needed in the background |
+| Metro cannot connect after adding a network security config | Config overrides `usesCleartextTraffic` | Add a debug-only config allowing cleartext to `localhost` and `10.0.2.2` |
+| Proxy shows no traffic from an Android release build | Release builds ignore user-installed CAs (by design) | Use a debug build with `debug-overrides` for inspection |
+| Play Integrity / App Check fails on emulators or CI | No genuine device / not installed from Play | Use the debug provider with registered debug tokens; install via an internal testing track |
+| App Attest errors in development | Simulator unsupported, or entitlement environment mismatch | Test on a device; use the `development` environment for dev builds |
+| Release-only crash (`ClassNotFoundException`) after enabling R8 | Reflection-used classes stripped | Add `-keep` rules; run release builds in CI and smoke-test them |
+| Google Maps key "not authorized" only in the Play build | Play App Signing key's SHA-1 missing from key restrictions | Add the Play signing SHA-1 from Play Console → App integrity |
+| `console.log` output visible in release logcat | `transform-remove-console` not applied | Ensure it is under `env.production`, then rebuild with `--reset-cache` |
+
+## Production checklist
+
+- [ ] Threat model written: assets, actors, trust boundaries, MASVS categories in scope
+- [ ] No secrets in the JS bundle, native code, `.env` or `EXPO_PUBLIC_*`; third-party secret APIs proxied through the backend
+- [ ] Public keys restricted (package + SHA-1 incl. Play signing key, bundle ID, API scope) with quotas and alerts
+- [ ] Tokens and keys in Keychain/Keystore with `ThisDeviceOnly` classes; nothing sensitive in AsyncStorage
+- [ ] Sensitive caches encrypted (MMKV/SQLCipher) with a Keychain-stored key
+- [ ] Logout and account deletion wipe Keychain, storage, caches, files and query cache
+- [ ] iOS Keychain cleared on first launch after reinstall
+- [ ] ATS on, no `NSAllowsArbitraryLoads`; Android cleartext disabled with debug-only overrides
+- [ ] Pinning (if used) has backup pins, monitoring and a rotation runbook agreed with ops
+- [ ] R8 enabled with mapping files uploaded; release builds smoke-tested
+- [ ] Attestation (Play Integrity / App Attest / App Check) verified server-side on abusable endpoints, rolled out via monitor mode
+- [ ] Root/jailbreak/RASP signals feed server-side risk decisions, not hard crashes
+- [ ] Biometrics use Keychain access control or server-verified signatures, never a bare boolean
+- [ ] Sensitive screens hidden in app switcher (FLAG_SECURE / iOS overlay)
+- [ ] Console logs stripped in production; crash reports and analytics scrubbed of tokens and PII
+- [ ] Backup rules exclude secure storage (Android); iOS file protection chosen deliberately
+- [ ] WebViews restricted to own origins with validated, typed messages
+- [ ] Deep links validated; sensitive links use Universal/App Links; `android:exported` explicit
+- [ ] Dependency scanning, lockfiles, minimum release age and secret scanning in CI
+- [ ] Privacy manifest, ATT (if tracking), Play Data safety and consent flows reviewed
+- [ ] MobSF scan and MASTG-based review (or external pentest) before major releases
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [React Native — Security](https://reactnative.dev/docs/security)
+- [OWASP MASVS](https://mas.owasp.org/MASVS/)
+- [OWASP Mobile Top 10](https://owasp.org/www-project-mobile-top-10/)
+- [Play Integrity API](https://developer.android.com/google/play/integrity)
+- [Apple — DeviceCheck & App Attest](https://developer.apple.com/documentation/devicecheck)
+- [react-native-keychain](https://github.com/oblador/react-native-keychain)
+
+## Interview questions
+
+### Where would you store an API key for a third-party service in a React Native app?
+
+**Short answer:** If it is a secret, not in the app at all. Anything in the bundle or binary — `.env` via react-native-config, `EXPO_PUBLIC_*`, native constants, even obfuscated strings — can be extracted from the APK/IPA, and Hermes bytecode can be disassembled.
+
+Secret keys stay on the backend; the app calls your own authenticated, rate-limited endpoint that proxies the third party. Keys that are public by design (Maps SDK, Firebase config, Stripe publishable, Sentry DSN) ship in the app but are restricted — Android package + SHA-1 of every signing cert including the Play App Signing key, iOS bundle ID, API scopes, quotas — and backed by server-side rules (Firebase Security Rules, App Check). Mention that platform restrictions rely on spoofable headers, so they reduce abuse rather than prevent it.
+
+### How do you store authentication tokens securely, and why not AsyncStorage?
+
+**Short answer:** In the iOS Keychain and Android Keystore-backed storage via react-native-keychain or expo-secure-store, using a `ThisDeviceOnly` accessibility class. AsyncStorage is unencrypted files in the sandbox — readable on rooted devices, in backups, and by forensic tools.
+
+Choose `AfterFirstUnlockThisDeviceOnly` if background tasks need the token, `WhenUnlockedThisDeviceOnly` otherwise; optionally add biometric access control. Keep access tokens short-lived and mostly in memory. Handle platform quirks: iOS Keychain survives reinstall (clear on first launch), Android Keystore keys are not backed up (exclude ciphertext from backup, catch decryption errors). Larger sensitive data goes into encrypted MMKV or SQLCipher with the key in the Keychain.
+
+### What is certificate pinning, what are its risks, and how do you rotate pins?
+
+**Short answer:** Pinning makes the app accept a TLS connection only if the server's chain contains an expected public key (SPKI hash), defending against rogue or user-installed CAs. The main risk is self-inflicted: a wrong pin bricks every installed app until users update.
+
+Pin SPKI hashes (not certificates) for your own hosts only, always with a backup pin (offline key or second CA). Implement with react-native-ssl-public-key-pinning or natively (OkHttp `CertificatePinner` / `network_security_config` pin-set, TrustKit / `NSPinnedDomains`). Rotation: add the new pin in a release, wait for adoption with minimum-version enforcement, rotate the server key, remove the old pin later. Monitor pin failures, keep the update-check endpoint reachable, and consider Android pin expiration. Acknowledge that Frida/objection bypass pinning on rooted devices — it protects users from MITM, not your API from the device owner.
+
+### Is root or jailbreak detection effective? How would you use it?
+
+**Short answer:** It is a useful risk signal but not a security boundary — every client check can be hooked or hidden (Frida, Magisk DenyList), and false positives hit legitimate users.
+
+Use jail-monkey or freeRASP to collect signals (root, hooks, debugger, tampering, unofficial store), send them to the backend, and combine them with attestation verdicts and behavioural data. Respond proportionally: extra rate limits, step-up authentication, or disabling high-risk features such as payouts — rather than crashing the app. Real protection for the business comes from server-side authorization and attestation.
+
+### How do Play Integrity and App Attest work, and how do you integrate them?
+
+**Short answer:** They let your backend verify that a request comes from your genuine, unmodified app on a genuine device. The app obtains a platform-signed token bound to a server nonce or request hash; the backend verifies it (Google decodes Play Integrity tokens; App Attest attestations are verified against Apple's root CA) and allows, limits or challenges the request.
+
+Integration: backend issues a single-use nonce → app requests the token (Play Integrity standard/classic request; App Attest `attestKey` once, then `generateAssertion` per request) → backend verifies signature, nonce, package/bundle, and verdict fields. Firebase App Check wraps both into short-lived tokens verifiable with the Admin SDK (limited-use tokens for replay protection). Roll out in monitor mode first, decide a policy for unavailable verdicts (non-Play devices, simulators), and mind quotas.
+
+### How do you implement biometric login securely?
+
+**Short answer:** Never trust a boolean from `authenticate()`. Either store the refresh token behind biometric access control so the OS only releases it after a match, or — stronger — create a key pair in the Secure Enclave/Keystore that requires biometrics to sign a server challenge, so the server verifies the proof.
+
+The local-gate approach is fine for "app lock" UX but trivially bypassed with Frida. Keychain access control (`BIOMETRY_CURRENT_SET`) is enforced by secure hardware. Signature-based flows give the server proof of possession plus user presence, ideal for passwordless login and step-up for payments. Invalidate keys on biometric enrolment changes, provide a password/OTP fallback, and handle lockout and cancellation.
+
+### How do you prevent sensitive data from leaking outside the app?
+
+**Short answer:** Cover each leak channel explicitly: app-switcher snapshots, screenshots, logs, crash reports, backups, clipboard, caches and WebView storage.
+
+`FLAG_SECURE` on Android and a blur overlay on resign-active on iOS; strip `console.*` in production with `transform-remove-console`; scrub `Authorization` headers, query strings and PII in Sentry `beforeSend`/`beforeBreadcrumb`; exclude secure storage from Android backups via data extraction rules and choose iOS file protection classes deliberately; avoid copying secrets to the clipboard; delete temp files after upload and clear image/WebView caches on logout. Maintaining a data inventory makes all of this — and privacy labels — manageable.
+
+### How would you secure a WebView that talks to native code?
+
+**Short answer:** Restrict it to origins you control, validate every message, and expose a minimal typed bridge.
+
+Use `onShouldStartLoadWithRequest` to allow only your origin (open other `https` links externally, block `file:`, `javascript:` and custom schemes), `originWhitelist={['https://*']}`, disable file access and universal access from file URLs, `mixedContentMode="never"`, no multiple windows, and debugging only in dev. In `onMessage`, check `nativeEvent.url` against your origin, parse JSON defensively and validate against a schema of allowed actions. Never inject long-lived tokens into web content; exchange a short-lived, scoped session server-side instead.
+
+### How do you manage supply-chain risk in a React Native project?
+
+**Short answer:** Treat dependencies as code you ship: lock them, scan them, review new ones — especially their native code and install scripts — and avoid auto-adopting brand-new versions.
+
+Commit lockfiles (npm/Yarn/pnpm, `Podfile.lock`) and use frozen installs in CI; run `npm audit` plus Socket/Snyk on PRs; use Renovate/Dependabot with a minimum release age and grouped updates; restrict lifecycle scripts (pnpm 10's allow-list model); skim podspecs and Gradle plugins of new native libraries; scan for committed secrets; lock down CI tokens and signing keys. Reference the 2025 npm account-takeover incidents as the reason these controls matter.
+
+### Walk me through a threat model for a fintech React Native app.
+
+**Short answer:** Identify assets (credentials, tokens, money movement, PII), actors (thief, device owner with root, network attacker, malicious apps, bots, compromised dependencies) and trust boundaries, then map controls to MASVS categories — with enforcement on the server.
+
+Concretely: short-lived access tokens and rotating device-bound refresh tokens in the Keychain; server-verified biometric signatures for transfers; attestation on login, OTP and transfer endpoints; pinning with backup pins; FLAG_SECURE and app-switcher overlay; no PII in logs or crash reports; backups excluded; Universal/App Links for sensitive links; RASP signals feeding a fraud engine; rate limiting and anomaly detection; dependency scanning; MASTG-based pentests each major release. Close by stating what the client cannot guarantee and how the backend compensates.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

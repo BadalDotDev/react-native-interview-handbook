@@ -1,0 +1,1016 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Background Tasks · React Native Interview Handbook</title>
+<meta name="description" content="What a React Native app can and cannot do while it isn&#x27;t on screen, which iOS and Android mechanism fits each job (silent push, BGTaskScheduler, WorkManager, foreground…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Background Tasks · React Native Interview Handbook">
+<meta property="og:description" content="What a React Native app can and cannot do while it isn&#x27;t on screen, which iOS and Android mechanism fits each job (silent push, BGTaskScheduler, WorkManager, foreground…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/background-tasks.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Background Tasks
+
+What a React Native app can and cannot do while it isn't on screen, which iOS and Android mechanism fits each job (silent push, BGTaskScheduler, WorkManager, foreground services, background transfers, audio, VoIP, Headless JS), and how to set up, implement and test them with Expo and bare React Native.
+
+## How it works
+
+### The reality check
+
+Mobile operating systems are designed to **suspend** your app shortly after the user leaves it. Background execution isn't a right; it's a set of narrow, declared, system-scheduled windows, each tied to a specific purpose. The OS decides *when* (and whether) you run based on battery, network, thermal state, how often the user opens your app, and user settings. The most common senior-interview mistake is promising "we'll sync every 5 minutes in the background"; neither platform offers that to ordinary apps.
+
+```mermaid
+stateDiagram-v2
+    state "Foreground (active)" as Active
+    state "Background (running briefly)" as Background
+    state "Suspended (in memory, no CPU)" as Suspended
+    state "Not running" as NotRunning
+    state "Force-quit by user (iOS - no wakeups)" as ForceQuit
+    [*] --> Active : user launches
+    Active --> Background : user leaves the app
+    Background --> Suspended : seconds later, or task finished
+    Suspended --> NotRunning : system reclaims memory
+    Suspended --> Background : wake event
+    NotRunning --> Background : system relaunch for task, push or transfer
+    Background --> Active : user returns
+    Suspended --> ForceQuit : swiped away in app switcher
+    ForceQuit --> Active : user opens the app again
+```
+*Figure: iOS app states. Android is similar in spirit (cached processes, process death), but Android's Force stop is a settings action; a normal swipe from Recents usually just kills the process.*
+
+| Aspect | iOS | Android |
+|---|---|---|
+| Default after leaving | Suspended within seconds | Process cached; killable any time; Doze when idle |
+| Scheduled work | `BGTaskScheduler`: app refresh (~30 s) and processing (minutes), fully opportunistic | `WorkManager` (on JobScheduler): constraints, retries, periodic minimum 15 min, ~10 min per run |
+| Server-triggered | Silent push (`content-available`), throttled, not delivered after force-quit | High-priority FCM data message, may start the process and briefly exempt it |
+| Long user-visible work | Background modes (audio, location, VoIP), background `URLSession`; iOS 26 adds `BGContinuedProcessingTask` | Foreground service with a visible notification and a declared type |
+| Finishing a job | `beginBackgroundTask`: roughly 30 s | Expedited WorkManager job, or keep running briefly until process is cached |
+| Exact timing | Not available (use local notifications for user-facing times) | Exact alarms, restricted by permission and Play policy |
+| User controls | Background App Refresh toggle, Low Power Mode, force-quit | Battery optimization, background restriction, App Standby Buckets, OEM battery killers |
+
+| You want to... | Possible? |
+|---|---|
+| Sync "roughly a few times a day" when conditions are good | Yes (BGAppRefresh / WorkManager periodic) |
+| Run code every 5 minutes forever | No. Android minimum periodic interval is 15 min and still deferrable; iOS decides itself |
+| React to a server event within seconds | Mostly: data/silent push, best-effort, throttled |
+| Upload a 2 GB video after the user leaves | Yes: background `URLSession` on iOS; foreground service or user-initiated data transfer job on Android |
+| Track location during a workout | Yes, with background location mode and permission (see [Location & Maps](location.html)) |
+| Play audio, run a call | Yes, with the audio mode / CallKit and the matching foreground service types |
+| Run anything after an iOS user force-quits | Effectively no (VoIP pushes, background transfers already in flight and some location APIs are exceptions) |
+| Fire at an exact time | Show a scheduled local notification; exact code execution only on Android with exact alarms |
+
+```mermaid
+timeline
+    title Android background execution restrictions
+    Android 6 : Doze and App Standby
+    Android 7 : Doze on the go
+    Android 8 : Background service limits : Implicit broadcast limits
+    Android 9 : App Standby Buckets
+    Android 10 : Separate background location permission
+    Android 11 : Restricted standby bucket
+    Android 12 : Foreground service starts from background blocked : Exact alarm permission : Expedited jobs
+    Android 13 : Notification permission : Foreground service Task Manager
+    Android 14 : Foreground service types mandatory : Exact alarms denied by default
+    Android 15 : dataSync 6 hour daily limit : Boot-started service type limits
+```
+*Figure: Every Android release has tightened background execution. Code that worked on Android 9 often silently fails on Android 14+.*
+
+## Requirements & prerequisites
+
+| Requirement | Details |
+|---|---|
+| Physical devices | `BGTaskScheduler` does not run on the iOS simulator; background push delivery, Doze and OEM behaviour need real devices. |
+| iOS capabilities | Background Modes in Xcode (`UIBackgroundModes`): `fetch`, `processing`, `remote-notification`, `audio`, `location`, `voip` as needed. Push Notifications capability for silent push and PushKit. |
+| iOS Info.plist | `BGTaskSchedulerPermittedIdentifiers` listing every task identifier. |
+| Android | `targetSdkVersion` at the current Play requirement; WorkManager (bundled by most libraries); `FOREGROUND_SERVICE` + type-specific `FOREGROUND_SERVICE_*` permissions; `POST_NOTIFICATIONS` for visible notifications (Android 13+). |
+| Play Console | Declare foreground service types and justify them (App content > Foreground service permissions); exact alarm and background location declarations where used. |
+| Expo | Development build (`expo-dev-client`); config via `app.json` / `app.config.ts` and config plugins, applied by `npx expo prebuild`. Expo Go can't test real background execution. |
+| Backend | Push sending via FCM HTTP v1 / APNs; idempotent sync endpoints, because background runs are retried and overlap. |
+
+## Mechanisms
+
+### Push-triggered work (silent/data push)
+
+The most responsive option: the server tells the device something changed, and the app wakes briefly to fetch it. On iOS a silent push (`content-available: 1`, `apns-push-type: background`, `apns-priority: 5`) gives you about 30 seconds, is throttled (Apple suggests no more than a few per hour), is coalesced, and is not delivered to force-quit apps. On Android a **high-priority FCM data message** can wake the device from Doze and start your process; FCM may downgrade high-priority messages that don't lead to a user-visible notification. Treat push as a *hint to sync*, never as the data channel itself. Setup lives in the [Push Notifications guide](push-notifications.html).
+
+### Periodic fetch
+
+- **iOS `BGAppRefreshTask`**: short (about 30 s) refreshes. You submit a request with an `earliestBeginDate`; the system runs it when it predicts the user will open the app soon, based on usage patterns. An app the user rarely opens may run rarely or never. At most one pending refresh request per app.
+- **Android WorkManager `PeriodicWorkRequest`**: minimum interval **15 minutes**, with constraints (network, battery not low, charging, idle). Runs are deferred by Doze maintenance windows and standby buckets, and each run is limited to about 10 minutes.
+
+### Long processing
+
+- **iOS `BGProcessingTask`**: minutes of runtime for maintenance (DB compaction, ML model updates, large syncs), typically when the device is idle and often charging (`requiresExternalPower`, `requiresNetworkConnectivity`). It can be deferred for days.
+- **iOS 26 `BGContinuedProcessingTask`**: for user-initiated work (an export, a large upload) that should continue after backgrounding, with system-provided progress UI. React Native library support is still emerging; verify before relying on it.
+- **Android WorkManager** one-time work with constraints and backoff; `setExpedited()` for important, short work that should start now (quota-limited).
+
+### Android foreground services
+
+A foreground service keeps the process at foreground priority while showing an ongoing notification. Since Android 12 you generally cannot **start** one while the app is in the background (exemptions include high-priority FCM, exact alarms, and some system broadcasts), so start it while the user is in the app. Since Android 14 every foreground service must declare a type in the manifest and hold the matching permission.
+
+| Type | Permission | Typical use | Notes |
+|---|---|---|---|
+| `dataSync` | `FOREGROUND_SERVICE_DATA_SYNC` | Uploads, downloads, sync | Android 15: limited to 6 hours per 24 h; prefer WorkManager or user-initiated jobs |
+| `mediaPlayback` | `FOREGROUND_SERVICE_MEDIA_PLAYBACK` | Music, podcasts | Used by track-player libraries |
+| `location` | `FOREGROUND_SERVICE_LOCATION` + location permission | Navigation, workout tracking | Needs location permission granted first |
+| `phoneCall` | `FOREGROUND_SERVICE_PHONE_CALL` | VoIP/calling | Usually with `ConnectionService` |
+| `camera` / `microphone` | `FOREGROUND_SERVICE_CAMERA` / `_MICROPHONE` + runtime permission | Recording while backgrounded | While-in-use permission rules apply |
+| `connectedDevice` | `FOREGROUND_SERVICE_CONNECTED_DEVICE` | BLE wearables | Requires a Bluetooth/USB-related permission |
+| `mediaProcessing` | `FOREGROUND_SERVICE_MEDIA_PROCESSING` | Transcoding (Android 15+) | Has a time limit |
+| `shortService` | none beyond `FOREGROUND_SERVICE` | Finishing a short critical task | About 3 minutes, can't be restarted |
+| `specialUse` | `FOREGROUND_SERVICE_SPECIAL_USE` | Anything else | Needs a manifest subtype property and Play review justification |
+
+Other rules: call `startForeground()` within a few seconds of `startForegroundService()` or the app crashes; on Android 13+ the notification is hidden if `POST_NOTIFICATIONS` is denied (the service still runs and appears in the Task Manager); on Android 14+ users can dismiss most foreground service notifications, and can stop your app from the Task Manager.
+
+### Background location, audio, VoIP
+
+- **Location**: iOS `location` background mode plus "Always" or while-in-use with the blue indicator; Android `ACCESS_BACKGROUND_LOCATION` and/or a `location` foreground service. Details and store-review rules are in [Location & Maps](location.html).
+- **Audio**: iOS `UIBackgroundModes` `audio` keeps the app running *while audio is playing*; Android uses a `mediaPlayback` foreground service with a MediaSession. `react-native-track-player` (or `expo-audio` for simpler cases) handles both, including lock-screen controls.
+- **VoIP**: iOS PushKit VoIP pushes wake even force-quit apps, but since iOS 13 you **must** report every VoIP push to CallKit (`reportNewIncomingCall`) immediately, or iOS terminates the app and eventually stops delivering VoIP pushes. Report the call natively in the PushKit delegate, before JS is even loaded. Android uses high-priority FCM plus `ConnectionService` (self-managed) and a `phoneCall` foreground service; full-screen intents are restricted to calling and alarm apps on Android 14+.
+
+### Background transfers
+
+- **iOS background `URLSession`** hands uploads/downloads to a system daemon; they continue while your app is suspended or even terminated by the system, and iOS relaunches the app in the background when they finish. They're cancelled if the user force-quits. Upload from a **file**, not an in-memory body. Libraries: `@kesha-antonov/react-native-background-downloader`, `react-native-background-upload` (check maintenance), `expo-file-system/legacy` upload/download with `sessionType: BACKGROUND`.
+- **Android**: WorkManager for deferrable transfers; a `dataSync` foreground service for user-visible ones; and on Android 14+ **user-initiated data transfer jobs** (`JobInfo.Builder#setUserInitiated`, `RUN_USER_INITIATED_JOBS`), which the platform now recommends over foreground services for user-requested transfers.
+
+### Finishing work after backgrounding
+
+When the user leaves mid-save, iOS lets you request extra time with `UIApplication.beginBackgroundTask(withName:expirationHandler:)`. Expect roughly **30 seconds** on current iOS (check `backgroundTimeRemaining`), always call `endBackgroundTask`, and treat the expiration handler as mandatory: if you don't end the task in time, iOS kills the app. On Android, the process usually keeps running briefly after backgrounding, but the durable way to finish is to hand the work to WorkManager (expedited if urgent).
+
+### Headless JS (Android)
+
+Headless JS runs a registered JS function from a native `HeadlessJsTaskService` without any Activity or UI. It's how libraries run JS for FCM background messages, background fetch events and boot events. The service must be started from a context that's allowed to start services (see the Kotlin example below); on its own it grants no extra background privileges.
+
+### Exact alarms
+
+`AlarmManager.setExactAndAllowWhileIdle()` fires at a precise time even in Doze, but Android 12+ requires `SCHEDULE_EXACT_ALARM` (user-grantable in settings; denied by default for most new installs on Android 14+) or `USE_EXACT_ALARM` (auto-granted, but Google Play only allows it for alarm-clock and calendar-style apps). Check `canScheduleExactAlarms()` and fall back to inexact alarms or WorkManager. For reminders, a scheduled local notification (expo-notifications, Notifee triggers) is almost always the right tool. Alarms are cleared on reboot; reschedule from a `BOOT_COMPLETED` receiver.
+
+### Decision flowchart
+
+```mermaid
+flowchart TD
+    Q(["What must happen while<br/>the app is not visible?"]) --> srv{"Triggered by a server event?"}
+    srv -->|"yes"| push["Data or silent push<br/>then a short sync"]
+    srv -->|"no"| ongoing{"Ongoing user-visible activity?"}
+    ongoing -->|"audio"| audio["Audio background mode<br/>+ mediaPlayback service"]
+    ongoing -->|"tracking"| loc["Background location<br/>+ location service"]
+    ongoing -->|"calls"| voip["PushKit + CallKit<br/>ConnectionService"]
+    ongoing -->|"big transfer"| xfer["Background URLSession<br/>dataSync service or UIDT job"]
+    ongoing -->|"no"| fin{"Finishing work started<br/>in the foreground?"}
+    fin -->|"yes, seconds"| bgt["iOS beginBackgroundTask<br/>Android expedited work"]
+    fin -->|"no"| per{"Recurring and deferrable?"}
+    per -->|"light"| refresh["BGAppRefreshTask<br/>WorkManager periodic"]
+    per -->|"heavy"| proc["BGProcessingTask<br/>WorkManager + constraints"]
+    per -->|"exact time"| alarm["Local notification<br/>or exact alarm"]
+```
+*Figure: Start from the job, not from a library. Most apps need push-triggered sync plus one opportunistic periodic task.*
+
+## Choosing a library / approach
+
+| Need | Library | Built on | Notes |
+|---|---|---|---|
+| Periodic JS task (Expo or bare with Expo modules) | **expo-background-task** + **expo-task-manager** (SDK 53+) | iOS `BGTaskScheduler` (processing), Android WorkManager | Replaces the deprecated `expo-background-fetch`. All registered tasks share one worker; minimum interval 15 min. |
+| Periodic JS task with more knobs | **react-native-background-fetch** (Transistorsoft) | iOS `BGTaskScheduler`, Android JobScheduler (optionally AlarmManager) | Headless mode after termination on Android, `startOnBoot`, one-off `scheduleTask`. Mature and widely deployed. |
+| Server-triggered sync | **@react-native-firebase/messaging** `setBackgroundMessageHandler` | APNs silent push, FCM data messages (Headless JS on Android) | Needs the push setup; see [Push Notifications](push-notifications.html). |
+| Long user-visible work (Android) | **Notifee** foreground service, or a custom native service | Android foreground service | Check Notifee's current maintenance status; a small custom module is a solid alternative. |
+| Audio playback | **react-native-track-player** | iOS audio mode, Android `mediaPlayback` service + MediaSession | Handles remote controls and the playback service lifecycle. |
+| VoIP calls | **react-native-callkeep** + **react-native-voip-push-notification** | CallKit/PushKit, Android `ConnectionService` | Report calls natively on iOS; JS may not be loaded in time. |
+| Large uploads/downloads | Background downloader/uploader libraries, `expo-file-system/legacy` background sessions | `URLSession` background config, WorkManager | Upload from files; make transfers resumable. |
+| Full control | Custom module (Expo Modules API, Nitro, TurboModule) with WorkManager / `BGTaskScheduler` | Platform APIs directly | Best when the work can be done natively (no JS runtime needed in background). |
+
+**Recommendation:** use push-triggered sync for freshness and **one** periodic task (expo-background-task in Expo apps, react-native-background-fetch in bare apps that want headless/boot control) as a safety net. Keep the task body in one shared, idempotent `runBackgroundSync()` function. Add foreground services, audio or VoIP only when the product genuinely needs that user-visible behaviour, because each brings review scrutiny and platform-specific edge cases.
+
+## Setup — iOS
+
+### Step 1 — Enable Background Modes
+
+Xcode > target > Signing & Capabilities > + Capability > **Background Modes**, then tick only what you use. Each mode can be questioned in App Review, so don't enable `audio` or `location` "just in case".
+
+```xml title="ios/MyApp/Info.plist"
+<key>UIBackgroundModes</key>
+<array>
+    <string>fetch</string>               <!-- BGAppRefreshTask / background fetch -->
+    <string>processing</string>          <!-- BGProcessingTask (expo-background-task) -->
+    <string>remote-notification</string> <!-- silent push -->
+    <!-- only if needed: audio, location, voip -->
+</array>
+```
+
+### Step 2 — Declare permitted task identifiers
+
+`BGTaskScheduler` refuses to register or submit identifiers that aren't listed here.
+
+```xml title="ios/MyApp/Info.plist"
+<key>BGTaskSchedulerPermittedIdentifiers</key>
+<array>
+    <string>com.expo.modules.backgroundtask.processing</string> <!-- expo-background-task -->
+    <string>com.transistorsoft.fetch</string>                   <!-- react-native-background-fetch -->
+    <string>com.example.app.refresh</string>                    <!-- a custom native task -->
+</array>
+```
+
+For react-native-background-fetch, custom `scheduleTask` identifiers must also be listed and prefixed `com.transistorsoft.`.
+
+### Step 3 — Register handlers before launch completes
+
+iOS requires every `BGTaskScheduler` launch handler to be registered **before `application(_:didFinishLaunchingWithOptions:)` returns**; registering later (for example, when JS loads) throws or silently drops the task on background relaunches. Libraries do this in native code; some require a one-line AppDelegate hook, which their Expo config plugins add during prebuild. For a custom module:
+
+```swift title="ios/MyApp/BackgroundRefresh.swift"
+import BackgroundTasks
+
+final class BackgroundRefresh {
+  static let shared = BackgroundRefresh()
+  static let taskId = "com.example.app.refresh"
+
+  func register() {
+    BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.taskId, using: nil) { task in
+      self.handle(task as! BGAppRefreshTask)
+    }
+  }
+
+  func schedule() {
+    let request = BGAppRefreshTaskRequest(identifier: Self.taskId)
+    request.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60) // a hint, not a schedule
+    do { try BGTaskScheduler.shared.submit(request) }
+    catch { NSLog("BGTask submit failed: \(error)") } // .unavailable on simulator or when refresh is off
+  }
+
+  private func handle(_ task: BGAppRefreshTask) {
+    schedule() // always queue the next run first
+    let work = Task {
+      let ok = await NativeSync.pullLatest() // URLSession + SQLite, no JS runtime needed
+      task.setTaskCompleted(success: ok)
+    }
+    task.expirationHandler = { work.cancel() } // pullLatest returns false when cancelled
+  }
+}
+```
+
+```diff title="ios/MyApp/AppDelegate.swift"
+   func application(
+     _ application: UIApplication,
+     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+   ) -> Bool {
++    BackgroundRefresh.shared.register()
+     // ... existing React Native factory / root view setup ...
+     return true
+   }
+```
+
+Call `schedule()` when the app enters the background (or from a TurboModule method) as well.
+
+### Step 4 — Expo (CNG)
+
+```json title="app.json"
+{
+  "expo": {
+    "ios": {
+      "infoPlist": {
+        "UIBackgroundModes": ["fetch", "processing", "remote-notification"],
+        "BGTaskSchedulerPermittedIdentifiers": ["com.transistorsoft.fetch"]
+      }
+    },
+    "plugins": ["react-native-background-fetch"]
+  }
+}
+```
+
+With CNG, installing `expo-background-task` makes prebuild add its `processing` mode and identifier automatically; list extra modes and identifiers yourself. Run `npx expo prebuild --clean` and inspect the generated `ios/<AppName>/Info.plist` to confirm.
+
+## Setup — Android
+
+### Step 1 — WorkManager (custom modules only)
+
+Libraries bundle WorkManager; for your own worker:
+
+```gradle title="android/app/build.gradle"
+dependencies {
+    implementation("androidx.work:work-runtime-ktx:2.10.1") // use the latest stable
+}
+```
+
+### Step 2 — Permissions, services and receivers
+
+```xml title="android/app/src/main/AndroidManifest.xml"
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- only if you truly need exact timing, and your app qualifies under Play policy -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <application android:name=".MainApplication">
+        <!-- Headless JS entry point -->
+        <service android:name=".SyncTaskService" android:exported="false" />
+
+        <!-- Notifee's foreground service, typed for Android 14+ -->
+        <service
+            android:name="app.notifee.core.ForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            tools:replace="android:foregroundServiceType" />
+
+        <!-- Re-arm alarms and one-off schedules after reboot -->
+        <receiver android:name=".BootReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
+```
+
+Notes:
+
+- **`RECEIVE_BOOT_COMPLETED`**: WorkManager persists and reschedules its own work after reboot; `AlarmManager` alarms and ad-hoc schedules do not, so re-arm them in a boot receiver. On Android 15, boot receivers can't start `dataSync`, `camera`, `mediaPlayback`, `phoneCall`, `microphone` or `mediaProjection` foreground services.
+- **`foregroundServiceType`** must match both the permission you declare and the type you pass to `startForeground()`; a mismatch throws at runtime on Android 14+.
+- The `POST_NOTIFICATIONS` runtime prompt is covered in [Permissions](permissions.html).
+
+### Step 3 — Expo (CNG)
+
+Permissions go in `app.json`; manifest element changes need a config plugin.
+
+```json title="app.json"
+{
+  "expo": {
+    "android": {
+      "permissions": ["RECEIVE_BOOT_COMPLETED", "WAKE_LOCK", "FOREGROUND_SERVICE", "FOREGROUND_SERVICE_DATA_SYNC"]
+    },
+    "plugins": ["./plugins/withDataSyncForegroundService"]
+  }
+}
+```
+
+```js title="plugins/withDataSyncForegroundService.js"
+const { AndroidConfig, withAndroidManifest } = require('expo/config-plugins');
+
+const SERVICE = 'app.notifee.core.ForegroundService';
+
+module.exports = function withDataSyncForegroundService(config) {
+  return withAndroidManifest(config, (cfg) => {
+    const manifest = cfg.modResults.manifest;
+    manifest.$['xmlns:tools'] = 'http://schemas.android.com/tools';
+    const app = AndroidConfig.Manifest.getMainApplicationOrThrow(cfg.modResults);
+    app.service = (app.service ?? []).filter((s) => s.$['android:name'] !== SERVICE);
+    app.service.push({
+      $: {
+        'android:name': SERVICE,
+        'android:exported': 'false',
+        'android:foregroundServiceType': 'dataSync',
+        'tools:replace': 'android:foregroundServiceType',
+      },
+    });
+    return cfg;
+  });
+};
+```
+
+## Implementation
+
+### The JS context in the background
+
+Background JS runs in conditions most app code never considers:
+
+- **Android Headless JS has no React tree.** No providers, no navigation, no hooks, no context, no mounted screens. Only code reachable from the registered task function runs.
+- **iOS relaunches the whole app in the background** for BGTasks, silent pushes and finished background transfers: `didFinishLaunching` runs, the JS bundle loads and the root component usually mounts. Effects fire, so guard "app opened" analytics, splash logic and heavy startup work with `AppState.currentState === 'active'`.
+- **Register at module top level in `index.js`.** `defineTask`, `registerHeadlessTask`, `setBackgroundMessageHandler` and `registerForegroundService` must run during bundle evaluation, because on a headless launch nothing else will register them in time.
+- **Self-contained:** open MMKV/SQLite directly, read the token from the Keychain (stored `AFTER_FIRST_UNLOCK`, or it's unreadable while the phone is locked), and don't depend on in-memory state from a previous session.
+- **Idempotent and overlap-safe:** the same run may be retried, or start while a foreground sync is running. Use a lease lock and idempotent server calls.
+- **Fast and budgeted:** assume ~30 seconds total on iOS *including* bundle load. Pass a deadline down, persist progress, stop early.
+- **Frugal:** background memory limits are lower; don't hydrate entire stores or decode large images.
+
+```ts title="src/background/runBackgroundSync.ts"
+import { deviceStore } from '../storage/mmkv';
+import { getDatabase } from '../db/database';
+import { drainOutbox } from '../sync/outbox';
+import { pullChanges } from '../sync/pull';
+import { log } from '../monitoring/log';
+
+export type SyncReason = 'periodic' | 'push' | 'boot' | 'foreground';
+
+const LOCK_KEY = 'bg-sync-lock-until';
+const LOCK_TTL_MS = 60_000; // a crashed run can't hold the lock forever
+
+export async function runBackgroundSync(reason: SyncReason, budgetMs = 20_000): Promise<boolean> {
+  const startedAt = Date.now();
+  if ((deviceStore.getNumber(LOCK_KEY) ?? 0) > startedAt) return true; // another run is active
+  deviceStore.set(LOCK_KEY, startedAt + LOCK_TTL_MS);
+
+  const deadline = startedAt + budgetMs;
+  try {
+    const db = await getDatabase(); // opened directly, no React context
+    await drainOutbox(db, deadline); // push local changes first
+    if (Date.now() < deadline) await pullChanges(db, deadline);
+    deviceStore.set('last-bg-sync-at', Date.now());
+    log.info('bg-sync ok', { reason, ms: Date.now() - startedAt });
+    return true;
+  } catch (e) {
+    log.error('bg-sync failed', { reason, error: String(e) });
+    return false;
+  } finally {
+    deviceStore.remove(LOCK_KEY);
+  }
+}
+```
+
+The outbox and pull logic are covered in [Offline Storage & Sync](offline-storage.html). Every trigger below calls this one function.
+
+### Registering everything in `index.js`
+
+```js title="index.js"
+import { AppRegistry } from 'react-native';
+import { getMessaging, setBackgroundMessageHandler } from '@react-native-firebase/messaging';
+import notifee from '@notifee/react-native';
+import BackgroundFetch from 'react-native-background-fetch';
+import App from './App';
+import { name as appName } from './app.json';
+import { backgroundSyncTask } from './src/background/headlessSync';
+import { headlessFetchTask } from './src/background/backgroundFetch';
+import { onBackgroundMessage } from './src/background/onBackgroundMessage';
+import { uploadRunner } from './src/background/uploadRunner';
+
+// Background entry points: registered during bundle evaluation, before any UI.
+AppRegistry.registerHeadlessTask('BackgroundSync', () => backgroundSyncTask);
+BackgroundFetch.registerHeadlessTask(headlessFetchTask);
+setBackgroundMessageHandler(getMessaging(), onBackgroundMessage);
+notifee.registerForegroundService(uploadRunner);
+
+AppRegistry.registerComponent(appName, () => App);
+```
+
+Keep these imported modules lean; heavy imports here slow every background launch.
+
+### expo-background-task
+
+```ts title="src/background/tasks.ts"
+import * as BackgroundTask from 'expo-background-task';
+import * as TaskManager from 'expo-task-manager';
+import { runBackgroundSync } from './runBackgroundSync';
+
+export const SYNC_TASK = 'background-sync';
+
+// Module top level: must be defined before the OS asks to run it.
+TaskManager.defineTask(SYNC_TASK, async () => {
+  const ok = await runBackgroundSync('periodic', 25_000);
+  return ok ? BackgroundTask.BackgroundTaskResult.Success : BackgroundTask.BackgroundTaskResult.Failed;
+});
+
+export async function registerBackgroundSync(): Promise<boolean> {
+  const status = await BackgroundTask.getStatusAsync();
+  if (status === BackgroundTask.BackgroundTaskStatus.Restricted) return false; // e.g. refresh disabled
+  if (!(await TaskManager.isTaskRegisteredAsync(SYNC_TASK))) {
+    await BackgroundTask.registerTaskAsync(SYNC_TASK, { minimumInterval: 60 }); // minutes, minimum 15
+  }
+  return true;
+}
+
+export const unregisterBackgroundSync = () => BackgroundTask.unregisterTaskAsync(SYNC_TASK);
+```
+
+In an Expo Router app, make the task module load first with a custom entry file and point `"main"` in `package.json` at it:
+
+```js title="index.js"
+import './src/background/tasks';
+import 'expo-router/entry';
+```
+
+Call `registerBackgroundSync()` after login, `unregisterBackgroundSync()` on logout, and expose `BackgroundTask.triggerTaskWorkerForTestingAsync()` behind a dev-only menu item to run the worker on demand.
+
+### react-native-background-fetch
+
+```ts title="src/background/backgroundFetch.ts"
+import BackgroundFetch, { type HeadlessEvent } from 'react-native-background-fetch';
+import { runBackgroundSync } from './runBackgroundSync';
+
+export async function configureBackgroundFetch(): Promise<boolean> {
+  const status = await BackgroundFetch.configure(
+    {
+      minimumFetchInterval: 15, // minutes: a floor, not a schedule
+      stopOnTerminate: false,   // Android: keep firing after the app is killed
+      startOnBoot: true,        // Android: resume after reboot
+      enableHeadless: true,     // Android: run the headless task when no UI exists
+      requiredNetworkType: BackgroundFetch.NETWORK_TYPE_ANY,
+    },
+    async (taskId) => {
+      await runBackgroundSync('periodic');
+      BackgroundFetch.finish(taskId); // always signal completion
+    },
+    async (taskId) => {
+      BackgroundFetch.finish(taskId); // timeout: the OS wants you to stop now
+    },
+  );
+  return status === BackgroundFetch.STATUS_AVAILABLE;
+}
+
+// Android only: runs when the app is terminated (registered in index.js).
+export async function headlessFetchTask({ taskId, timeout }: HeadlessEvent): Promise<void> {
+  if (timeout) {
+    BackgroundFetch.finish(taskId);
+    return;
+  }
+  await runBackgroundSync('periodic');
+  BackgroundFetch.finish(taskId);
+}
+```
+
+`configure` should run on every app launch (it's idempotent). For a one-off delayed job, `BackgroundFetch.scheduleTask({ taskId: 'com.transistorsoft.upload-retry', delay: 60_000, periodic: false })`; on iOS that identifier must be in `BGTaskSchedulerPermittedIdentifiers`. `STATUS_DENIED`/`STATUS_RESTRICTED` means the user or a device policy has disabled Background App Refresh; tell the user what they lose instead of failing silently.
+
+### Headless JS with a Kotlin `HeadlessJsTaskService`
+
+Use this when a native trigger (notification action, custom push handler, a native SDK callback) must run JS logic.
+
+```ts title="src/background/headlessSync.ts"
+import { runBackgroundSync, type SyncReason } from './runBackgroundSync';
+
+export async function backgroundSyncTask(data: { reason?: SyncReason }): Promise<void> {
+  await runBackgroundSync(data.reason ?? 'periodic');
+}
+```
+
+```kotlin title="android/app/src/main/java/com/example/app/SyncTaskService.kt"
+package com.example.app
+
+import android.content.Intent
+import com.facebook.react.HeadlessJsTaskService
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.jstasks.HeadlessJsTaskConfig
+
+class SyncTaskService : HeadlessJsTaskService() {
+  override fun getTaskConfig(intent: Intent): HeadlessJsTaskConfig? {
+    val extras = intent.extras ?: return null
+    return HeadlessJsTaskConfig(
+      "BackgroundSync",             // key used in AppRegistry.registerHeadlessTask
+      Arguments.fromBundle(extras), // becomes the task's data argument
+      25_000L,                      // timeout in ms, then the task is stopped
+      false,                        // don't run while the app is in the foreground
+    )
+  }
+}
+```
+
+```kotlin title="android/app/src/main/java/com/example/app/HeadlessSync.kt"
+package com.example.app
+
+import android.content.Context
+import android.content.Intent
+import android.util.Log
+import com.facebook.react.HeadlessJsTaskService
+
+object HeadlessSync {
+  fun start(context: Context, reason: String) {
+    val intent = Intent(context, SyncTaskService::class.java).putExtra("reason", reason)
+    try {
+      context.startService(intent)
+      HeadlessJsTaskService.acquireWakeLockNow(context)
+    } catch (e: IllegalStateException) {
+      // Android 8+: background service starts are refused unless the app is temporarily
+      // allowlisted (high-priority FCM, notification PendingIntent, ...). Defer instead.
+      Log.w("HeadlessSync", "startService refused, deferring to WorkManager", e)
+      SyncWorker.enqueueOneOff(context)
+    }
+  }
+}
+```
+
+> [!WARNING]
+> `HeadlessJsTaskService` is a plain started service: it gives you a JS runtime, not background privileges. Since Android 8, `startService()` from the background throws `IllegalStateException` unless the app is temporarily allowlisted. That's why libraries run their headless tasks from their own FCM service or JobService. Start it only from allowlisted moments, and always have a fallback.
+
+### A custom WorkManager worker (native-only work)
+
+When the background work can be done natively (fetch JSON, write SQLite), skip the JS runtime entirely: it's faster, uses less memory, and avoids JS startup inside a tight budget.
+
+```kotlin title="android/app/src/main/java/com/example/app/SyncWorker.kt"
+package com.example.app
+
+import android.content.Context
+import androidx.work.*
+import java.io.IOException
+import java.util.concurrent.TimeUnit
+
+class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
+  override suspend fun doWork(): Result = try {
+    NativeSync.pullLatest(applicationContext) // your native sync code
+    Result.success()
+  } catch (e: IOException) {
+    if (runAttemptCount < 5) Result.retry() else Result.failure()
+  }
+
+  companion object {
+    private val constraints = Constraints.Builder()
+      .setRequiredNetworkType(NetworkType.CONNECTED)
+      .setRequiresBatteryNotLow(true)
+      .build()
+
+    fun schedulePeriodic(context: Context) {
+      val request = PeriodicWorkRequestBuilder<SyncWorker>(1, TimeUnit.HOURS) // minimum is 15 minutes
+        .setConstraints(constraints)
+        .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+        .build()
+      WorkManager.getInstance(context)
+        .enqueueUniquePeriodicWork("periodic-sync", ExistingPeriodicWorkPolicy.KEEP, request)
+    }
+
+    fun enqueueOneOff(context: Context) {
+      val request = OneTimeWorkRequestBuilder<SyncWorker>()
+        .setConstraints(constraints)
+        .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+        .build()
+      WorkManager.getInstance(context)
+        .enqueueUniqueWork("one-off-sync", ExistingWorkPolicy.KEEP, request)
+    }
+  }
+}
+```
+
+```kotlin title="android/app/src/main/java/com/example/app/BootReceiver.kt"
+package com.example.app
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+
+class BootReceiver : BroadcastReceiver() {
+  override fun onReceive(context: Context, intent: Intent) {
+    if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+    ReminderAlarms.rescheduleAll(context) // AlarmManager alarms don't survive reboot
+    SyncWorker.enqueueOneOff(context)     // WorkManager work does, but catch up now
+  }
+}
+```
+
+Expose `schedulePeriodic` through a TurboModule, Nitro module or Expo module, and mirror it on iOS with the `BackgroundRefresh` class from the iOS setup. Using `enqueueUnique*Work` with `KEEP` makes scheduling idempotent across app launches.
+
+### Silent-push-triggered sync
+
+Server side, send a data-only message through FCM HTTP v1 that is high priority on Android and a background push on iOS:
+
+```json title="FCM HTTP v1 request body"
+{
+  "message": {
+    "token": "<device registration token>",
+    "data": { "type": "sync", "scope": "inbox" },
+    "android": { "priority": "high" },
+    "apns": {
+      "headers": { "apns-push-type": "background", "apns-priority": "5" },
+      "payload": { "aps": { "content-available": 1 } }
+    }
+  }
+}
+```
+
+```ts title="src/background/onBackgroundMessage.ts"
+import type { FirebaseMessagingTypes } from '@react-native-firebase/messaging';
+import notifee from '@notifee/react-native';
+import { runBackgroundSync } from './runBackgroundSync';
+
+export async function onBackgroundMessage(message: FirebaseMessagingTypes.RemoteMessage): Promise<void> {
+  if (message.data?.type !== 'sync') return;
+  const ok = await runBackgroundSync('push', 20_000);
+  if (ok && message.data.notify === '1') {
+    // Android: surfacing a notification keeps high-priority FCM from being deprioritised
+    await notifee.displayNotification({
+      title: String(message.data.title ?? 'New activity'),
+      android: { channelId: 'activity' },
+    });
+  }
+}
+```
+
+On iOS the handler runs when the app is launched or resumed in the background for the push; RNFirebase can pass an `isHeadless` initial prop so your root component renders `null` in that case. Silent push is **best-effort**: throttled, coalesced, dropped after force-quit and in Low Power Mode, so it complements (never replaces) the periodic task and a sync on every foreground.
+
+### Long upload via a foreground service (Android) and background session (iOS)
+
+```ts title="src/media/startUpload.ts"
+import notifee, { AndroidForegroundServiceType, AndroidImportance } from '@notifee/react-native';
+import * as FileSystem from 'expo-file-system/legacy';
+import { Platform } from 'react-native';
+import { randomUUID } from 'expo-crypto';
+import { uploadQueue } from './uploadQueue';
+import { getPresignedUrl } from '../api/uploads';
+
+export const UPLOAD_NOTIFICATION_ID = 'upload';
+
+// Call while the app is visible: Android 12+ blocks starting the service from the background.
+export async function startUpload(fileUri: string, name: string): Promise<void> {
+  const job = { id: randomUUID(), fileUri, name };
+  await uploadQueue.add(job); // persisted, so a killed process can resume later
+
+  if (Platform.OS === 'android') {
+    await notifee.createChannel({ id: 'uploads', name: 'Uploads', importance: AndroidImportance.LOW });
+    await notifee.displayNotification({
+      id: UPLOAD_NOTIFICATION_ID,
+      title: `Uploading ${name}`,
+      android: {
+        channelId: 'uploads',
+        asForegroundService: true,
+        foregroundServiceTypes: [AndroidForegroundServiceType.FOREGROUND_SERVICE_TYPE_DATA_SYNC],
+        ongoing: true,
+        progress: { indeterminate: true },
+      },
+    });
+    return;
+  }
+
+  // iOS: nsurlsessiond performs the transfer even while the app is suspended.
+  const url = await getPresignedUrl(job.id);
+  await FileSystem.uploadAsync(url, fileUri, {
+    httpMethod: 'PUT',
+    uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+    sessionType: FileSystem.FileSystemSessionType.BACKGROUND,
+  });
+  await uploadQueue.markDone(job.id); // may never run if iOS terminates the app; reconcile server-side
+}
+```
+
+```ts title="src/background/uploadRunner.ts"
+import notifee, { type Notification } from '@notifee/react-native';
+import { uploadInParts } from '../media/multipartUpload';
+import { uploadQueue } from '../media/uploadQueue';
+import { UPLOAD_NOTIFICATION_ID } from '../media/startUpload';
+
+// Registered in index.js. The promise stays pending while the service runs.
+export function uploadRunner(_notification: Notification): Promise<void> {
+  return new Promise(() => {
+    runQueuedUploads().finally(() => notifee.stopForegroundService());
+  });
+}
+
+async function runQueuedUploads(): Promise<void> {
+  for (let job = await uploadQueue.next(); job; job = await uploadQueue.next()) {
+    let lastUpdate = 0;
+    await uploadInParts(job, async (sent, total) => {
+      if (Date.now() - lastUpdate < 1000) return; // Android throttles rapid notification updates
+      lastUpdate = Date.now();
+      await notifee.displayNotification({
+        id: UPLOAD_NOTIFICATION_ID,
+        title: `Uploading ${job.name}`,
+        body: `${Math.round((sent / total) * 100)}%`,
+        android: { channelId: 'uploads', asForegroundService: true, onlyAlertOnce: true, progress: { max: total, current: sent } },
+      });
+    });
+    await uploadQueue.markDone(job.id);
+  }
+}
+```
+
+Design notes: upload in resumable parts (S3 multipart, tus) so a killed process resumes instead of restarting; have the backend confirm completion (for example from a storage event) rather than trusting the client's final call; on Android 15, `dataSync` services time out after 6 hours in 24 h, so very long transfers belong in WorkManager (long-running worker with `setForeground`) or a user-initiated data transfer job.
+
+## Runtime flows
+
+```mermaid
+sequenceDiagram
+    participant AD as AppDelegate
+    participant Sch as BGTaskScheduler
+    participant OS as iOS scheduler
+    participant JS as JS runtime
+    AD->>Sch: register(identifier, handler) at launch
+    JS->>Sch: submit refresh request, earliestBeginDate
+    Note over JS,OS: user leaves, app suspended or terminated
+    OS->>OS: wait for battery, network and usage prediction
+    OS->>AD: relaunch in background if not running
+    AD->>JS: load bundle, root component mounts
+    Sch->>JS: launch handler fires task event
+    JS->>Sch: submit next request first
+    JS->>JS: runBackgroundSync with deadline
+    alt finished in time
+        JS->>Sch: finish, setTaskCompleted(true)
+    else about 30 s elapsed
+        Sch->>JS: expirationHandler
+        JS->>Sch: setTaskCompleted(false)
+    end
+    OS->>AD: app suspended again
+```
+*Figure: iOS BGAppRefreshTask lifecycle. The OS picks the moment; bundle loading counts against the budget; the next request must be resubmitted every run.*
+
+```mermaid
+sequenceDiagram
+    participant BE as Backend
+    participant FCM as FCM
+    participant Svc as Messaging service
+    participant HJS as HeadlessJsTaskService
+    participant JS as JS handler
+    BE->>FCM: HTTP v1 data message, priority high
+    FCM->>Svc: deliver, may wake device from Doze
+    Note over Svc: process started if needed, no Activity
+    Svc->>HJS: startService with message extras
+    HJS->>HJS: acquire wake lock, start React host
+    HJS->>JS: invoke setBackgroundMessageHandler task
+    JS->>JS: sync, write DB, maybe show notification
+    JS-->>HJS: promise resolves or timeout
+    HJS->>HJS: release wake lock, stop service
+    Note over Svc,JS: process cached, killable later
+```
+*Figure: Android Headless JS started by a high-priority data push. The temporary allowlist from a high-priority message is what allows the service start.*
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant UI as RN screen
+    participant N as Notifee
+    participant FGS as Foreground service
+    participant R as Upload runner
+    participant S3 as Object storage
+    U->>UI: tap Upload while app is visible
+    UI->>N: displayNotification asForegroundService
+    N->>FGS: startForegroundService, startForeground with dataSync type
+    FGS->>R: registered runner starts
+    loop each part
+        R->>S3: PUT part with presigned URL
+        S3-->>R: ETag
+        R->>N: update progress, throttled
+    end
+    Note over U,UI: user switches apps, process keeps foreground priority
+    R->>S3: complete multipart upload
+    R->>N: stopForegroundService
+    N->>FGS: stop service, remove notification
+```
+*Figure: A long upload through an Android foreground service. The service must be started while the app is visible and declared with a matching type.*
+
+## Edge cases & gotchas
+
+- **Force-quit on iOS** (swiping the app away) stops BGTask runs and silent push delivery until the user opens the app again. Background `URLSession` transfers are cancelled. VoIP pushes still arrive. You can't detect or prevent it; design for it.
+- **Force stop on Android** (Settings > Force stop, or some OEM "clean" buttons) puts the app in the stopped state: jobs and alarms are cancelled and FCM messages aren't delivered until the next manual launch. A normal swipe from Recents on stock Android only kills the process.
+- **Low Power Mode** (iOS) pauses Background App Refresh and defers discretionary work; **Battery Saver** and **Doze** (Android) batch jobs into maintenance windows and suspend network access outside them.
+- **App Standby Buckets**: active, working set, frequent, rare, restricted. Rarely used apps get very few job and alarm slots per day. Your testing phone (in "active") is not your median user.
+- **OEM battery killers** (Xiaomi, Huawei, Samsung, OnePlus and others) kill background processes and block auto-start beyond stock Android rules. See dontkillmyapp.com; for critical use cases, guide users to allow unrestricted battery usage.
+- **Execution time limits**: roughly 30 s for BGAppRefresh, silent push and `beginBackgroundTask`; minutes for BGProcessingTask; about 10 minutes per WorkManager run; Headless JS until your configured timeout. Exceeding them gets the task (or app) killed, and iOS may penalise future scheduling.
+- **Memory limits** are much lower in the background; jetsam kills on iOS don't produce crash reports, just missing runs.
+- **Never rely on exact timing.** `minimumFetchInterval` and `earliestBeginDate` are floors. Show "last synced" in the UI and always sync on foreground.
+- **Protected data while locked**: files with complete protection and Keychain items stored `WHEN_UNLOCKED` can't be read before first unlock or while locked, so a background task can crash opening an encrypted DB.
+- **Token refresh races**: a background sync and the foreground app refreshing the same refresh token at the same time can invalidate each other; serialise refresh behind a lock.
+- **Notification permission denied** on Android 13+: foreground services still run, but the user sees no progress notification.
+- **Play policy**: undeclared or unjustified foreground service types, `USE_EXACT_ALARM` in a non-alarm app, or background location without a clear feature are common rejection reasons. Verify current policies before each release.
+
+## Testing & debugging
+
+### iOS
+
+| What | How |
+|---|---|
+| Legacy background fetch | Xcode > Debug > **Simulate Background Fetch** (exercises the old fetch API only, not `BGTaskScheduler`) |
+| BGTaskScheduler launch | Real device. Run from Xcode, background the app so the request is submitted, pause the debugger, then in LLDB: `e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@"com.example.app.refresh"]` and resume |
+| BGTask expiration | Same flow with `_simulateExpirationForTaskWithIdentifier:` to test the expiration handler |
+| Why a task isn't running | Console.app on the Mac, select the device, filter by `dasd` or your task identifier to see scheduler decisions |
+| Silent push | Send a real background push to a device; `xcrun simctl push booted com.example.app payload.apns` for simulator smoke tests |
+| Background refresh status | Settings > General > Background App Refresh; test with Low Power Mode on |
+
+The `_simulate...` selectors are private debugging APIs: use them from LLDB only, never in shipped code.
+
+### Android
+
+```bash
+# Run a JobScheduler job immediately (react-native-background-fetch uses job id 999)
+adb shell cmd jobscheduler run -f com.example.app 999
+
+# Inspect scheduled jobs (WorkManager jobs appear here with their constraints)
+adb shell dumpsys jobscheduler | grep -A 20 com.example.app
+
+# WorkManager diagnostics dump (read the output in logcat)
+adb shell am broadcast -a "androidx.work.diagnostics.REQUEST_DIAGNOSTICS" -p "com.example.app"
+
+# Doze: unplug, force idle, then restore
+adb shell dumpsys battery unplug
+adb shell dumpsys deviceidle force-idle
+adb shell dumpsys deviceidle unforce
+adb shell dumpsys battery reset
+
+# App Standby Buckets
+adb shell am set-standby-bucket com.example.app rare
+adb shell am get-standby-bucket com.example.app
+
+# Kill the process like the system would (not a force stop)
+adb shell am kill com.example.app
+
+# Simulate "background restricted" by the user
+adb shell cmd appops set com.example.app RUN_ANY_IN_BACKGROUND ignore
+```
+
+Android Studio's **App Inspection > Background Task Inspector** shows WorkManager workers, their state, constraints and retries live. For headless JS, watch `adb logcat` for `ReactNativeJS` and `HeadlessJsTaskContext` lines.
+
+### Test matrix
+
+Test each mechanism in each state: foreground, backgrounded, suspended, killed by the system, force-quit/force-stopped, after reboot, in Doze/Low Power Mode, with Background App Refresh disabled, with notifications denied, and on at least one aggressive OEM device. Log every background run (reason, duration, outcome) to your monitoring tool, because field data is the only way to see real-world frequency (see [Monitoring](monitoring.html)).
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| iOS task never runs | Identifier missing from `BGTaskSchedulerPermittedIdentifiers`, mode not enabled, running on simulator, or refresh disabled | Check Info.plist and modes, test on device with the LLDB command, check `getStatusAsync()` / fetch status |
+| `BGTaskScheduler` crash: launch handler not registered | Registration happened after `didFinishLaunching` returned | Register in native launch code (library hook or AppDelegate) |
+| Works in development, never in the field | Rarely used app gets few slots; users force-quit; Low Power Mode | Push-triggered sync + sync on foreground; show "last synced"; don't promise intervals |
+| Silent pushes arrive sporadically | Throttling, wrong headers (`apns-push-type`, priority 5), force-quit | Correct payload, send sparingly, treat as a hint |
+| Android headless task never fires | Not registered at top level of `index.js`, or `enableHeadless`/`stopOnTerminate` misconfigured | Register before `registerComponent`; set `stopOnTerminate: false`, `enableHeadless: true` |
+| `IllegalStateException: Not allowed to start service` | Starting a service from the background (Android 8+) | Start from allowlisted contexts, or use WorkManager |
+| `ForegroundServiceStartNotAllowedException` | Starting an FGS from the background (Android 12+) | Start while visible, or use expedited WorkManager / user-initiated jobs |
+| `MissingForegroundServiceTypeException` or `SecurityException` on start | Missing `foregroundServiceType` or matching `FOREGROUND_SERVICE_*` permission (Android 14+) | Declare type + permission, pass the same type to `startForeground` |
+| App crashes about 5 s after starting service | `startForeground()` not called in time | Show the notification immediately when the service starts |
+| Periodic work stops after a few days | Standby bucket demotion, OEM killer, background restriction | Check buckets and appops; guide users on OEM settings; rely on push + foreground sync |
+| Exact alarms fire late or throw | `SCHEDULE_EXACT_ALARM` not granted (default-denied on Android 14+) | Check `canScheduleExactAlarms()`, fall back to inexact alarms or notifications |
+| Background sync fails only when locked | Encrypted DB or Keychain item not accessible before unlock | `AFTER_FIRST_UNLOCK` Keychain accessibility; appropriate file protection |
+| Duplicate uploads or records | Overlapping runs, retries without idempotency | Lease lock, unique work names, idempotency keys |
+
+## Production checklist
+
+- [ ] Background behaviour is specified as "best effort" in product requirements; nothing depends on exact timing
+- [ ] Only needed `UIBackgroundModes` are enabled; all task identifiers listed in `BGTaskSchedulerPermittedIdentifiers`
+- [ ] Task handlers registered natively before launch completes; JS tasks registered at top level of `index.js`
+- [ ] One shared, idempotent, deadline-aware `runBackgroundSync()` used by every trigger, protected by a lock
+- [ ] App syncs on every foreground regardless of background success; UI shows "last synced"
+- [ ] Silent/data push payloads use correct headers and priorities, and are sent sparingly
+- [ ] Foreground services declare types and permissions, start only while visible, and show a useful notification
+- [ ] Play Console foreground service, exact alarm and background location declarations are complete
+- [ ] Exact alarms used only if policy allows; `canScheduleExactAlarms()` checked with fallbacks
+- [ ] Alarms and one-off schedules re-armed after reboot; WorkManager work uses unique names
+- [ ] Keychain items and files needed in the background are accessible after first unlock
+- [ ] Background tasks unregistered and queues cleared on logout
+- [ ] Tested on real devices across states: killed, force-quit, reboot, Doze, Low Power Mode, OEM devices
+- [ ] Every background run is logged with reason, duration and result to monitoring
+- [ ] Current iOS and Android background policies re-checked for this release's target SDK
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [Expo BackgroundTask](https://docs.expo.dev/versions/latest/sdk/background-task/)
+- [Apple — BackgroundTasks framework](https://developer.apple.com/documentation/backgroundtasks)
+- [Android — Persistent work with WorkManager](https://developer.android.com/develop/background-work/background-tasks/persistent)
+- [React Native — Headless JS](https://reactnative.dev/docs/headless-js-android)
+- [react-native-background-fetch](https://github.com/transistorsoft/react-native-background-fetch)
+- [Don't kill my app! (OEM battery restrictions)](https://dontkillmyapp.com/)
+
+## Interview questions
+
+### Can a React Native app run code every 5 minutes in the background?
+
+**Short answer:** Not reliably, and a senior engineer should say so. iOS schedules `BGAppRefreshTask` opportunistically based on usage, battery and network; Android's WorkManager has a 15-minute minimum periodic interval, deferred further by Doze and standby buckets.
+
+The right design is event-driven: push-triggered sync for freshness, one opportunistic periodic task as a safety net, and a sync on every foreground. If the product truly needs continuous work, it must be a user-visible activity (location tracking, audio, a call, a transfer) with the corresponding background mode or foreground service.
+
+### How does background execution differ between iOS and Android?
+
+**Short answer:** iOS suspends apps and grants only purpose-specific windows (BGTaskScheduler, silent push, audio, location, VoIP, background transfers) scheduled by the OS. Android is more flexible but increasingly restricted: WorkManager for deferrable work, foreground services with visible notifications and declared types for ongoing work, and exact alarms behind a permission.
+
+Other differences: iOS stops background wakeups after a force-quit; Android has Doze, standby buckets and OEM killers; Android can run headless JS without UI, while iOS relaunches the full app in the background.
+
+### What happens when a background task runs in React Native with no UI?
+
+**Short answer:** On Android, Headless JS starts a React runtime without an Activity or component tree and runs only the registered task function. On iOS, the app is relaunched in the background and the root component usually mounts.
+
+Consequences: register tasks at the top level of `index.js`; don't depend on providers, navigation or in-memory state; open storage directly; keep it fast because bundle load counts against the budget; make it idempotent and deadline-aware; guard startup side effects like "app open" analytics on iOS.
+
+### When would you use an Android foreground service, and what changed in Android 14?
+
+**Short answer:** For ongoing, user-visible work that must not be deferred: media playback, navigation, calls, a user-initiated upload. The app shows a persistent notification and keeps foreground priority.
+
+Android 12 blocked starting foreground services from the background (with exemptions). Android 14 made `foregroundServiceType` mandatory, with a matching `FOREGROUND_SERVICE_*` permission and Play Console declarations; Android 15 added a 6-hour daily cap for `dataSync`. For deferrable work use WorkManager; for user-requested transfers on Android 14+, consider user-initiated data transfer jobs.
+
+### How would you implement reliable large uploads that continue after the user leaves the app?
+
+**Short answer:** iOS: a background `URLSession` upload from a file, performed by the system even while the app is suspended. Android: a `dataSync` foreground service started while the app is visible, or a long-running WorkManager worker or user-initiated job.
+
+Make uploads resumable (multipart or tus), persist the queue, use idempotency keys, throttle progress notifications, and have the backend confirm completion, because the app may be terminated before it hears the final response. A force-quit on iOS cancels background sessions, so resume on next launch.
+
+### Why does silent push sometimes not wake the app, and how do you design around it?
+
+**Short answer:** Silent pushes are best-effort: iOS throttles and coalesces them, doesn't deliver them after a force-quit or reliably in Low Power Mode, and requires `apns-push-type: background` with priority 5; Android can deprioritise high-priority messages that don't show a notification, and Doze or OEM killers interfere.
+
+Design: treat the push as a hint to sync, keep the payload small, make the sync idempotent, and back it up with a periodic task and a sync on every foreground. For user-visible messages, send a visible notification instead.
+
+### What are the rules for VoIP push on iOS?
+
+**Short answer:** PushKit VoIP pushes wake the app even after force-quit, but every one must be reported to CallKit as an incoming call immediately; otherwise iOS terminates the app and eventually stops delivering VoIP pushes.
+
+In React Native, report the call natively in the PushKit delegate (via react-native-callkeep or your own module) before JS is loaded, then let JS handle signalling. Using VoIP pushes for non-call background work is a guideline violation. Android uses high-priority FCM, `ConnectionService`, and a `phoneCall` foreground service.
+
+### How do you test background tasks?
+
+**Short answer:** On real devices, forcing each mechanism to run: LLDB `_simulateLaunchForTaskWithIdentifier:` for BGTaskScheduler, `adb shell cmd jobscheduler run -f <package> <jobId>` and WorkManager's Background Task Inspector on Android, plus Doze (`dumpsys deviceidle force-idle`) and standby bucket commands.
+
+Then test the state matrix (killed, force-quit, reboot, Low Power Mode, refresh disabled, notifications denied, OEM devices) and add field telemetry for every run, because lab tests can't reproduce the OS's usage-based scheduling.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

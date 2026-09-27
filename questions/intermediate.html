@@ -1,0 +1,2899 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Intermediate Q&amp;A · React Native Interview Handbook</title>
+<meta name="description" content="The questions that separate &quot;has shipped an RN app&quot; from &quot;understands why it works&quot;: hooks semantics, state and server-cache design, navigation architecture, list and animation…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Intermediate Q&amp;A · React Native Interview Handbook">
+<meta property="og:description" content="The questions that separate &quot;has shipped an RN app&quot; from &quot;understands why it works&quot;: hooks semantics, state and server-cache design, navigation architecture, list and animation…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="questions/intermediate.html" data-type="qa">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Intermediate Q&A
+
+The questions that separate "has shipped an RN app" from "understands why it works": hooks semantics, state and server-cache design, navigation architecture, list and animation performance, forms, networking, storage, typing, error handling, testing and platform concerns. Each answer opens with a line you can say out loud, then goes deep enough to survive the follow-ups.
+
+## Hooks deep dive
+
+### How do useEffect dependencies and cleanup actually work, and when does the cleanup run?
+
+**Short answer:** `useEffect` runs *after* React has committed the render and the frame is on screen. On every re-render React compares each dependency to its previous value with `Object.is`; if any changed (or there is no array at all), it first runs the **previous** effect's cleanup, then runs the new effect. On unmount it runs the last cleanup. An empty array means "mount and unmount only".
+
+| Dependency argument | Effect runs | Cleanup runs |
+|---|---|---|
+| omitted | after every render | before every re-run and on unmount |
+| `[]` | once after mount | on unmount |
+| `[a, b]` | after mount and whenever `a` or `b` changes (`Object.is`) | before each re-run and on unmount |
+
+```mermaid
+flowchart TD
+    Render["Render: component function runs"] --> Commit["Commit: native views updated"]
+    Commit --> Paint["Frame shown to the user"]
+    Paint --> First{"First mount?"}
+    First -->|"yes"| RunEff["Run effect body"]
+    First -->|"no"| Changed{"Any dependency changed?<br/>(Object.is)"}
+    Changed -->|"no"| Skip["Skip effect"]
+    Changed -->|"yes"| Cleanup["Run previous cleanup<br/>(sees the OLD props and state)"]
+    Cleanup --> RunEff
+    RunEff --> Idle(["Wait for next render"])
+    Skip --> Idle
+    Idle -->|"props or state change"| Render
+    Idle -->|"unmount"| FinalClean["Run last cleanup"]
+```
+*Figure: useEffect run and cleanup lifecycle for a single effect.*
+
+The cleanup belongs to the render that created it, so it closes over the *old* values. That is exactly what you want: disconnect from the old room, not the new one.
+
+```tsx title="src/chat/ChatRoom.tsx"
+import { useEffect, useState } from 'react';
+import { FlatList, Text } from 'react-native';
+import { chatClient, type Message } from './chatClient';
+
+export function ChatRoom({ roomId }: { roomId: string }) {
+  const [messages, setMessages] = useState<Message[]>([]);
+
+  // Render as <ChatRoom key={roomId} roomId={roomId} /> so state resets per room.
+  useEffect(() => {
+    const connection = chatClient.connect(roomId);
+    const unsubscribe = connection.onMessage((m) =>
+      setMessages((prev) => [...prev, m]), // functional update: no dependency on `messages`
+    );
+    return () => {
+      unsubscribe();
+      connection.disconnect(); // runs for the OLD roomId before connecting to the new one
+    };
+  }, [roomId]);
+
+  return (
+    <FlatList
+      data={messages}
+      keyExtractor={(m) => m.id}
+      renderItem={({ item }) => <Text>{item.text}</Text>}
+    />
+  );
+}
+```
+
+**Dependency rules that matter in practice**
+
+- Every *reactive* value read inside the effect (props, state, anything computed during render, functions declared in the component) must be listed. Module constants and state setters don't need to be.
+- Objects, arrays and inline functions get a new identity every render, so listing them re-runs the effect every render. Fix by depending on primitives (`user.id` instead of `user`), creating the object *inside* the effect, hoisting it out of the component, or memoizing it.
+- Never silence `react-hooks/exhaustive-deps` to "make it run once". If the effect should not re-run when a value changes, that value is probably event-like logic — see the stale-closure question for `useEffectEvent`.
+- In development, `StrictMode` mounts, unmounts and re-mounts every component once, so every effect runs setup → cleanup → setup. That is a deliberate test that your cleanup is symmetric; it does not happen in release builds.
+
+> [!WARNING]
+> Many effects shouldn't exist. Derived data (filtered lists, totals, formatted strings) should be computed during render, and logic caused by a specific user action (submit, press) belongs in the event handler. Effects are for **synchronizing with external systems**: subscriptions, native modules, timers, network.
+
+> [!INTERVIEW]
+> What a senior answer includes: cleanup runs before the *next* effect as well as on unmount; comparison is `Object.is`; StrictMode double-invocation in dev; "you might not need an effect". Red flags: "cleanup only runs on unmount", disabling the lint rule. Likely follow-ups: race conditions in fetch effects, stale closures, `useLayoutEffect` differences.
+
+### How do you prevent race conditions when fetching data inside useEffect?
+
+**Short answer:** When a dependency changes quickly (search text, selected user), several requests are in flight and can resolve out of order, so an older response overwrites a newer one. In the cleanup, either **abort** the request with `AbortController` or set an **`ignore` flag** so late responses are discarded. In production code, a data library like TanStack Query handles this for you because results are keyed by query key.
+
+The bug looks like this: the user types `re`, then `react`; the `re` request is slower and lands last, so the list shows results for `re` under a search box that says `react`.
+
+**Fix 1 — AbortController (cancels the network request too):**
+
+```tsx title="src/users/useUser.ts"
+import { useEffect, useState } from 'react';
+
+type Status = 'idle' | 'loading' | 'success' | 'error';
+
+export function useUser(userId: string) {
+  const [user, setUser] = useState<User | null>(null);
+  const [status, setStatus] = useState<Status>('idle');
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setStatus('loading');
+
+    fetch(`${API_URL}/users/${userId}`, { signal: controller.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json() as Promise<User>;
+      })
+      .then((data) => {
+        setUser(data);
+        setStatus('success');
+      })
+      .catch((err: unknown) => {
+        if (err instanceof Error && err.name === 'AbortError') return; // expected on cleanup
+        setStatus('error');
+      });
+
+    return () => controller.abort();
+  }, [userId]);
+
+  return { user, status };
+}
+```
+
+**Fix 2 — ignore flag (works with any promise, e.g. an SDK that takes no signal):**
+
+```tsx
+useEffect(() => {
+  let ignore = false;
+
+  async function load() {
+    const results = await searchProducts(query); // effect callbacks can't be async themselves
+    if (!ignore) setResults(results);
+  }
+  load();
+
+  return () => {
+    ignore = true;
+  };
+}, [query]);
+```
+
+| Technique | Stops network work | Works with any promise | Notes |
+|---|---|---|---|
+| `AbortController` | Yes (fetch, axios `signal`) | No | Must swallow `AbortError` |
+| `ignore` flag | No | Yes | Simplest, zero dependencies |
+| TanStack Query / RTK Query | Yes (passes `signal` to your fn) | Yes | Also caches, dedupes, retries |
+
+Pitfalls:
+
+- `useEffect(async () => …)` is wrong: an async function returns a Promise, and React expects the return value to be a cleanup function.
+- The old "Can't perform a React state update on an unmounted component" warning was removed in React 18. The real problem was never the warning; it is **showing wrong data**.
+- Debouncing the input reduces the number of requests but does **not** remove the race; you still need abort or ignore.
+
+> [!INTERVIEW]
+> What a senior answer includes: explains *why* responses reorder, shows both abort and ignore, and says they would use a query library in real code. Likely follow-ups: "How does TanStack Query avoid this?" (keys and observers — the component only reads the cache entry for the current key), "How do you cancel axios?" (`signal`, `CancelToken` is deprecated).
+
+### What is a stale closure in React, and how do you fix it?
+
+**Short answer:** Every render creates new functions that capture *that render's* props and state. If a function outlives its render — an interval, a listener subscribed once, a memoized callback with missing dependencies — it keeps reading the old values. Fixes: functional state updates, correct dependencies, a "latest value" ref, or `useEffectEvent` (stable in React 19.2) for event-like logic inside effects.
+
+```tsx
+// BUG: the interval closes over count from the first render, forever 0 + 1
+const [count, setCount] = useState(0);
+useEffect(() => {
+  const id = setInterval(() => setCount(count + 1), 1000);
+  return () => clearInterval(id);
+}, []);
+```
+
+**Fix 1 — functional update** (best when you only need the previous state):
+
+```tsx
+useEffect(() => {
+  const id = setInterval(() => setCount((c) => c + 1), 1000);
+  return () => clearInterval(id);
+}, []);
+```
+
+**Fix 2 — correct dependencies**: add the value to the dependency array and let the effect re-subscribe. Correct, but sometimes wasteful (re-connecting a socket every time a theme changes).
+
+**Fix 3 — latest-value ref**: keep the subscription stable and read fresh values through a ref.
+
+```tsx title="src/hooks/useLatest.ts"
+import { useLayoutEffect, useRef } from 'react';
+
+export function useLatest<T>(value: T) {
+  const ref = useRef(value);
+  useLayoutEffect(() => {
+    ref.current = value; // updated after commit, never during render
+  });
+  return ref;
+}
+```
+
+```tsx
+const userRef = useLatest(user);
+
+useEffect(() => {
+  const sub = AppState.addEventListener('change', (next) => {
+    if (next === 'active') analytics.track('foreground', { userId: userRef.current?.id });
+  });
+  return () => sub.remove();
+}, [userRef]); // ref identity is stable, so this subscribes once
+```
+
+**Fix 4 — `useEffectEvent`** (React 19.2+, so RN versions that ship React 19.2): declares a function that always sees the latest props/state but is *not* a dependency.
+
+```tsx
+import { useEffect, useEffectEvent } from 'react';
+
+function Room({ roomId, theme }: { roomId: string; theme: 'light' | 'dark' }) {
+  const onConnected = useEffectEvent(() => {
+    showToast(`Connected to ${roomId}`, theme); // reads latest theme
+  });
+
+  useEffect(() => {
+    const connection = connect(roomId);
+    connection.on('connected', onConnected);
+    return () => connection.disconnect();
+  }, [roomId]); // theme changes no longer reconnect
+  return null;
+}
+```
+
+Common RN sources of stale closures: `AppState`/`Keyboard`/`Linking` listeners registered once, `navigation.addListener`, `setTimeout` in press handlers, Reanimated `runOnJS` callbacks captured at gesture start, and `useCallback` with a hand-trimmed dependency list.
+
+> [!INTERVIEW]
+> Red flags: "just add `// eslint-disable-next-line`". Strong answers name the mechanism (closures capture per-render values) and pick the fix by intent: previous state → functional update; should re-sync → dependency; event-like read → ref or `useEffectEvent`.
+
+### When do useCallback and useMemo actually help, when are they noise, and how does React Compiler change this?
+
+**Short answer:** They are caches keyed by dependencies. They help only when **referential stability** matters (a prop to a `memo` child or list row, an effect dependency, a context value) or when a computation is **genuinely expensive**. Everywhere else they add code and a small cost for nothing. React Compiler (stable since v1.0, October 2025) memoizes components and hooks automatically at build time, so in compiled code most manual memoization goes away — but your code must follow the Rules of React for the compiler to optimize it.
+
+| Helps | Noise |
+|---|---|
+| Callback passed to a `React.memo` component or a list row | Callback passed to a host component (`Pressable`, `TextInput`) |
+| Value used in an effect's dependency array | Cheap derived values (`items.length`, a string format) |
+| Context provider `value` objects | Components that render rarely or are cheap |
+| Sorting/filtering thousands of items each render | Wrapping everything "just in case" |
+| Stable `renderItem` / `keyExtractor` for large lists | When the child re-renders anyway because another prop changes |
+
+```tsx
+const ProductRow = memo(function ProductRow({ item, onPress }: RowProps) {
+  return (
+    <Pressable onPress={() => onPress(item.id)}>
+      <Text>{item.title}</Text>
+    </Pressable>
+  );
+});
+
+function ProductList({ products, query }: { products: Product[]; query: string }) {
+  const navigation = useNavigation();
+  const visible = useMemo(
+    () => products.filter((p) => p.title.toLowerCase().includes(query.toLowerCase())),
+    [products, query], // worth it for large arrays
+  );
+  const handlePress = useCallback(
+    (id: string) => navigation.navigate('ProductDetails', { id }),
+    [navigation], // stable, so memoized rows skip re-rendering
+  );
+  return (
+    <FlatList
+      data={visible}
+      keyExtractor={(p) => p.id}
+      renderItem={({ item }) => <ProductRow item={item} onPress={handlePress} />}
+    />
+  );
+}
+```
+
+**How React Compiler changes the picture**
+
+- It analyzes each component and hook and inserts fine-grained caching, including for JSX elements and inline callbacks, so the code above works without `memo`, `useMemo` or `useCallback`.
+- Expo templates enable it (`"experiments": { "reactCompiler": true }` in `app.json`). In bare RN add `babel-plugin-react-compiler` to `babel.config.js`; it must run **first** in the plugin list, while the Reanimated/worklets plugin stays **last**.
+- It silently skips components that break the rules (mutating props or state, reading `ref.current` during render, conditional hooks). Use the compiler-aware rules in recent `eslint-plugin-react-hooks` to find them; React DevTools shows a "Memo" badge on optimized components.
+- `useMemo`/`useCallback` remain valid escape hatches — for example to control exactly when an effect dependency changes. Opt a file or function out with the `'use no memo'` directive while debugging.
+
+> [!TIP]
+> Don't rip out existing memoization when you turn the compiler on; it is compatible. Stop adding new manual memoization and delete it opportunistically once the compiled build is profiled.
+
+> [!INTERVIEW]
+> What a senior answer includes: memoization is about identity, not "performance magic"; `useCallback` without a memoized consumer does nothing; measure with the React DevTools profiler first. Mention the compiler, its build setup, and that it bails out on rule violations. Red flag: "I wrap every function in useCallback".
+
+### What are the main uses of useRef in React Native?
+
+**Short answer:** `useRef` is a mutable box that survives re-renders and does **not** trigger a render when changed. Three uses: (1) instance variables — timer IDs, flags, the latest value of something, (2) handles to native components — `focus()`, `measure()`, `scrollToOffset()`, and (3) lazily creating an expensive object once. Don't read or write `ref.current` during render (lazy init is the one allowed exception).
+
+**1. Mutable instance values**
+
+```tsx
+function useCountdown(seconds: number) {
+  const [left, setLeft] = useState(seconds);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stop = useCallback(() => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
+  }, []);
+
+  const start = useCallback(() => {
+    if (timerRef.current) return; // guard double start without re-rendering
+    timerRef.current = setInterval(() => setLeft((s) => Math.max(0, s - 1)), 1000);
+  }, []);
+
+  useEffect(() => {
+    if (left === 0) stop(); // side effects live in effects, never in state updaters
+  }, [left, stop]);
+
+  useEffect(() => stop, [stop]); // clear on unmount
+
+  return { left, start, stop };
+}
+```
+
+**2. Refs to native components**
+
+```tsx
+const inputRef = useRef<TextInput>(null);
+const listRef = useRef<FlatList<Message>>(null);
+
+<TextInput ref={inputRef} />
+<Button title="Edit" onPress={() => inputRef.current?.focus()} />
+<Button title="Top" onPress={() => listRef.current?.scrollToOffset({ offset: 0, animated: true })} />
+```
+
+In React 19, `ref` is a regular prop on function components, so custom inputs no longer need `forwardRef` (it still works).
+
+**3. Previous value** — two versions, and the difference is a good senior talking point:
+
+```tsx title="src/hooks/usePrevious.ts"
+// Classic ref version: works, but reads ref.current during render,
+// which React docs discourage and React Compiler treats as a rule violation.
+export function usePreviousRef<T>(value: T): T | undefined {
+  const ref = useRef<T | undefined>(undefined);
+  useEffect(() => {
+    ref.current = value;
+  }, [value]);
+  return ref.current;
+}
+
+// Render-safe version: store the previous value in state and adjust during render.
+export function usePrevious<T>(value: T): T | undefined {
+  const [current, setCurrent] = useState(value);
+  const [previous, setPrevious] = useState<T | undefined>(undefined);
+  if (!Object.is(value, current)) {
+    setPrevious(current);
+    setCurrent(value);
+  }
+  return previous;
+}
+```
+
+**Lazy one-time initialization**
+
+```tsx
+const playerRef = useRef<AudioPlayer | null>(null);
+if (playerRef.current === null) {
+  playerRef.current = createAudioPlayer(); // allowed: runs once, deterministic
+}
+```
+
+| Need | Use |
+|---|---|
+| Value shown in UI | `useState` |
+| Value only read in handlers/effects | `useRef` |
+| Imperative handle to a native view | `useRef<ComponentType>(null)` |
+| Value per render that drives an animation on the UI thread | Reanimated `useSharedValue` |
+
+> [!WARNING]
+> Changing `ref.current` never re-renders. If the UI must reflect it, it's state. And a ref attached to a view is `null` until after the first commit — access it in effects or handlers, not during render.
+
+### When would you use useLayoutEffect in React Native, and what changed with the New Architecture?
+
+**Short answer:** `useLayoutEffect` runs synchronously after React commits but **before the frame is shown**. With the New Architecture (Fabric), layout is computed synchronously in C++, so you can measure a view in `useLayoutEffect`, set state, and React applies that update before paint — no flicker. Under the old architecture layout ran asynchronously on a shadow thread, so measuring in a layout effect couldn't reliably prevent a visible jump. Use it only for measure-then-position work; it blocks the frame.
+
+Typical cases: tooltips and popovers positioned relative to an anchor, auto-sizing a container to its content, scrolling to an initial position before the user sees the list, and synchronizing an imperative native value that must match the first frame.
+
+```tsx title="src/ui/Tooltip.tsx"
+import { useLayoutEffect, useRef, useState, type RefObject } from 'react';
+import { Text, View } from 'react-native';
+
+type Props = { anchorRef: RefObject<View | null>; text: string };
+
+export function Tooltip({ anchorRef, text }: Props) {
+  const tooltipRef = useRef<View>(null);
+  const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
+
+  useLayoutEffect(() => {
+    // On Fabric these measurements are available synchronously in a layout effect,
+    // and the state update below is flushed before the frame is painted.
+    anchorRef.current?.measureInWindow((x, y, _width, _height) => {
+      tooltipRef.current?.measureInWindow((_tx, _ty, _tw, tooltipHeight) => {
+        setPosition({ top: y - tooltipHeight - 8, left: x });
+      });
+    });
+  }, [anchorRef, text]);
+
+  return (
+    <View
+      ref={tooltipRef}
+      style={{ position: 'absolute', top: position?.top ?? 0, left: position?.left ?? 0, opacity: position ? 1 : 0 }}
+    >
+      <Text>{text}</Text>
+    </View>
+  );
+}
+```
+
+| | `useEffect` | `useLayoutEffect` | `onLayout` |
+|---|---|---|---|
+| Timing | After paint | After commit, before paint | After native layout, delivered asynchronously |
+| Blocks frame | No | Yes | No |
+| Flicker when repositioning | Likely | No (on Fabric) | Likely (one frame at the old size) |
+| Use for | Subscriptions, fetching | Measure and position | Reacting to size changes over time |
+
+Recent New Architecture releases also expose DOM-like methods on host component refs (for example `getBoundingClientRect()`); check your RN version's docs before relying on them.
+
+> [!WARNING]
+> Heavy work in `useLayoutEffect` delays the frame directly — keep it to measurement and a single state update. And code copied from pre-Fabric apps that "fixes" flicker with `setTimeout`, `requestAnimationFrame` or `opacity: 0` then `onLayout` can often be simplified now.
+
+> [!INTERVIEW]
+> Strong answers connect the hook to the renderer: synchronous layout plus a synchronous commit path is what makes the flicker go away, and that came with Fabric (default since RN 0.76). Follow-up: "What else does synchronous layout enable?" — concurrent features such as transitions, and consistent reads of layout from JS. See the [New Architecture guide](../guides/new-architecture.html).
+
+### When would you choose useReducer over useState?
+
+**Short answer:** Use `useReducer` when several pieces of state change together, when the next state depends on the previous one through non-trivial rules, or when you want explicit, testable state transitions (effectively a small state machine). The reducer is a pure function you can unit-test without rendering, and `dispatch` has a stable identity, so you can pass it down without `useCallback`.
+
+A discriminated-union state makes impossible states unrepresentable (no `isLoading && error && data` combinations):
+
+```tsx title="src/orders/ordersReducer.ts"
+export type OrdersState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'success'; orders: Order[] }
+  | { status: 'error'; message: string };
+
+export type OrdersAction =
+  | { type: 'fetch' }
+  | { type: 'resolved'; orders: Order[] }
+  | { type: 'rejected'; message: string }
+  | { type: 'reset' };
+
+export function ordersReducer(state: OrdersState, action: OrdersAction): OrdersState {
+  switch (action.type) {
+    case 'fetch':
+      return { status: 'loading' };
+    case 'resolved':
+      // Ignore late responses if the user already reset the screen
+      return state.status === 'loading' ? { status: 'success', orders: action.orders } : state;
+    case 'rejected':
+      return state.status === 'loading' ? { status: 'error', message: action.message } : state;
+    case 'reset':
+      return { status: 'idle' };
+  }
+}
+```
+
+```tsx
+const [state, dispatch] = useReducer(ordersReducer, { status: 'idle' });
+
+if (state.status === 'success') {
+  // TypeScript narrows: state.orders is available here and only here
+}
+```
+
+| Prefer `useState` | Prefer `useReducer` |
+|---|---|
+| Independent primitives (a toggle, an input value) | Multiple values that must change atomically |
+| Simple "set to X" updates | Transitions with rules ("can only resolve while loading") |
+| Logic is trivial | Logic deserves unit tests outside React |
+| — | Deep children trigger updates (pass `dispatch` via context) |
+
+Pitfalls: reducers must be pure — no API calls, no `Date.now()`, no mutation (StrictMode calls them twice in dev to catch this). If a `useReducer` plus Context setup starts to grow middleware, persistence and devtools needs, that's the point to adopt Redux Toolkit or Zustand rather than rebuilding them.
+
+### How would you write reusable custom hooks such as useDebounce, useAppState and useKeyboard?
+
+**Short answer:** A custom hook is a function starting with `use` that composes other hooks to share **stateful logic**, not state — every component calling it gets its own independent state. Good hooks subscribe in an effect, clean up symmetrically, avoid stale closures for callbacks, and return a small, stable API.
+
+```tsx title="src/hooks/useDebounce.ts"
+import { useEffect, useState } from 'react';
+
+export function useDebounce<T>(value: T, delayMs = 300): T {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(id); // each keystroke cancels the pending update
+  }, [value, delayMs]);
+
+  return debounced;
+}
+
+// Usage: debounce the *value*, then let the query key drive fetching
+// const debouncedQuery = useDebounce(query, 400);
+// const results = useQuery({ queryKey: ['search', debouncedQuery], queryFn: ... , enabled: debouncedQuery.length > 1 });
+```
+
+```tsx title="src/hooks/useAppState.ts"
+import { useEffect, useRef, useState } from 'react';
+import { AppState, type AppStateStatus } from 'react-native';
+
+export function useAppState(onForeground?: () => void): AppStateStatus {
+  const [appState, setAppState] = useState<AppStateStatus>(AppState.currentState);
+  const previous = useRef<AppStateStatus>(AppState.currentState);
+  const onForegroundRef = useRef(onForeground);
+
+  useEffect(() => {
+    onForegroundRef.current = onForeground; // latest callback, no resubscribe
+  });
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (next) => {
+      if (previous.current.match(/inactive|background/) && next === 'active') {
+        onForegroundRef.current?.();
+      }
+      previous.current = next;
+      setAppState(next);
+    });
+    return () => subscription.remove();
+  }, []);
+
+  return appState;
+}
+```
+
+```tsx title="src/hooks/useKeyboard.ts"
+import { useEffect, useState } from 'react';
+import { Keyboard, Platform, type KeyboardEvent } from 'react-native';
+
+type KeyboardState = { visible: boolean; height: number };
+
+export function useKeyboard(): KeyboardState {
+  const [state, setState] = useState<KeyboardState>({ visible: false, height: 0 });
+
+  useEffect(() => {
+    // keyboardWill* events only fire on iOS; Android only has keyboardDid*
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+
+    const onShow = (e: KeyboardEvent) => setState({ visible: true, height: e.endCoordinates.height });
+    const onHide = () => setState({ visible: false, height: 0 });
+
+    const showSub = Keyboard.addListener(showEvent, onShow);
+    const hideSub = Keyboard.addListener(hideEvent, onHide);
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
+  return state;
+}
+```
+
+Design notes:
+
+- **Callbacks as refs**: `useAppState(onForeground)` would resubscribe on every render if the callback were a dependency; the ref pattern (or `useEffectEvent`) avoids that.
+- **Don't animate with React state**: `useKeyboard` is fine for toggling UI, but driving a per-frame animation through `setState` is janky. Use `react-native-keyboard-controller`'s Reanimated hooks for that.
+- **Sharing state**: if two components must see the *same* value, a custom hook isn't enough — lift state up, use a store, or `useSyncExternalStore` over a shared source.
+- **Test hooks** with `renderHook` from React Native Testing Library.
+
+> [!INTERVIEW]
+> Likely follow-ups: "Why is the `inactive` state iOS-only?", "Two components call `useDebounce` — do they share a timer?" (no), "How would you test `useAppState`?" (mock `AppState.addEventListener`, invoke the captured listener inside `act`).
+
+### What are the Rules of Hooks, and why do they exist?
+
+**Short answer:** Call hooks only at the **top level** of function components or custom hooks — never inside conditions, loops, nested functions, after an early `return`, or in class components and plain utilities. React doesn't identify hooks by name; it stores them in an ordered list on the component's fiber and matches them by **call order**. If the order changes between renders, hook N reads hook N-1's state.
+
+```tsx
+// BROKEN: the early return changes how many hooks run
+function Profile({ userId }: { userId?: string }) {
+  if (!userId) return <SignInPrompt />;
+  const [tab, setTab] = useState<'posts' | 'likes'>('posts'); // hook #1 only sometimes
+  const query = useQuery({ queryKey: ['user', userId], queryFn: () => fetchUser(userId) });
+  // ...
+}
+
+// FIXED: hooks first, branch after (or split into two components)
+function Profile({ userId }: { userId?: string }) {
+  const [tab, setTab] = useState<'posts' | 'likes'>('posts');
+  const query = useQuery({
+    queryKey: ['user', userId],
+    queryFn: () => fetchUser(userId!),
+    enabled: !!userId, // make the hook conditional in behavior, not in existence
+  });
+  if (!userId) return <SignInPrompt />;
+  // ...
+}
+```
+
+Mechanically, on each render React walks a cursor through the hook list: first `useState` call → slot 0, first `useQuery` → slots 1..n. A skipped call shifts every later slot, which is why React throws "Rendered fewer hooks than expected" or, worse, silently mixes state.
+
+The broader **Rules of React** matter even more now that React Compiler exists: components and hooks must be pure and idempotent during render, props and state are immutable, values passed to JSX must not be mutated afterwards, and hook return values/arguments must not be mutated. The compiler relies on these guarantees and skips code that violates them.
+
+- Enforce with `eslint-plugin-react-hooks` (`rules-of-hooks`, `exhaustive-deps`, plus the compiler-powered rules in recent versions).
+- The one exception: React 19's `use()` can be called conditionally and in loops, because it reads a promise or context rather than owning a slot of state.
+
+> [!INTERVIEW]
+> The key word is **order**. Red flag: "because React says so" or "because hooks are slow in conditions". Follow-up: "How do you conditionally subscribe?" — keep the hook unconditional and pass a flag (`enabled`, a `null` key, an early exit *inside* the effect).
+
+### What is useSyncExternalStore, and when do you need it?
+
+**Short answer:** It's React's official way to subscribe a component to a mutable store that lives **outside** React — a custom store, MMKV, a socket client, a native module emitting events. You give it `subscribe` and `getSnapshot`; React re-renders when the snapshot changes (`Object.is`) and guarantees all components see the same value during a concurrent render (no "tearing"). Zustand and React Redux are built on it.
+
+```tsx title="src/store/createStore.ts"
+import { useSyncExternalStore } from 'react';
+
+type Listener = () => void;
+
+export function createStore<T>(initial: T) {
+  let state = initial;
+  const listeners = new Set<Listener>();
+
+  return {
+    getState: () => state,
+    setState(updater: (prev: T) => T) {
+      const next = updater(state);
+      if (Object.is(next, state)) return;
+      state = next; // immutable replacement: the snapshot identity changes
+      listeners.forEach((l) => l());
+    },
+    subscribe(listener: Listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+}
+
+type CartState = { items: CartItem[]; coupon: string | null };
+export const cartStore = createStore<CartState>({ items: [], coupon: null });
+
+export function useCart<S>(selector: (s: CartState) => S): S {
+  return useSyncExternalStore(
+    cartStore.subscribe, // must be a stable reference, or React resubscribes every render
+    () => selector(cartStore.getState()),
+  );
+}
+
+// const count = useCart((s) => s.items.length);   // primitive: safe
+// const items = useCart((s) => s.items);          // existing reference: safe
+// const view = useCart((s) => ({ n: s.items.length })); // new object each call: infinite loop
+```
+
+**Rules for `getSnapshot`:** it must return the **same reference** when nothing changed. Returning a freshly built object or array makes React think the store changes on every check and ends in "The result of getSnapshot should be cached" / "Maximum update depth exceeded". Select primitives or existing references, or memoize derived snapshots.
+
+| Situation | Tool |
+|---|---|
+| Value owned by React | `useState` / `useReducer` |
+| Mutable external source with a change event | `useSyncExternalStore` |
+| Syncing *to* an external system (you push changes out) | `useEffect` |
+| App-wide client state with selectors and middleware | Zustand / Redux Toolkit (both use it internally) |
+
+Before React 18, people wrote `useEffect(() => store.subscribe(() => setState(store.get())))`. That pattern renders once with a stale value, can miss an update between render and subscription, and can tear under concurrent rendering.
+
+> [!INTERVIEW]
+> Mention tearing and concurrent rendering as the reason it exists, the cached-snapshot rule, and that it is mostly a *library-author* API. A good follow-up answer: "I'd reach for it when wrapping a native SDK that emits events, such as a Bluetooth connection state."
+
+## State management
+
+### How do you categorize state in a React Native app, and how do you choose a tool for each kind?
+
+**Short answer:** Split state by **where it comes from and who owns it**: local UI state (`useState`), global client state (Zustand, Redux Toolkit, or Context for rarely changing values), **server state** — a cache of data the backend owns (TanStack Query or RTK Query), navigation/URL state (route params that deep links can reproduce), and form state (react-hook-form). Most "state management" pain comes from treating server state as client state.
+
+```mermaid
+flowchart TD
+    Q{"Who owns the source of truth?"}
+    Q -->|"the backend"| Server["Server state<br/>TanStack Query / RTK Query"]
+    Q -->|"the app"| Client{"Who needs it?"}
+    Client -->|"one component or subtree"| Local["Local state<br/>useState / useReducer"]
+    Client -->|"many unrelated screens"| Global["Global client state<br/>Zustand / Redux Toolkit"]
+    Client -->|"rarely changes, app-wide"| Ctx["Context<br/>theme, locale, session, DI"]
+    Client -->|"identifies what screen shows"| Nav["Navigation state<br/>route params, deep links"]
+    Client -->|"input being edited"| Form["Form state<br/>react-hook-form"]
+    Server --> Persist{"Must survive restart?"}
+    Global --> Persist
+    Persist -->|"yes"| Disk[("MMKV / SQLite persister")]
+```
+*Figure: A decision map for where a piece of state should live.*
+
+| Category | Examples | Tool | Persist? |
+|---|---|---|---|
+| Local UI | modal open, selected tab, input focus | `useState`, `useReducer` | No |
+| Global client | auth session, cart, feature flags, onboarding done | Zustand, Redux Toolkit | Often (MMKV) |
+| Low-frequency app-wide | theme, locale, DI of services | Context | Sometimes |
+| Server cache | products, profile, feed | TanStack Query, RTK Query | Optional (offline) |
+| Navigation | `orderId` of the details screen, active tab | React Navigation / Expo Router params | Via state persistence |
+| Form | draft values, validation errors, dirty flags | react-hook-form | Drafts only |
+
+**How to choose, pragmatically**
+
+1. Start with local state plus a server-state library. That covers most screens of most apps.
+2. Add a small global store only for genuinely global client state (session, cart, preferences). Zustand is the lightweight default; Redux Toolkit when a large team benefits from strict conventions, middleware, devtools time-travel, or you already have Redux.
+3. Keep Context for values that change rarely or for dependency injection.
+4. Don't copy route params or server data into a global store "for convenience" — you create two sources of truth that drift.
+
+> [!INTERVIEW]
+> What a senior answer includes: the server-vs-client distinction and *why* (caching, staleness, dedupe, retries are solved problems), explicit criteria for Redux vs Zustand, and awareness that URL/navigation state is state. Red flag: "we put everything in Redux, including API responses and loading flags for every call".
+
+### What are the pitfalls of React Context for state, and how do you avoid them?
+
+**Short answer:** When a provider's `value` changes identity, **every** component that consumes that context re-renders, and `React.memo` can't stop it. Pitfalls: an inline `value={{ … }}` object re-renders all consumers on every provider render, and one big context mixes fast- and slow-changing data. Fixes: memoize the value, split contexts (state vs actions, or by domain), keep high-frequency state out of Context, or move to a store with selectors.
+
+```tsx title="src/auth/AuthProvider.tsx"
+import { createContext, useContext, useMemo, useReducer, type PropsWithChildren } from 'react';
+
+type AuthState = { user: User | null; status: 'restoring' | 'signedIn' | 'signedOut' };
+type AuthActions = { signIn: (token: string, user: User) => void; signOut: () => void };
+
+const AuthStateContext = createContext<AuthState | null>(null);
+const AuthActionsContext = createContext<AuthActions | null>(null);
+
+export function AuthProvider({ children }: PropsWithChildren) {
+  const [state, dispatch] = useReducer(authReducer, { user: null, status: 'restoring' });
+
+  // Actions depend only on the stable dispatch, so this object never changes identity
+  const actions = useMemo<AuthActions>(
+    () => ({
+      signIn: (token, user) => dispatch({ type: 'signedIn', token, user }),
+      signOut: () => dispatch({ type: 'signedOut' }),
+    }),
+    [],
+  );
+
+  return (
+    <AuthActionsContext.Provider value={actions}>
+      <AuthStateContext.Provider value={state}>{children}</AuthStateContext.Provider>
+    </AuthActionsContext.Provider>
+  );
+}
+
+export function useAuthState() {
+  const ctx = useContext(AuthStateContext);
+  if (!ctx) throw new Error('useAuthState must be used inside AuthProvider');
+  return ctx;
+}
+
+export function useAuthActions() {
+  const ctx = useContext(AuthActionsContext);
+  if (!ctx) throw new Error('useAuthActions must be used inside AuthProvider');
+  return ctx;
+}
+```
+
+Now a "Sign out" button that only calls `useAuthActions()` never re-renders when the user object changes.
+
+| Pitfall | Symptom | Fix |
+|---|---|---|
+| Inline `value={{ user, setUser }}` | Every consumer re-renders whenever the provider's parent renders | `useMemo` the value (or let React Compiler do it) |
+| One mega-context | Typing in a search box re-renders the whole app | Split by domain and by update frequency |
+| High-frequency data (scroll offset, timers, text input) | Jank | Local state, refs, Reanimated shared values, or a store |
+| Consumer needs one field | Re-renders on any field change | Store with selectors (Zustand, Redux, `useSyncExternalStore`) |
+| Missing provider | Silent default value | `null` default plus a throwing hook, as above |
+
+In React 19 you can render `<AuthStateContext value={state}>` directly instead of `.Provider`, and read context with `use(AuthStateContext)`, which may be called conditionally.
+
+> [!INTERVIEW]
+> Follow-up: "Context vs Redux?" — Context is a **transport** mechanism (dependency injection), not a state manager: no selectors, no middleware, no devtools. It's ideal for theme, locale, the current user, and injecting services like an API client.
+
+### How do Redux Toolkit slices, createAsyncThunk and RTK Query fit together?
+
+**Short answer:** Redux Toolkit is the official, opinionated way to write Redux. `createSlice` generates action creators and an Immer-powered reducer for a piece of **client** state; `createAsyncThunk` wraps an async operation and dispatches `pending`/`fulfilled`/`rejected` actions you handle in `extraReducers`; **RTK Query** is a data-fetching and caching layer on top — for server state you should reach for it instead of hand-written thunks, because it gives caching, dedupe, invalidation by tags, polling and generated hooks.
+
+```ts title="src/store/sessionSlice.ts"
+import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
+
+type SessionState = { user: User | null; status: 'idle' | 'loading' | 'failed'; error?: string };
+const initialState: SessionState = { user: null, status: 'idle' };
+
+export const signIn = createAsyncThunk<User, Credentials, { rejectValue: string }>(
+  'session/signIn',
+  async (credentials, { rejectWithValue, signal }) => {
+    try {
+      const { data } = await api.post<User>('/auth/sign-in', credentials, { signal });
+      return data;
+    } catch (e) {
+      return rejectWithValue(toErrorMessage(e));
+    }
+  },
+);
+
+const sessionSlice = createSlice({
+  name: 'session',
+  initialState,
+  reducers: {
+    signedOut: () => initialState,
+    profileUpdated: (state, action: PayloadAction<Partial<User>>) => {
+      if (state.user) Object.assign(state.user, action.payload); // Immer: "mutation" is safe here
+    },
+  },
+  extraReducers: (builder) => {
+    builder
+      .addCase(signIn.pending, (state) => {
+        state.status = 'loading';
+        state.error = undefined;
+      })
+      .addCase(signIn.fulfilled, (state, action) => {
+        state.status = 'idle';
+        state.user = action.payload;
+      })
+      .addCase(signIn.rejected, (state, action) => {
+        state.status = 'failed';
+        state.error = action.payload ?? 'Unknown error';
+      });
+  },
+});
+
+export const { signedOut, profileUpdated } = sessionSlice.actions;
+export default sessionSlice.reducer;
+```
+
+```ts title="src/store/api.ts"
+import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';
+import type { RootState } from './store';
+
+export const api = createApi({
+  reducerPath: 'api',
+  baseQuery: fetchBaseQuery({
+    baseUrl: API_URL,
+    prepareHeaders: (headers, { getState }) => {
+      const token = (getState() as RootState).auth.accessToken;
+      if (token) headers.set('Authorization', `Bearer ${token}`);
+      return headers;
+    },
+  }),
+  tagTypes: ['Order'],
+  endpoints: (build) => ({
+    getOrders: build.query<Order[], void>({
+      query: () => '/orders',
+      providesTags: (result = []) => [
+        ...result.map(({ id }) => ({ type: 'Order' as const, id })),
+        { type: 'Order' as const, id: 'LIST' },
+      ],
+    }),
+    createOrder: build.mutation<Order, NewOrder>({
+      query: (body) => ({ url: '/orders', method: 'POST', body }),
+      invalidatesTags: [{ type: 'Order', id: 'LIST' }], // refetches getOrders automatically
+    }),
+  }),
+});
+
+export const { useGetOrdersQuery, useCreateOrderMutation } = api;
+```
+
+```ts title="src/store/store.ts"
+import { configureStore } from '@reduxjs/toolkit';
+import { useDispatch, useSelector } from 'react-redux';
+
+export const store = configureStore({
+  reducer: { session: sessionReducer, auth: authReducer, [api.reducerPath]: api.reducer },
+  middleware: (getDefault) => getDefault().concat(api.middleware),
+});
+
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
+export const useAppDispatch = useDispatch.withTypes<AppDispatch>();
+export const useAppSelector = useSelector.withTypes<RootState>();
+```
+
+RN-specific notes:
+
+- RTK Query's `refetchOnFocus` / `refetchOnReconnect` rely on `setupListeners`, whose defaults listen to browser `window` events. In React Native, pass a custom handler to `setupListeners` that wires `AppState` and NetInfo.
+- Persisting with `redux-persist` works, but never persist the RTK Query cache blindly, and never put tokens in unencrypted storage (see the storage question).
+
+> [!INTERVIEW]
+> Red flags: writing a thunk plus three reducers plus loading flags for every GET in a new codebase, or not knowing RTK Query exists. Good follow-up answers: tag invalidation vs manual `updateQueryData` for optimistic updates, and typed hooks with `.withTypes()`.
+
+### How do selectors work in Zustand, and why do you need useShallow?
+
+**Short answer:** A Zustand store is a hook; you pass a **selector** and the component re-renders only when the selected value changes by `Object.is`. Selecting a primitive or an existing reference is cheap and precise. Selecting a **new object or array** each time (`s => ({ a: s.a, b: s.b })`) looks changed on every store update — in Zustand v5 it can even loop infinitely — so wrap multi-value selectors in `useShallow`, which compares one level deep.
+
+```ts title="src/store/useCartStore.ts"
+import { create } from 'zustand';
+import { createJSONStorage, persist } from 'zustand/middleware';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+type CartItem = { id: string; qty: number; price: number };
+
+type CartState = {
+  items: CartItem[];
+  coupon: string | null;
+  add: (item: CartItem) => void;
+  remove: (id: string) => void;
+  clear: () => void;
+};
+
+export const useCartStore = create<CartState>()(
+  persist(
+    (set) => ({
+      items: [],
+      coupon: null,
+      add: (item) =>
+        set((s) => {
+          const existing = s.items.find((i) => i.id === item.id);
+          return {
+            items: existing
+              ? s.items.map((i) => (i.id === item.id ? { ...i, qty: i.qty + item.qty } : i))
+              : [...s.items, item],
+          };
+        }),
+      remove: (id) => set((s) => ({ items: s.items.filter((i) => i.id !== id) })),
+      clear: () => set({ items: [], coupon: null }),
+    }),
+    {
+      name: 'cart',
+      storage: createJSONStorage(() => AsyncStorage), // or an MMKV-backed StateStorage adapter
+      partialize: (s) => ({ items: s.items, coupon: s.coupon }), // don't persist functions
+    },
+  ),
+);
+```
+
+```tsx
+import { useShallow } from 'zustand/react/shallow';
+
+// Good: primitive selector, re-renders only when the count changes
+const count = useCartStore((s) => s.items.length);
+
+// Good: actions are stable references
+const add = useCartStore((s) => s.add);
+
+// Needs useShallow: returns a new object every time
+const { items, coupon } = useCartStore(useShallow((s) => ({ items: s.items, coupon: s.coupon })));
+
+// Bad: subscribes to the entire store, re-renders on any change
+const everything = useCartStore();
+
+// Outside React (interceptors, notification handlers):
+useCartStore.getState().clear();
+```
+
+| Pattern | Re-renders when | Verdict |
+|---|---|---|
+| `useStore()` | anything changes | Avoid in anything non-trivial |
+| `useStore(s => s.count)` | `count` changes | Ideal |
+| `useStore(s => ({ a, b }))` | always (new object) | Bug — use `useShallow` |
+| `useStore(useShallow(s => ({ a, b })))` | `a` or `b` changes | Good |
+| Derived: `useStore(s => s.items.filter(...))` | always (new array) | Select raw data, derive with `useMemo` |
+
+Why teams pick Zustand: tiny API, no provider, works outside React, middleware for `persist`, `devtools`, `immer` and `subscribeWithSelector`. Trade-off: fewer conventions, so large teams need to agree on store structure themselves.
+
+> [!INTERVIEW]
+> Follow-ups: "How does Zustand avoid Context re-render problems?" (external store plus `useSyncExternalStore` plus selectors), "How do you reset all stores on sign-out?" (each store exposes `reset`, or keep an initial-state snapshot and `setState(initial, true)`).
+
+### What is the difference between staleTime and gcTime in TanStack Query, and how does the cache lifecycle work in React Native?
+
+**Short answer:** `staleTime` controls how long data is considered **fresh** — while fresh, TanStack Query serves it from cache without refetching. `gcTime` (called `cacheTime` before v5) controls how long **inactive** data — no mounted component uses it — stays in memory before it is garbage collected. Defaults: `staleTime: 0` (immediately stale), `gcTime: 5 minutes`. They are independent axes: freshness decides *refetching*, activity decides *eviction*.
+
+```mermaid
+stateDiagram-v2
+    state "Fetching" as Fetching
+    state "Fresh (served from cache, no refetch)" as Fresh
+    state "Stale (shown, refetched on triggers)" as Stale
+    state "Inactive (no observers, gcTime timer running)" as Inactive
+    state "Garbage collected" as Removed
+    [*] --> Fetching : first useQuery mounts
+    Fetching --> Fresh : data received
+    Fresh --> Stale : staleTime elapses
+    Stale --> Fetching : mount, app focus, reconnect, invalidate
+    Fresh --> Inactive : last observer unmounts
+    Stale --> Inactive : last observer unmounts
+    Inactive --> Fetching : observer returns and data is stale
+    Inactive --> Fresh : observer returns while still fresh
+    Inactive --> Removed : gcTime elapses
+    Removed --> [*]
+```
+*Figure: TanStack Query cache entry lifecycle (fresh, stale, inactive, garbage collected).*
+
+**Refetch triggers** for stale queries: a new observer mounts, the app regains focus, the network reconnects, `invalidateQueries`, or `refetchInterval`. The first two rely on browser events, so React Native needs explicit wiring:
+
+```ts title="src/query/setupQuery.ts"
+import { focusManager, onlineManager, QueryClient } from '@tanstack/react-query';
+import NetInfo from '@react-native-community/netinfo';
+import { AppState, type AppStateStatus } from 'react-native';
+
+onlineManager.setEventListener((setOnline) =>
+  NetInfo.addEventListener((state) => setOnline(!!state.isConnected)), // returns unsubscribe
+);
+
+export function subscribeAppFocus() {
+  const onChange = (status: AppStateStatus) => focusManager.setFocused(status === 'active');
+  const sub = AppState.addEventListener('change', onChange);
+  return () => sub.remove();
+}
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 30_000, // most mobile data is fine for 30s; avoids refetch on every screen mount
+      gcTime: 10 * 60_000,
+      retry: 2,
+    },
+  },
+});
+```
+
+**Invalidation** marks matching queries stale and refetches the active ones:
+
+```ts
+await queryClient.invalidateQueries({ queryKey: ['orders'] }); // matches ['orders'], ['orders', id], ...
+```
+
+| Setting | Question it answers | Typical mobile value |
+|---|---|---|
+| `staleTime` | "How long can I trust this without asking the server?" | 30 s – 5 min; `Infinity` for static reference data |
+| `gcTime` | "How long do I keep unused data for instant back-navigation?" | 5 – 30 min; `>= maxAge` if persisting to disk |
+| `refetchOnWindowFocus` | Refetch when the app returns to foreground | `true` (after wiring `focusManager`) |
+| `enabled` | Should this query run at all? | Dependent queries, auth-gated data |
+
+Gotchas: a `gcTime` shorter than your persister's `maxAge` means restored data is thrown away quickly; screens kept mounted in a stack keep their queries *active*, so they refetch on app focus even when not visible — gate expensive ones with `useIsFocused` or `enabled`.
+
+> [!INTERVIEW]
+> Strong answers state the defaults, explain that stale data is still *shown* (stale-while-revalidate), and mention the RN `focusManager`/`onlineManager` wiring. Red flag: setting `staleTime: 0, gcTime: 0` "to always be fresh" — that throws away the cache and causes loading spinners on every navigation.
+
+### How do you implement optimistic updates and infinite scrolling with TanStack Query?
+
+**Short answer:** For optimistic updates, in `onMutate` cancel in-flight queries for the key, snapshot the current cache, write the expected result with `setQueryData`, and return the snapshot; roll back in `onError`; and `invalidateQueries` in `onSettled` so the server has the final word. For infinite scrolling, use `useInfiniteQuery` with `initialPageParam` and `getNextPageParam`, flatten `data.pages`, and call `fetchNextPage` from the list's `onEndReached`.
+
+```ts title="src/posts/useToggleLike.ts"
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+
+export function useToggleLike(postId: string) {
+  const queryClient = useQueryClient();
+  const key = ['post', postId] as const;
+
+  return useMutation({
+    mutationFn: (liked: boolean) => api.put(`/posts/${postId}/like`, { liked }),
+    onMutate: async (liked) => {
+      await queryClient.cancelQueries({ queryKey: key }); // don't let an old refetch overwrite us
+      const previous = queryClient.getQueryData<Post>(key);
+      queryClient.setQueryData<Post>(key, (old) =>
+        old ? { ...old, liked, likeCount: old.likeCount + (liked ? 1 : -1) } : old,
+      );
+      return { previous };
+    },
+    onError: (_error, _liked, context) => {
+      if (context?.previous) queryClient.setQueryData(key, context.previous); // rollback
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: key }),
+  });
+}
+```
+
+Sending the **target state** (`liked: true`) rather than a toggle makes the request idempotent, so retries and double taps can't flip it twice.
+
+```tsx title="src/feed/FeedScreen.tsx"
+import { useInfiniteQuery } from '@tanstack/react-query';
+import { FlashList } from '@shopify/flash-list';
+import { useMemo } from 'react';
+
+type FeedPage = { items: Post[]; nextCursor: string | null };
+
+export function FeedScreen() {
+  const query = useInfiniteQuery({
+    queryKey: ['feed'],
+    queryFn: ({ pageParam, signal }) => fetchFeed({ cursor: pageParam, signal }) as Promise<FeedPage>,
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.nextCursor, // null means no more pages
+    maxPages: 10, // cap memory on very long sessions
+  });
+
+  const items = useMemo(() => query.data?.pages.flatMap((p) => p.items) ?? [], [query.data]);
+
+  return (
+    <FlashList
+      data={items}
+      keyExtractor={(p) => p.id}
+      renderItem={({ item }) => <PostCard post={item} />}
+      onEndReached={() => {
+        if (query.hasNextPage && !query.isFetchingNextPage) query.fetchNextPage();
+      }}
+      onEndReachedThreshold={0.5}
+      refreshing={query.isRefetching && !query.isFetchingNextPage}
+      onRefresh={() => query.refetch()}
+      ListFooterComponent={query.isFetchingNextPage ? <Spinner /> : null}
+    />
+  );
+}
+```
+
+Details interviewers probe:
+
+- **Cursor vs offset pagination** — cursors are stable when items are inserted at the top; offsets duplicate or skip items.
+- **Paged (not infinite) lists**: `placeholderData: keepPreviousData` keeps showing page N while page N+1 loads (v5 replaced the old `keepPreviousData: true` option).
+- **Refetching an infinite query** refetches every loaded page sequentially — another reason for `maxPages`.
+- **Optimistic lists**: when adding an item, write a temporary ID, then replace it with the server's ID on success.
+- A simpler v5 alternative for UI-only optimism: render the pending `variables` from `useMutation` without touching the cache.
+
+> [!INTERVIEW]
+> What a senior answer includes: `cancelQueries` before writing (and why), rollback context, invalidate on settle, idempotent mutation payloads, and a guard against duplicate `fetchNextPage` calls. Follow-up: "How do you queue mutations while offline?" — paused mutations plus a persister; see the [Offline Storage & Sync guide](../guides/offline-storage.html).
+
+## Navigation
+
+### How do nested navigators work, and when do you choose native-stack over the JS stack?
+
+**Short answer:** Each navigator owns its own slice of navigation state and renders one of its screens; a screen can itself render a navigator, forming a tree. Actions bubble up to the nearest navigator that can handle them, and you target nested screens with `navigate('Parent', { screen: 'Child', params })`. Use **native-stack** (`@react-navigation/native-stack`, backed by `react-native-screens` using `UINavigationController` / Android fragments) by default for native transitions, gestures and memory behavior; use the **JS stack** (`@react-navigation/stack`) only when you need fully custom transitions or headers that native-stack can't do.
+
+The standard shape — tabs nested *inside* a root stack, so detail screens push *over* the tab bar:
+
+```tsx title="src/navigation/RootNavigator.tsx"
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+
+const RootStack = createNativeStackNavigator<RootStackParamList>();
+const Tabs = createBottomTabNavigator<TabParamList>();
+
+function MainTabs() {
+  return (
+    <Tabs.Navigator>
+      <Tabs.Screen name="Feed" component={FeedScreen} />
+      <Tabs.Screen name="Account" component={AccountScreen} />
+    </Tabs.Navigator>
+  );
+}
+
+export function RootNavigator() {
+  return (
+    <RootStack.Navigator>
+      <RootStack.Screen name="Main" component={MainTabs} options={{ headerShown: false }} />
+      <RootStack.Screen name="OrderDetails" component={OrderDetailsScreen} />
+      <RootStack.Group screenOptions={{ presentation: 'modal' }}>
+        <RootStack.Screen name="Settings" component={SettingsScreen} />
+      </RootStack.Group>
+    </RootStack.Navigator>
+  );
+}
+
+// From anywhere inside the tabs:
+// navigation.navigate('Main', { screen: 'Account', params: { highlight: 'billing' } });
+```
+
+Nesting rules worth knowing: `navigation.setOptions` only affects the navigator the screen belongs to (use `navigation.getParent()` for the parent's header), each nested stack has its own history, `getFocusedRouteNameFromRoute(route)` lets a parent derive header titles from the focused child, and nesting many navigators increases memory and makes linking config deeper — keep the tree shallow.
+
+| | native-stack | JS stack |
+|---|---|---|
+| Transitions and gestures | Platform-native (UIKit / Android) | JS with Reanimated/Animated plus Gesture Handler |
+| Performance | Best; runs off the JS thread | Good, but can drop frames when JS is busy |
+| Header | Native header (large titles, search bar, blur on iOS) | Fully customizable React header |
+| Custom transitions | Limited set of `animation` presets | Anything (`cardStyleInterpolator`) |
+| Memory | Native screen detaching | Relies on `react-native-screens` for detaching too |
+| Default choice | Yes | Only for bespoke UX |
+
+> [!TIP]
+> If you use Expo Router, the same concepts apply: each `_layout.tsx` is a navigator, folders are nested navigators, and `Stack` defaults to native-stack.
+
+### How do you implement an authentication flow with React Navigation, and why not call navigate() after login?
+
+**Short answer:** Render **different screen sets based on auth state** — while restoring the session show the splash, when signed out register only the auth screens, when signed in register only the app screens. When the state changes, React Navigation automatically moves to the first screen of the new set and the old screens are unmounted. Calling `navigate('Home')` after login leaves the login screen in history (the back gesture returns to it), lets protected screens be reached via deep links while signed out, and races with token restoration.
+
+```mermaid
+flowchart TD
+    Container["NavigationContainer"] --> Boot{"Session state?"}
+    Boot -->|"restoring"| Splash["Native splash stays visible<br/>(tokens read from secure storage)"]
+    Boot -->|"signedOut"| AuthGroup["Auth screens"]
+    Boot -->|"signedIn"| AppGroup["App screens"]
+    AuthGroup --> SignIn["SignIn"]
+    AuthGroup --> SignUp["SignUp"]
+    AuthGroup --> Forgot["ForgotPassword"]
+    AppGroup --> Tabs["Main tabs"]
+    AppGroup --> Details["OrderDetails"]
+    AppGroup --> Modals["Modals: Settings, Paywall"]
+    Tabs --> Feed["Feed stack"]
+    Tabs --> Account["Account stack"]
+```
+*Figure: Auth-flow navigator structure — screen sets swap when session state changes.*
+
+```tsx title="src/navigation/RootNavigator.tsx"
+export function RootNavigator() {
+  const { status, isSigningOut } = useAuthState(); // 'restoring' | 'signedOut' | 'signedIn'
+
+  if (status === 'restoring') return null; // keep the native splash until tokens are read
+
+  return (
+    <Stack.Navigator>
+      {status === 'signedIn' ? (
+        <Stack.Group>
+          <Stack.Screen name="Main" component={MainTabs} options={{ headerShown: false }} />
+          <Stack.Screen name="OrderDetails" component={OrderDetailsScreen} />
+        </Stack.Group>
+      ) : (
+        <Stack.Group screenOptions={{ headerShown: false }}>
+          <Stack.Screen
+            name="SignIn"
+            component={SignInScreen}
+            options={{ animationTypeForReplace: isSigningOut ? 'pop' : 'push' }}
+          />
+          <Stack.Screen name="SignUp" component={SignUpScreen} />
+        </Stack.Group>
+      )}
+    </Stack.Navigator>
+  );
+}
+
+// SignInScreen just updates auth state; it never navigates:
+// await signIn(credentials);  -> status becomes 'signedIn' -> navigator swaps screen sets
+```
+
+With the **static API** in React Navigation 7 the same idea is expressed with `if` hooks on groups:
+
+```tsx
+const RootStack = createNativeStackNavigator({
+  groups: {
+    SignedIn: { if: useIsSignedIn, screens: { Main: MainTabs, OrderDetails: OrderDetailsScreen } },
+    SignedOut: { if: useIsSignedOut, screens: { SignIn: SignInScreen, SignUp: SignUpScreen } },
+  },
+});
+```
+
+Production details:
+
+- Hide the native splash (expo-splash-screen or react-native-bootsplash) only once restoration finishes, to avoid a login-screen flash for signed-in users.
+- A deep link opened while signed out should be stored and replayed after sign-in — see [Deep Linking](../guides/deep-linking.html).
+- On sign-out, also clear the query cache and per-user stores, or the next user sees stale data.
+- Token storage, refresh and session expiry are covered in [Authentication & Sessions](../guides/authentication.html).
+
+> [!INTERVIEW]
+> Red flags: `navigation.reset` gymnastics after login, or an `isLoggedIn` check inside every screen. Strong answers mention unmounting of auth screens, the restoring state, splash handling and cache cleanup on sign-out.
+
+### How do you type navigation with TypeScript in React Navigation?
+
+**Short answer:** Define a **ParamList** type per navigator mapping route names to their params (`undefined` for none), type screens with helpers like `NativeStackScreenProps<ParamList, 'Route'>`, compose nested navigators with `NavigatorScreenParams` and `CompositeScreenProps`, and register the root list globally so `useNavigation()` and `Link` are type-checked everywhere. With the static API, derive the types with `StaticParamList<typeof RootStack>`.
+
+```ts title="src/navigation/types.ts"
+import type { NavigatorScreenParams, CompositeScreenProps } from '@react-navigation/native';
+import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import type { BottomTabScreenProps } from '@react-navigation/bottom-tabs';
+
+export type TabParamList = {
+  Feed: undefined;
+  Account: { highlight?: 'billing' | 'security' } | undefined;
+};
+
+export type RootStackParamList = {
+  Main: NavigatorScreenParams<TabParamList>; // nested navigator
+  OrderDetails: { orderId: string };          // IDs, not objects
+  Settings: undefined;
+};
+
+export type RootStackScreenProps<T extends keyof RootStackParamList> =
+  NativeStackScreenProps<RootStackParamList, T>;
+
+export type TabScreenProps<T extends keyof TabParamList> = CompositeScreenProps<
+  BottomTabScreenProps<TabParamList, T>,
+  RootStackScreenProps<keyof RootStackParamList> // tab screens can also navigate in the root stack
+>;
+
+declare global {
+  namespace ReactNavigation {
+    // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+    interface RootParamList extends RootStackParamList {}
+  }
+}
+```
+
+```tsx
+export function OrderDetailsScreen({ route, navigation }: RootStackScreenProps<'OrderDetails'>) {
+  const { orderId } = route.params;              // string, checked
+  navigation.navigate('Settings');               // OK
+  // navigation.navigate('OrderDetails');        // error: params required
+  // ...
+}
+
+function OrderRow({ id }: { id: string }) {
+  const navigation = useNavigation();            // typed via the global RootParamList
+  return <Pressable onPress={() => navigation.navigate('OrderDetails', { orderId: id })} />;
+}
+```
+
+Guidelines: prefer string IDs in params because deep links deliver strings (use `parse` in the linking config for numbers); use `undefined` rather than `{}` for no params; export screen-props helpers so screens don't import navigator internals; for `useRoute`, pass `RouteProp<RootStackParamList, 'OrderDetails'>`.
+
+> [!INTERVIEW]
+> Follow-up: "What does the type system *not* protect?" — params coming from deep links or state restoration are runtime data; validate them (for example with zod) before trusting their shape.
+
+### What is the difference between useFocusEffect and useEffect in a screen?
+
+**Short answer:** Screens in a stack stay **mounted** when you push another screen on top, and tab screens stay mounted after their first visit, so `useEffect` with `[]` runs once per mount — not each time the user comes back. `useFocusEffect` runs its callback when the screen **gains focus** and its cleanup when it **loses focus**. Use it for work tied to visibility: refreshing data, pausing video/camera, screen-specific Android back handling, analytics screen views.
+
+```tsx
+import { useCallback } from 'react';
+import { BackHandler } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
+
+function PhotoGridScreen() {
+  const [selecting, setSelecting] = useState(false);
+
+  useFocusEffect(
+    useCallback(() => {
+      // Only this screen, only while focused, intercepts the Android back button
+      const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+        if (selecting) {
+          setSelecting(false);
+          return true; // handled
+        }
+        return false; // let navigation handle it
+      });
+      return () => sub.remove();
+    }, [selecting]),
+  );
+  // ...
+}
+```
+
+| Hook / API | Fires | Typical use |
+|---|---|---|
+| `useEffect(fn, [])` | Mount / unmount | One-time setup, subscriptions that should persist while mounted |
+| `useFocusEffect(useCallback(fn, deps))` | Focus / blur (and deps change while focused) | Pause/resume media, refresh, screen-scoped listeners |
+| `useIsFocused()` | Re-renders on focus change | Conditionally render heavy content (camera preview) |
+| `navigation.addListener('focus')` | Focus events | Imperative handling, e.g. in class components |
+
+Gotchas: the callback must be memoized (`useCallback`), otherwise it re-runs on every render while focused; `useFocusEffect` also runs on initial focus, so if you refetch on focus, skip the first run or rely on TanStack Query's `staleTime`; and focus is not app foreground — returning from background does not re-trigger it (combine with `AppState` if you need both).
+
+### What should and shouldn't go in route params, and how does that relate to deep linking?
+
+**Short answer:** Params should be **small, serializable identifiers** — an `orderId`, a filter, a mode — never full objects, class instances or functions. Navigation state must be serializable for state persistence and deep linking (a URL can only produce strings), and React Navigation warns "Non-serializable values were found in the navigation state". Passing a callback also captures a stale closure and breaks when the screen is restored. To return a result, navigate back with params (`popTo` in React Navigation 7), or write to a shared store or query cache.
+
+```tsx
+// Anti-pattern: function in params
+navigation.navigate('AddressPicker', { onSelect: (a: Address) => setAddress(a) });
+
+// Better: the picker returns data by navigating back with params
+function AddressPickerScreen({ navigation }: RootStackScreenProps<'AddressPicker'>) {
+  const choose = (address: Address) =>
+    navigation.popTo('Checkout', { selectedAddressId: address.id });
+  // ...
+}
+
+function CheckoutScreen({ route }: RootStackScreenProps<'Checkout'>) {
+  const selectedAddressId = route.params?.selectedAddressId;
+  const { data: address } = useQuery({
+    queryKey: ['address', selectedAddressId],
+    queryFn: () => fetchAddress(selectedAddressId!),
+    enabled: !!selectedAddressId,
+  });
+  // ...
+}
+```
+
+Pass `orderId`, not the `order` object: the details screen fetches (usually instantly from the query cache), stays correct when data changes, and works identically from a push notification or a URL. Because params are serializable, the same routes map to URLs:
+
+```tsx title="src/navigation/linking.ts"
+import type { LinkingOptions } from '@react-navigation/native';
+
+export const linking: LinkingOptions<RootStackParamList> = {
+  prefixes: ['myapp://', 'https://app.example.com'],
+  config: {
+    screens: {
+      Main: { screens: { Feed: 'feed', Account: 'account' } },
+      OrderDetails: 'orders/:orderId',        // https://app.example.com/orders/42
+      Settings: 'settings',
+    },
+  },
+};
+
+// <NavigationContainer linking={linking} fallback={<SplashView />}>...
+```
+
+The native side (URL schemes, Universal Links, App Links, `apple-app-site-association`, `assetlinks.json`) and deferred deep links are covered in the [Deep Linking & Universal Links guide](../guides/deep-linking.html). Expo Router generates this mapping from the file tree automatically.
+
+> [!INTERVIEW]
+> Red flags: passing `navigation` or setters through params, or sending an entire API object and then wondering why the details screen shows stale data. Strong answers tie serializability to persistence, deep links and restoration after process death.
+
+### How do you prevent a user from leaving a screen with unsaved changes?
+
+**Short answer:** Use `usePreventRemove(condition, callback)` (or the underlying `beforeRemove` event) from React Navigation. When the screen is about to be **removed** — header back, swipe-back, Android hardware back, or a `pop`/`reset` action — the removal is blocked and your callback receives the action, so you can confirm and then `navigation.dispatch(data.action)` to continue.
+
+```tsx title="src/profile/EditProfileScreen.tsx"
+import { Alert } from 'react-native';
+import { usePreventRemove } from '@react-navigation/native';
+import { useForm } from 'react-hook-form';
+
+export function EditProfileScreen({ navigation }: RootStackScreenProps<'EditProfile'>) {
+  const { control, handleSubmit, formState } = useForm<ProfileForm>({ defaultValues });
+  const hasUnsavedChanges = formState.isDirty && !formState.isSubmitSuccessful;
+
+  usePreventRemove(hasUnsavedChanges, ({ data }) => {
+    Alert.alert('Discard changes?', 'You have unsaved changes.', [
+      { text: 'Keep editing', style: 'cancel' },
+      { text: 'Discard', style: 'destructive', onPress: () => navigation.dispatch(data.action) },
+    ]);
+  });
+
+  // Navigate away only after the successful submit is reflected in state,
+  // otherwise the hook still sees hasUnsavedChanges === true and blocks goBack().
+  useEffect(() => {
+    if (formState.isSubmitSuccessful) navigation.goBack();
+  }, [formState.isSubmitSuccessful, navigation]);
+
+  // ... form fields and a Save button calling handleSubmit(save)
+}
+```
+
+Limitations to know:
+
+- It fires only when the screen is **removed** from navigation state — not when another screen is pushed on top, not when switching tabs, and not when the app is closed.
+- On a root screen, Android back exits the app without removing a route; handle that with `BackHandler`.
+- Native-stack has historically had gaps around native back gestures and header buttons; newer `react-native-screens` versions close most of them, but test swipe-back on iOS and predictive back on Android. `gestureEnabled: false` is the blunt fallback.
+- The classic bug is calling `setSaved(true)` and `goBack()` in the same handler — the condition hasn't re-rendered yet, so the prompt appears after a successful save.
+
+> [!INTERVIEW]
+> Follow-up: "How do you also protect against the app being killed?" — you can't block that; persist a draft (MMKV) on change and restore it when the screen mounts.
+
+## Lists and images
+
+### Which FlatList props do you tune for performance, and why does memoizing renderItem matter?
+
+**Short answer:** FlatList virtualizes: it renders a window of items around the viewport and replaces the rest with spacers. The main knobs are `getItemLayout` (skip measuring fixed-height rows), `windowSize` (how many screens of content stay rendered), `initialNumToRender` (first paint), `maxToRenderPerBatch` / `updateCellsBatchingPeriod` (how fast new rows fill in) and `removeClippedSubviews`. None of them rescue expensive rows, though — rows must be `memo`ized with stable props, or every parent state change re-renders every mounted row.
+
+| Prop | Default | Increase it | Decrease it |
+|---|---|---|---|
+| `windowSize` | 21 (10 screens above, 10 below, plus visible) | Fewer blank areas on fast scroll | Less memory and JS work |
+| `initialNumToRender` | 10 | No blank first screen | Faster first render (keep enough to fill one screen) |
+| `maxToRenderPerBatch` | 10 | Fills faster while scrolling | More responsive to touches between batches |
+| `updateCellsBatchingPeriod` | 50 ms | Fewer, larger batches | Faster fill, more frequent work |
+| `removeClippedSubviews` | `true` on Android, `false` on iOS | Detaches off-screen native views | Avoids known bugs with missing or blank content |
+| `getItemLayout` | — | Only when row size is known exactly | Wrong values break `scrollToIndex` and cause jumps |
+
+```tsx title="src/inbox/InboxList.tsx"
+import { memo, useCallback } from 'react';
+import { FlatList, Pressable, Text, type ListRenderItem } from 'react-native';
+
+const ROW_HEIGHT = 72; // fixed-height rows, including border
+
+type RowProps = { item: Message; selected: boolean; onPress: (id: string) => void };
+
+const MessageRow = memo(function MessageRow({ item, selected, onPress }: RowProps) {
+  return (
+    <Pressable style={{ height: ROW_HEIGHT, opacity: selected ? 0.6 : 1 }} onPress={() => onPress(item.id)}>
+      <Text numberOfLines={1}>{item.subject}</Text>
+    </Pressable>
+  );
+});
+
+type Props = { messages: Message[]; selectedId: string | null; onSelect: (id: string) => void };
+
+export function InboxList({ messages, selectedId, onSelect }: Props) {
+  const renderItem = useCallback<ListRenderItem<Message>>(
+    ({ item }) => <MessageRow item={item} selected={item.id === selectedId} onPress={onSelect} />,
+    [selectedId, onSelect],
+  );
+
+  return (
+    <FlatList
+      data={messages}
+      renderItem={renderItem}
+      keyExtractor={keyExtractor}
+      getItemLayout={getItemLayout}
+      initialNumToRender={12}
+      windowSize={7}
+      maxToRenderPerBatch={8}
+      onEndReachedThreshold={0.4}
+    />
+  );
+}
+
+const keyExtractor = (m: Message) => m.id;
+const getItemLayout = (_: ArrayLike<Message> | null | undefined, index: number) => ({
+  length: ROW_HEIGHT,
+  offset: ROW_HEIGHT * index,
+  index,
+});
+```
+
+Row-level rules that matter more than the props:
+
+- Pass the **ID** to a shared stable handler instead of creating a closure per item in the parent.
+- Keep items immutable: update one item by replacing it, so unchanged rows keep their identity and `memo` skips them.
+- If `renderItem` reads state that isn't in `data` (like `selectedId`), either include it in the callback deps as above or pass `extraData` — FlatList is a pure component and otherwise won't re-render.
+- Avoid heavy work in rows: no inline `new Date(...).toLocaleString()` for 1,000 rows, no un-resized full-resolution images, no nested un-virtualized lists.
+- Never nest a vertical FlatList inside a vertical `ScrollView` — virtualization breaks and every row renders.
+- Profile in a **release** build; dev mode is many times slower and misleading.
+
+> [!INTERVIEW]
+> Strong answers explain that `windowSize` is measured in viewport lengths, not items, and that `getItemLayout` must be exact. Follow-ups: "Why is my list blank when I scroll fast?" (JS thread can't keep up — lighter rows, bigger window, or FlashList) and "Why does `scrollToIndex` fail?" (no `getItemLayout`, so use `onScrollToIndexFailed`). More in the [Performance guide](../guides/performance.html).
+
+### How does FlashList differ from FlatList, and what does recycling change about how you write rows?
+
+**Short answer:** FlatList mounts new row components as they enter the window and unmounts them as they leave. FlashList **recycles**: when a row scrolls off screen its component instance is reused for an incoming item with new props — the same idea as `UITableView` / `RecyclerView`. Far fewer mounts means less JS work and garbage collection, so large lists stay smooth. FlashList v2 targets the New Architecture only and no longer needs `estimatedItemSize`. The catch: row components must not assume they are mounted once per item.
+
+```tsx
+import { FlashList } from '@shopify/flash-list';
+
+<FlashList
+  data={feedItems}
+  keyExtractor={(item) => item.id}
+  getItemType={(item) => item.kind} // separate recycling pools: 'post' | 'ad' | 'header'
+  renderItem={({ item }) => {
+    switch (item.kind) {
+      case 'post':
+        return <PostCard post={item} />;
+      case 'ad':
+        return <AdCard ad={item} />;
+      case 'header':
+        return <SectionHeader title={item.title} />;
+    }
+  }}
+/>;
+```
+
+**Recycling rules**
+
+| Rule | Why |
+|---|---|
+| Don't put `key` props on a row's root or inner elements tied to the item ID | React would remount instead of reuse, defeating recycling |
+| Reset local state when the item changes | A recycled instance keeps its `useState` from the previous item (an "expanded" flag leaks to another row) |
+| Use `getItemType` for heterogeneous rows | Reusing a post cell for an ad forces a full subtree swap |
+| Give images a recycling-aware key (`recyclingKey` in expo-image) | Prevents the previous item's image flashing |
+| Keep rows cheap and synchronous | Recycling can't hide slow renders |
+
+For per-item local state, FlashList v2 provides a recycling-aware state hook (`useRecyclingState`) that resets when the item changes; otherwise lift state into a map keyed by ID.
+
+| | FlatList | FlashList v2 | LegendList |
+|---|---|---|---|
+| Strategy | Virtualize: mount/unmount | Recycle component instances | Recycle, pure JS |
+| Architecture | Both | New Architecture only | Both |
+| Size estimates | `getItemLayout` optional | Not needed | Optional |
+| Best for | Small/medium lists, simple needs | Large feeds, mixed row types, masonry | Chat-style and bidirectional lists |
+
+> [!INTERVIEW]
+> Red flag: "FlashList is just a faster FlatList, drop-in". A senior answer names the state-leak and `key` pitfalls, and says they would profile before and after switching.
+
+### How do you handle image loading and caching in React Native?
+
+**Short answer:** Core `Image` caches images via the platform (Fresco on Android, `NSURLCache` on iOS, which follows HTTP cache headers and is less predictable). For production feeds use **expo-image** — SDWebImage on iOS and Glide on Android, memory and disk caching, blurhash/thumbhash placeholders, transitions and a `recyclingKey` for recycled lists; it works in bare RN apps with Expo modules installed. `react-native-fast-image` is effectively unmaintained; if you depend on it, move to a maintained community fork or expo-image.
+
+```tsx title="src/ui/Avatar.tsx"
+import { Image } from 'expo-image';
+
+export function Avatar({ uri, blurhash, id }: { uri: string; blurhash?: string; id: string }) {
+  return (
+    <Image
+      source={{ uri }}
+      placeholder={blurhash ? { blurhash } : undefined}
+      contentFit="cover"
+      transition={150}
+      cachePolicy="memory-disk"
+      recyclingKey={id} // resets when a FlashList cell is reused for another user
+      style={{ width: 48, height: 48, borderRadius: 24 }}
+      accessibilityLabel="User avatar"
+    />
+  );
+}
+
+// Warm the cache before a screen opens (e.g. the next page of a gallery)
+// await Image.prefetch(nextPageUrls);
+```
+
+| Concern | Recommendation |
+|---|---|
+| Size | Request resized images from a CDN (`?w=96&dpr=3`); decoding a 4000px photo into a 48px avatar wastes memory and can OOM on Android |
+| Placeholders | Blurhash/thumbhash from the API for perceived performance |
+| Lists | Fixed dimensions (no layout shift), `recyclingKey`, avoid re-creating `source` objects each render |
+| Auth-protected images | Pass `headers` in `source`; beware caching private images on shared devices |
+| Cache invalidation | Version the URL (`avatar.jpg?v=3`) rather than trying to purge caches |
+| Clearing on sign-out | `Image.clearDiskCache()` / `clearMemoryCache()` if images are user-private |
+
+> [!INTERVIEW]
+> Follow-ups: "Why does my list use 1 GB of memory?" (full-resolution images decoded as bitmaps), "How do you show an image placeholder without layout jumps?" (known aspect ratio from the API, fixed container).
+
+## Animations and gestures
+
+### How does the Animated API work, and what are the limits of useNativeDriver?
+
+**Short answer:** `Animated` describes animations as a graph of `Animated.Value`s, interpolations and timing/spring drivers bound to style props of `Animated.View`/`Text`/`Image`. With `useNativeDriver: false`, JS computes every frame and sends updates to native, so a busy JS thread drops frames. With `useNativeDriver: true`, the graph is serialized to native **once** and the UI thread runs it, surviving JS jank. The limit: only **non-layout** properties — `transform` and `opacity` (plus a few others) — are supported; layout props like `width`, `height`, `top`, `margin` or `flex` throw.
+
+```mermaid
+flowchart TD
+    subgraph jsDriven["useNativeDriver: false"]
+        J1["JS thread computes value<br/>every frame"] --> J2["Send style update to native"]
+        J2 --> J3["UI thread applies and draws"]
+    end
+    subgraph nativeDriven["useNativeDriver: true"]
+        N1["JS thread serializes<br/>animation graph once"] --> N2["UI thread computes value<br/>every frame"]
+        N2 --> N3["UI thread applies transform / opacity"]
+    end
+    Busy["JS thread busy<br/>(heavy render, JSON parse)"] -.->|"frames dropped"| J1
+    Busy -.->|"no impact"| N2
+```
+*Figure: JS-driven vs native-driven Animated — where each frame is computed.*
+
+```tsx title="src/ui/FadeInCard.tsx"
+import { useEffect, useRef } from 'react';
+import { Animated } from 'react-native';
+
+export function FadeInCard({ children }: { children: React.ReactNode }) {
+  const progress = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const anim = Animated.timing(progress, { toValue: 1, duration: 250, useNativeDriver: true });
+    anim.start();
+    return () => anim.stop();
+  }, [progress]);
+
+  return (
+    <Animated.View
+      style={{
+        opacity: progress,
+        transform: [{ translateY: progress.interpolate({ inputRange: [0, 1], outputRange: [16, 0] }) }],
+      }}
+    >
+      {children}
+    </Animated.View>
+  );
+}
+```
+
+Scroll-linked effects can also run natively:
+
+```tsx
+const scrollY = useRef(new Animated.Value(0)).current;
+<Animated.FlatList
+  onScroll={Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], { useNativeDriver: true })}
+  scrollEventThrottle={16}
+  {...listProps}
+/>;
+```
+
+| Want to animate | Native driver? | Alternative |
+|---|---|---|
+| Fade, slide, scale, rotate | Yes (`opacity`, `transform`) | — |
+| Height of an expanding panel | No | Animate `scaleY` or use Reanimated / LayoutAnimation |
+| Width of a progress bar | No | `transform: [{ scaleX }]` with a left origin trick, or Reanimated |
+| Background color | Limited | Reanimated `interpolateColor` |
+| Follow a finger precisely | Awkward | Reanimated + Gesture Handler |
+
+Gotchas: you can't mix native and JS drivers on the same `Animated.Value`; reading a value requires a listener (`addListener`), which reintroduces bridge traffic; and `Animated.Value` must be kept in a ref (`useRef(...).current`), not created each render.
+
+> [!INTERVIEW]
+> Strong answers explain *why* layout props can't be native-driven (the native driver updates view properties directly, without re-running layout), and know when to graduate to Reanimated: gestures, layout animations, and logic that must react on the UI thread.
+
+### When do you use LayoutAnimation versus Reanimated, and how do shared values and worklets work?
+
+**Short answer:** `LayoutAnimation` is a fire-and-forget instruction: "animate whatever layout changes happen in the next render". It's great for cheap expand/collapse and list insertions, but you can't interrupt it, drive it by a gesture, or animate a single element independently. **Reanimated** runs animation logic on the UI thread: **shared values** hold state readable from both threads, **worklets** are small JS functions that execute on the UI runtime, and `useAnimatedStyle` maps shared values to styles every frame — including layout props — without touching the JS thread.
+
+```tsx
+import { LayoutAnimation } from 'react-native';
+
+const toggle = () => {
+  LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+  setExpanded((e) => !e); // the resulting layout change animates
+};
+```
+
+```tsx title="src/ui/SwipeToDismiss.tsx"
+import Animated, { runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+
+export function SwipeToDismiss({ children, onDismiss }: { children: React.ReactNode; onDismiss: () => void }) {
+  const translateX = useSharedValue(0);
+
+  const pan = Gesture.Pan()
+    .activeOffsetX([-10, 10]) // let vertical scrolling win for small movements
+    .onUpdate((e) => {
+      translateX.value = e.translationX; // runs on the UI thread as a worklet
+    })
+    .onEnd((e) => {
+      if (Math.abs(e.translationX) > 120) {
+        translateX.value = withSpring(Math.sign(e.translationX) * 600);
+        runOnJS(onDismiss)(); // hop back to the JS thread for React state / navigation
+      } else {
+        translateX.value = withSpring(0);
+      }
+    });
+
+  const style = useAnimatedStyle(() => ({
+    transform: [{ translateX: translateX.value }],
+    opacity: 1 - Math.min(Math.abs(translateX.value) / 600, 1),
+  }));
+
+  return (
+    <GestureDetector gesture={pan}>
+      <Animated.View style={style}>{children}</Animated.View>
+    </GestureDetector>
+  );
+}
+```
+
+| | LayoutAnimation | Animated (native driver) | Reanimated |
+|---|---|---|---|
+| Runs on | Native | UI thread (declarative graph) | UI thread (worklets) |
+| Layout props | Yes (whole next layout) | No | Yes |
+| Interruptible / gesture-driven | No | Partly | Yes |
+| Entering/exiting/layout transitions | Global only | No | `entering`, `exiting`, `layout` props |
+| Complexity | Minimal | Low | Medium |
+
+Reanimated 4 specifics: New Architecture only; worklets live in the separate `react-native-worklets` package (its Babel plugin must be **last** in `babel.config.js`; Expo configures it); CSS-style `transition*` and `animation*` style props now cover many simple cases declaratively. Newer worklets releases offer `scheduleOnRN` as the successor to `runOnJS`. For React Compiler compatibility, prefer `sv.get()` / `sv.set()` over `.value` in component bodies.
+
+Pitfalls: never read `sharedValue.value` during React render to drive UI (it doesn't re-render); don't capture large objects in worklets (they're copied to the UI runtime); on old-architecture Android, `LayoutAnimation` needed `UIManager.setLayoutAnimationEnabledExperimental(true)` — on the New Architecture that call is a no-op.
+
+### Why use react-native-gesture-handler instead of PanResponder?
+
+**Short answer:** `PanResponder` runs on the **JS thread** through RN's responder system: every touch move is an event to JS, so a busy JS thread makes gestures lag, and it negotiates poorly with native scroll views. **Gesture Handler** recognizes gestures natively on the UI thread using the platform's recognizers, supports declarative composition (simultaneous, exclusive, race), integrates with native scroll and buttons, and — paired with Reanimated — keeps the gesture-to-animation loop entirely off the JS thread.
+
+```tsx
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated';
+
+function ZoomableImage({ uri }: { uri: string }) {
+  const scale = useSharedValue(1);
+  const savedScale = useSharedValue(1);
+  const rotation = useSharedValue(0);
+
+  const pinch = Gesture.Pinch()
+    .onUpdate((e) => {
+      scale.value = savedScale.value * e.scale;
+    })
+    .onEnd(() => {
+      savedScale.value = scale.value;
+    });
+  const rotate = Gesture.Rotation().onUpdate((e) => {
+    rotation.value = e.rotation;
+  });
+  const doubleTap = Gesture.Tap()
+    .numberOfTaps(2)
+    .onEnd(() => {
+      scale.value = 1;
+      savedScale.value = 1;
+    });
+
+  const gesture = Gesture.Exclusive(doubleTap, Gesture.Simultaneous(pinch, rotate));
+  const style = useAnimatedStyle(() => ({
+    transform: [{ scale: scale.value }, { rotate: `${rotation.value}rad` }],
+  }));
+
+  return (
+    <GestureDetector gesture={gesture}>
+      <Animated.Image source={{ uri }} style={[{ width: 300, height: 300 }, style]} />
+    </GestureDetector>
+  );
+}
+```
+
+| | PanResponder | Gesture Handler 2 |
+|---|---|---|
+| Recognition | JS thread | Native (UI thread) |
+| Under JS load | Lags / drops | Unaffected |
+| Composition | Manual state machines | `Simultaneous`, `Exclusive`, `Race`, `requireExternalGestureToFail` |
+| Scroll interop | Fragile (`onMoveShouldSetPanResponderCapture` games) | Native-aware (`simultaneousWithExternalGesture`, `activeOffsetX`) |
+| Buttons | `Touchable*` / `Pressable` | Also native buttons (`RectButton`) |
+| Setup | None | `GestureHandlerRootView` at the app root |
+
+Setup gotcha: wrap the app (and any native modal content) in `GestureHandlerRootView` with `flex: 1`, or gestures silently won't fire. Gesture callbacks are workletized automatically when Reanimated is installed; add `.runOnJS(true)` to run them on the JS thread when you need to call React state setters directly.
+
+## Forms and keyboard
+
+### How do you build a validated form with react-hook-form and zod?
+
+**Short answer:** Define the rules once as a **zod schema**, infer the TypeScript type from it, and plug it into react-hook-form via `zodResolver`. RHF keeps field values outside React state (subscriptions instead of re-rendering the whole form per keystroke), and in React Native you bind `TextInput` through `Controller` because there's no DOM `register`. Map server-side errors back with `setError`.
+
+```tsx title="src/auth/SignUpScreen.tsx"
+import { Controller, useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { z } from 'zod';
+import { Button, Text, TextInput, View } from 'react-native';
+
+const signUpSchema = z
+  .object({
+    email: z.string().trim().email('Enter a valid email'), // Zod 4 also offers z.email()
+    password: z.string().min(8, 'At least 8 characters'),
+    confirmPassword: z.string(),
+  })
+  .refine((v) => v.password === v.confirmPassword, {
+    message: 'Passwords do not match',
+    path: ['confirmPassword'],
+  });
+
+type SignUpForm = z.infer<typeof signUpSchema>;
+
+export function SignUpScreen() {
+  const {
+    control,
+    handleSubmit,
+    setFocus,
+    setError,
+    formState: { errors, isSubmitting },
+  } = useForm<SignUpForm>({
+    resolver: zodResolver(signUpSchema),
+    defaultValues: { email: '', password: '', confirmPassword: '' },
+    mode: 'onTouched', // validate after first blur, then on change
+  });
+
+  const onSubmit = handleSubmit(async (values) => {
+    try {
+      await authApi.signUp(values);
+    } catch (e) {
+      if (isApiError(e) && e.code === 'EMAIL_TAKEN') {
+        setError('email', { message: 'This email is already registered' });
+      } else {
+        setError('root', { message: 'Something went wrong. Try again.' });
+      }
+    }
+  });
+
+  return (
+    <View>
+      <Controller
+        control={control}
+        name="email"
+        render={({ field: { ref, value, onChange, onBlur } }) => (
+          <TextInput
+            ref={ref}
+            value={value}
+            onChangeText={onChange}
+            onBlur={onBlur}
+            autoCapitalize="none"
+            autoComplete="email"
+            keyboardType="email-address"
+            textContentType="emailAddress"
+            returnKeyType="next"
+            submitBehavior="submit"
+            onSubmitEditing={() => setFocus('password')}
+            accessibilityLabel="Email"
+          />
+        )}
+      />
+      {errors.email ? <Text accessibilityLiveRegion="polite">{errors.email.message}</Text> : null}
+      {/* password and confirmPassword follow the same pattern */}
+      {errors.root ? <Text>{errors.root.message}</Text> : null}
+      <Button title="Create account" onPress={onSubmit} disabled={isSubmitting} />
+    </View>
+  );
+}
+```
+
+Why this combination: one schema gives runtime validation **and** static types (and can be shared with a Node backend); RHF gives dirty/touched tracking, async submit state and minimal re-renders; `setFocus` works because `field.ref` receives the `TextInput` instance.
+
+Pitfalls: forgetting `defaultValues` (inputs switch from uncontrolled to controlled and `isDirty` misbehaves); validating on every keystroke from the first character (`mode: 'onChange'` is noisy — `onTouched` feels better on mobile); client validation is UX, not security — the server validates again.
+
+### How do you manage TextInput focus chains and keyboard handling across iOS and Android?
+
+**Short answer:** Chain inputs with refs: `returnKeyType="next"` plus `onSubmitEditing={() => nextRef.current?.focus()}` and `submitBehavior="submit"` so the keyboard stays open between fields; the last field uses `returnKeyType="done"` or `"go"` and submits. For keeping inputs visible, `KeyboardAvoidingView` works for simple screens but behaves differently per platform and is fragile with headers, tabs and Android edge-to-edge; **react-native-keyboard-controller** gives consistent, animated, frame-synchronized behavior on both platforms and is the modern default.
+
+```tsx
+const passwordRef = useRef<TextInput>(null);
+
+<TextInput
+  placeholder="Email"
+  returnKeyType="next"
+  submitBehavior="submit" // replaces the deprecated blurOnSubmit={false}
+  onSubmitEditing={() => passwordRef.current?.focus()}
+/>
+<TextInput
+  ref={passwordRef}
+  placeholder="Password"
+  secureTextEntry
+  textContentType="password"
+  returnKeyType="go"
+  onSubmitEditing={submit}
+/>
+```
+
+**Why KeyboardAvoidingView is fragile**
+
+| Issue | Detail |
+|---|---|
+| Platform behavior | iOS usually needs `behavior="padding"`; on Android the OS historically resized the window (`adjustResize`), so `behavior` was often left undefined |
+| Offsets | Needs `keyboardVerticalOffset` equal to header height, which differs by screen and device |
+| Edge-to-edge Android | Apps targeting Android 15+ are edge-to-edge; the window is no longer resized for the keyboard automatically, so insets must be handled by the app |
+| Animation | Jumps rather than tracking the keyboard frame by frame |
+| Scroll views | Doesn't scroll the focused input into view |
+
+```tsx title="App.tsx"
+import { KeyboardProvider } from 'react-native-keyboard-controller';
+
+export default function App() {
+  return (
+    <KeyboardProvider>
+      <RootNavigator />
+    </KeyboardProvider>
+  );
+}
+```
+
+```tsx title="src/checkout/AddressForm.tsx"
+import { KeyboardAwareScrollView, KeyboardToolbar } from 'react-native-keyboard-controller';
+
+export function AddressForm() {
+  return (
+    <>
+      <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled">
+        {/* inputs: the focused one is scrolled into view automatically */}
+      </KeyboardAwareScrollView>
+      <KeyboardToolbar /> {/* previous / next / done above the keyboard */}
+    </>
+  );
+}
+```
+
+Other details that come up: `keyboardShouldPersistTaps="handled"` on scroll views so a tap on "Submit" doesn't just dismiss the keyboard; `Keyboard.dismiss()` on background press; `textContentType` (iOS) and `autoComplete` (Android and iOS) for password managers and one-time codes (`oneTimeCode` / `sms-otp`); and `keyboardWillShow` events exist only on iOS.
+
+> [!INTERVIEW]
+> Strong answers mention Android edge-to-edge changing keyboard behavior, the `submitBehavior` prop, and autofill attributes. Red flag: hard-coding a keyboard height or wrapping every screen in `KeyboardAvoidingView` with magic offsets.
+
+## Networking
+
+### How do you use axios interceptors to attach tokens and refresh them on 401?
+
+**Short answer:** A **request interceptor** attaches the current access token. A **response interceptor** catches `401`, refreshes the token **once** — concurrent failures share a single in-flight refresh promise — then retries the original request with the new token. A `_retry` flag prevents infinite loops, the refresh call bypasses the interceptors, and if refresh fails you emit a "session expired" event that signs the user out.
+
+```mermaid
+sequenceDiagram
+    participant UI as Screen
+    participant AX as Axios instance
+    participant API as API server
+    participant AUTH as Refresh endpoint
+    UI->>AX: GET /orders
+    AX->>API: request with access token
+    API-->>AX: 401 Unauthorized
+    alt no refresh in flight
+        AX->>AUTH: POST /auth/refresh with refresh token
+        AUTH-->>AX: new access and refresh tokens
+        AX->>AX: save tokens, resolve shared promise
+    else refresh already running
+        AX->>AX: await the shared refresh promise
+    end
+    AX->>API: retry original request with new token
+    API-->>AX: 200 OK
+    AX-->>UI: data
+    opt refresh fails
+        AX-->>UI: reject and emit sessionExpired
+    end
+```
+*Figure: Single-flight token refresh in a response interceptor.*
+
+```ts title="src/api/client.ts"
+import axios, { type AxiosError, type InternalAxiosRequestConfig } from 'axios';
+import { tokenStore } from '../auth/tokenStore';
+import { authEvents } from '../auth/authEvents';
+
+type RetriableConfig = InternalAxiosRequestConfig & { _retry?: boolean };
+type TokenPair = { accessToken: string; refreshToken: string };
+
+export const api = axios.create({ baseURL: API_URL, timeout: 15_000 });
+
+api.interceptors.request.use((config) => {
+  const token = tokenStore.getAccessToken(); // kept in memory, not read from disk per request
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+let refreshPromise: Promise<string> | null = null;
+
+function refreshAccessToken(): Promise<string> {
+  if (!refreshPromise) {
+    refreshPromise = (async () => {
+      try {
+        const refreshToken = await tokenStore.getRefreshToken(); // from Keychain / Keystore
+        if (!refreshToken) throw new Error('No refresh token');
+        // Plain axios, not `api`: the refresh call must not go through these interceptors
+        const { data } = await axios.post<TokenPair>(`${API_URL}/auth/refresh`, { refreshToken });
+        await tokenStore.setTokens(data); // refresh tokens usually rotate
+        return data.accessToken;
+      } finally {
+        refreshPromise = null;
+      }
+    })();
+  }
+  return refreshPromise;
+}
+
+api.interceptors.response.use(
+  (response) => response,
+  async (error: AxiosError) => {
+    const original = error.config as RetriableConfig | undefined;
+    if (error.response?.status !== 401 || !original || original._retry) {
+      return Promise.reject(error);
+    }
+    original._retry = true;
+    try {
+      const accessToken = await refreshAccessToken();
+      original.headers.Authorization = `Bearer ${accessToken}`;
+      return api(original);
+    } catch (refreshError) {
+      authEvents.emit('sessionExpired'); // clear tokens + caches, auth navigator shows SignIn
+      return Promise.reject(refreshError);
+    }
+  },
+);
+```
+
+Details that separate good from great:
+
+- **Single flight** matters because a screen often fires 5 requests at once; without it you send 5 refreshes, and with rotating refresh tokens 4 of them fail and log the user out.
+- **Proactive refresh**: decode the JWT `exp` and refresh shortly before expiry (and on app foreground) to avoid the 401 round trip.
+- **Don't retry non-auth 401s forever** — `_retry` guarantees one attempt per request.
+- **Where tokens live**: access token in memory, refresh token in Keychain/Keystore via `react-native-keychain` or `expo-secure-store`.
+
+The full session design (PKCE, rotation, biometric unlock, logout everywhere) is in [Authentication & Sessions](../guides/authentication.html).
+
+> [!INTERVIEW]
+> Red flags: refreshing inside every screen, refresh token in AsyncStorage, no protection against parallel refreshes. Likely follow-up: "How would you do the same with `fetch` or RTK Query?" — a wrapper function or a custom `baseQuery` with a mutex implementing the same single-flight logic.
+
+### How do you implement retries with exponential backoff and request cancellation?
+
+**Short answer:** Retry only **transient** failures — network errors, timeouts, `429`, `5xx` — and only **idempotent** requests (GET, PUT, DELETE, or POSTs carrying an idempotency key). Wait `base × 2^attempt` capped at a maximum, with **jitter** so thousands of phones don't retry in lockstep, and honor `Retry-After`. Cancel with `AbortController`: pass its `signal` to fetch or axios and abort on unmount, on a newer search, or when the user leaves the screen.
+
+```ts title="src/api/withRetry.ts"
+import axios from 'axios';
+
+type RetryOptions = { retries?: number; baseMs?: number; maxMs?: number; signal?: AbortSignal };
+
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const id = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(id);
+        reject(new Error('Aborted'));
+      },
+      { once: true },
+    );
+  });
+
+function isRetryable(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  if (error.code === 'ERR_CANCELED') return false; // user cancelled: never retry
+  if (!error.response) return true;                 // network error or timeout
+  const status = error.response.status;
+  const method = (error.config?.method ?? 'get').toUpperCase();
+  const hasIdempotencyKey = Boolean(error.config?.headers?.['Idempotency-Key']);
+  const idempotent = ['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE'].includes(method) || hasIdempotencyKey;
+  return idempotent && (status === 429 || status >= 500);
+}
+
+function retryAfterMs(error: unknown): number | undefined {
+  if (!axios.isAxiosError(error)) return undefined;
+  const header = error.response?.headers?.['retry-after'];
+  const seconds = Number(header);
+  return Number.isFinite(seconds) ? seconds * 1000 : undefined;
+}
+
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  { retries = 3, baseMs = 500, maxMs = 10_000, signal }: RetryOptions = {},
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt >= retries || signal?.aborted || !isRetryable(error)) throw error;
+      const cap = Math.min(maxMs, baseMs * 2 ** attempt);
+      const delay = retryAfterMs(error) ?? Math.random() * cap; // "full jitter"
+      await sleep(delay, signal);
+    }
+  }
+}
+```
+
+```tsx
+// Cancellation: abort when inputs change or the component unmounts
+useEffect(() => {
+  const controller = new AbortController();
+  withRetry(() => api.get<Product[]>('/search', { params: { q: query }, signal: controller.signal }), {
+    signal: controller.signal,
+  })
+    .then((res) => setResults(res.data))
+    .catch((e) => {
+      if (!axios.isCancel(e) && !controller.signal.aborted) setError(e);
+    });
+  return () => controller.abort();
+}, [query]);
+```
+
+| Decision | Recommendation |
+|---|---|
+| Max attempts | 2–4 for user-facing calls; more for background sync |
+| Retry POST? | Only with an idempotency key the server deduplicates |
+| 4xx (except 408/429) | Never retry — the request itself is wrong |
+| Timeouts | axios `timeout`, or a `setTimeout` that aborts the controller |
+| Offline | Don't burn retries; pause until NetInfo reports connectivity (TanStack Query does this) |
+| Cancellation in axios | `signal`; `CancelToken` is deprecated |
+
+In practice TanStack Query already provides retries with exponential backoff (`retry`, `retryDelay`), passes an `AbortSignal` to your `queryFn`, and pauses while offline — hand-rolled retry logic is for non-query code paths such as uploads and background sync.
+
+> [!INTERVIEW]
+> What a senior answer includes: idempotency, jitter (the thundering-herd problem after an outage), `Retry-After`, and never retrying user-cancelled requests. Follow-up: "How do you retry a large upload?" — resumable/chunked uploads (e.g. tus or S3 multipart); see the [Camera, Media & Uploads guide](../guides/camera.html).
+
+### What is the difference between isConnected and isInternetReachable in NetInfo, and how should you use them?
+
+**Short answer:** `isConnected` means the device has an active network interface (Wi-Fi, cellular) — **not** that the internet works. `isInternetReachable` means NetInfo actually reached the internet via a reachability check; it is `null` while unknown. A phone on hotel Wi-Fi behind a captive portal is connected but not reachable. Treat both as **hints** for UX (offline banners, pausing sync), never as a gate that blocks requests — the request itself is the only reliable test.
+
+```ts title="src/network/netinfo.ts"
+import NetInfo from '@react-native-community/netinfo';
+
+// Point reachability at your own backend instead of the default public endpoint
+NetInfo.configure({
+  reachabilityUrl: 'https://api.example.com/health',
+  reachabilityTest: async (response) => response.status === 204,
+  reachabilityShortTimeout: 5_000,  // re-check interval while unreachable
+  reachabilityLongTimeout: 60_000,  // re-check interval while reachable
+});
+```
+
+```tsx title="src/network/OfflineBanner.tsx"
+import { useNetInfo } from '@react-native-community/netinfo';
+
+export function OfflineBanner() {
+  const { isConnected, isInternetReachable } = useNetInfo();
+  // null means "not known yet": don't flash the banner on cold start
+  const offline = isConnected === false || isInternetReachable === false;
+  if (!offline) return null;
+  return <Banner text="You're offline. Changes will sync when you reconnect." />;
+}
+```
+
+| Field | Meaning | Values | Use for |
+|---|---|---|---|
+| `type` | Interface type | `wifi`, `cellular`, `none`, `unknown`, ... | Avoid big downloads on cellular |
+| `isConnected` | Interface is up | `boolean \| null` | Quick "definitely offline" signal |
+| `isInternetReachable` | Reachability check succeeded | `boolean \| null` | Offline banner, pausing sync |
+| `details.isConnectionExpensive` | Metered connection | `boolean` | Defer media prefetching |
+
+Pitfalls: `null` treated as `false` (offline banner flashes on every launch); blocking a request because NetInfo says offline even though it would have succeeded; emulators reporting odd states; and reachability checks costing battery if configured too aggressively. Wire NetInfo into TanStack Query's `onlineManager` so queries pause and resume automatically.
+
+### How would you design a reliable WebSocket connection with reconnects in a mobile app?
+
+**Short answer:** Assume the socket **will** die — backgrounding, network switches, elevators, server deploys. Reconnect with exponential backoff plus jitter, detect half-open connections with an app-level heartbeat, authenticate on connect with a fresh token, and **resync** missed events (last event ID or a REST refetch) after every reconnect. Tie the lifecycle to `AppState` (close in background, reconnect on foreground) and NetInfo (reconnect immediately when the network returns).
+
+```ts title="src/realtime/RealtimeClient.ts"
+type ServerEvent = { type: string; id?: string; payload?: unknown };
+
+export class RealtimeClient {
+  private ws: WebSocket | null = null;
+  private connecting = false;
+  private shouldRun = false;
+  private attempt = 0;
+  private lastEventId: string | null = null;
+  private lastPongAt = 0;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(
+    private readonly url: string,
+    private readonly getToken: () => Promise<string>,
+    private readonly onEvent: (event: ServerEvent) => void,
+  ) {}
+
+  start() {
+    this.shouldRun = true;
+    void this.connect();
+  }
+
+  stop() {
+    this.shouldRun = false;
+    this.clearTimers();
+    this.ws?.close(1000, 'client stop');
+    this.ws = null;
+  }
+
+  reconnectNow() {
+    if (!this.shouldRun || this.ws || this.connecting) return;
+    this.clearTimers();
+    this.attempt = 0;
+    void this.connect();
+  }
+
+  private async connect() {
+    if (!this.shouldRun || this.ws || this.connecting) return;
+    this.connecting = true;
+    try {
+      const token = await this.getToken(); // fresh token every attempt
+      const ws = new WebSocket(this.url);
+      this.ws = ws;
+      ws.onopen = () => {
+        this.attempt = 0;
+        // Authenticate in the first message rather than the URL (URLs end up in logs)
+        ws.send(JSON.stringify({ type: 'auth', token, since: this.lastEventId }));
+        this.startHeartbeat();
+      };
+      ws.onmessage = (msg) => {
+        const event = JSON.parse(String(msg.data)) as ServerEvent;
+        if (event.type === 'pong') {
+          this.lastPongAt = Date.now();
+          return;
+        }
+        if (event.id) this.lastEventId = event.id;
+        this.onEvent(event);
+      };
+      ws.onclose = (e) => {
+        this.clearTimers();
+        this.ws = null;
+        const authRejected = e.code === 4001; // app-defined close code
+        if (this.shouldRun && !authRejected) this.scheduleReconnect();
+      };
+    } catch {
+      this.scheduleReconnect();
+    } finally {
+      this.connecting = false;
+    }
+  }
+
+  private scheduleReconnect() {
+    const cap = Math.min(30_000, 1_000 * 2 ** this.attempt++);
+    this.retryTimer = setTimeout(() => void this.connect(), Math.random() * cap);
+  }
+
+  private startHeartbeat() {
+    this.lastPongAt = Date.now();
+    this.heartbeatTimer = setInterval(() => {
+      if (Date.now() - this.lastPongAt > 45_000) return this.dropAndReconnect(); // half-open socket
+      this.ws?.send(JSON.stringify({ type: 'ping' }));
+    }, 15_000);
+  }
+
+  private dropAndReconnect() {
+    const dead = this.ws;
+    this.clearTimers();
+    this.ws = null;
+    if (dead) {
+      dead.onclose = null; // a dead TCP connection may never deliver onclose
+      dead.close();
+    }
+    this.scheduleReconnect();
+  }
+
+  private clearTimers() {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.retryTimer = null;
+    this.heartbeatTimer = null;
+  }
+}
+```
+
+```ts
+// Lifecycle wiring (e.g. in a provider)
+const appStateSub = AppState.addEventListener('change', (s) => {
+  if (s === 'active') realtime.start();
+  else if (s === 'background') realtime.stop(); // iOS suspends the app anyway; free the socket
+});
+const unsubscribeNetInfo = NetInfo.addEventListener((s) => {
+  if (s.isInternetReachable) realtime.reconnectNow();
+});
+```
+
+Design points: after each reconnect, invalidate or refetch the affected queries so the UI converges even if events were lost; make server events idempotent and ordered (sequence numbers) so replays are harmless; backgrounded apps get push notifications for real-time alerts, not sockets; and the server must tolerate a reconnect storm after a deploy (jitter helps both sides).
+
+> [!INTERVIEW]
+> Red flags: `setTimeout(connect, 1000)` forever with no backoff, token in the query string, no resync after reconnect. Follow-up: "Socket.IO or raw WebSocket?" — Socket.IO adds reconnection, rooms and fallbacks but needs its own server protocol; raw WebSocket plus a thin client like the one above is often enough.
+
+## Storage
+
+### When do you use AsyncStorage, MMKV, SQLite or Keychain/SecureStore, and what must never go in AsyncStorage?
+
+**Short answer:** **AsyncStorage** is a simple, asynchronous, **unencrypted** key-value store — fine for small non-sensitive data. **MMKV** is a synchronous, memory-mapped key-value store accessed over JSI, much faster, with optional encryption — the modern default for preferences, flags and persisted client state. **SQLite** (expo-sqlite, op-sqlite, or WatermelonDB on top) is for relational or large data you query. **Keychain (iOS) / Keystore-backed storage (Android)** via `react-native-keychain` or `expo-secure-store` is for **secrets**. Tokens, passwords, keys and sensitive PII never go in AsyncStorage or unencrypted MMKV.
+
+| | AsyncStorage | MMKV | SQLite | Keychain / SecureStore |
+|---|---|---|---|---|
+| API | Async key-value (strings) | Sync key-value (string, number, bool, buffer) | SQL, transactions | Async, small values |
+| Speed | Slow-ish (serialization + async round trip) | Very fast | Fast with indexes | Slow (crypto, IPC) |
+| Encryption | No | Optional (key must live in Keychain) | Optional (SQLCipher variants) | Yes, hardware-backed where available |
+| Size | Small data; Android backend has a default size cap | Tens of MB comfortably | Large datasets | A few KB per item |
+| Survives uninstall | No | No | No | iOS Keychain: **yes, by default** |
+| Use for | Legacy/simple prefs | Settings, feature flags, Zustand/Redux persist, query cache | Offline data, message history, search | Refresh tokens, credentials, encryption keys |
+
+```ts title="src/storage/kv.ts"
+import { createMMKV } from 'react-native-mmkv'; // v4 (Nitro); v3 uses `new MMKV()` and `.delete()`
+
+export const kv = createMMKV({ id: 'app' });
+
+kv.set('onboarding.completed', true);
+const completed = kv.getBoolean('onboarding.completed') ?? false;
+kv.remove('onboarding.completed');
+```
+
+```ts title="src/auth/tokenStore.ts"
+import * as SecureStore from 'expo-secure-store';
+
+const REFRESH_KEY = 'auth.refreshToken';
+let accessToken: string | null = null; // memory only
+
+export const tokenStore = {
+  getAccessToken: () => accessToken,
+  getRefreshToken: () => SecureStore.getItemAsync(REFRESH_KEY),
+  async setTokens(t: { accessToken: string; refreshToken: string }) {
+    accessToken = t.accessToken;
+    await SecureStore.setItemAsync(REFRESH_KEY, t.refreshToken, {
+      // readable by background tasks after first unlock, never migrated to another device
+      keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+    });
+  },
+  async clear() {
+    accessToken = null;
+    await SecureStore.deleteItemAsync(REFRESH_KEY);
+  },
+};
+```
+
+> [!CAUTION]
+> Never store in AsyncStorage or plain MMKV: access/refresh tokens, passwords, API secrets, private keys, payment data, health data or government IDs. On a rooted/jailbroken device or from an unencrypted backup these files are readable. Also remember that **anything bundled in the JS or the binary is public** — storage choice can't protect a secret you ship.
+
+Gotchas: the iOS Keychain survives uninstall, so a reinstalled app can find an old refresh token — clear secure items on first launch using a flag in MMKV; MMKV's synchronous API is great for startup reads but don't store multi-MB blobs in it; and AsyncStorage values must be strings, so every read is a `JSON.parse`. Sync strategies, conflict resolution and database choices are in the [Offline Storage & Sync guide](../guides/offline-storage.html) and the [Security guide](../guides/security.html).
+
+> [!INTERVIEW]
+> What a senior answer includes: sync vs async trade-off, encryption-key management (MMKV encryption is only as good as where the key lives), Keychain persistence after uninstall, and matching storage to data shape. Red flag: "we encrypt tokens with a key hard-coded in JS".
+
+## TypeScript in React Native
+
+### How do you type props, children, styles, generic list components and refs to native components?
+
+**Short answer:** Type props as an object type (extend the underlying component's props with `ComponentProps<typeof X>` or `PressableProps` and `Omit` what you replace), children as `ReactNode` (or `PropsWithChildren`), style props as `StyleProp<ViewStyle | TextStyle | ImageStyle>` so callers can pass arrays and falsy values, make reusable lists **generic** over the item type `T`, and type refs with the component class: `useRef<TextInput>(null)`, `useRef<FlatList<Order>>(null)`. In React 19, `ref` is a normal prop, so custom components accept `ref?: Ref<Handle>` without `forwardRef`.
+
+```tsx title="src/ui/Button.tsx"
+import type { ReactNode } from 'react';
+import {
+  Pressable,
+  StyleSheet,
+  Text,
+  type PressableProps,
+  type StyleProp,
+  type TextStyle,
+  type ViewStyle,
+} from 'react-native';
+
+type ButtonProps = Omit<PressableProps, 'style' | 'children'> & {
+  title: string;
+  variant?: 'primary' | 'secondary';
+  leftIcon?: ReactNode;
+  style?: StyleProp<ViewStyle>;     // accepts objects, arrays, registered styles, false/null
+  textStyle?: StyleProp<TextStyle>;
+};
+
+export function Button({ title, variant = 'primary', leftIcon, style, textStyle, ...rest }: ButtonProps) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      style={({ pressed }) => [styles.base, styles[variant], pressed && styles.pressed, style]}
+      {...rest}
+    >
+      {leftIcon}
+      <Text style={[styles.label, textStyle]}>{title}</Text>
+    </Pressable>
+  );
+}
+
+const styles = StyleSheet.create({
+  base: { minHeight: 44, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, borderRadius: 8 },
+  primary: { backgroundColor: '#1f6feb' },
+  secondary: { backgroundColor: '#e7ecf3' },
+  pressed: { opacity: 0.7 },
+  label: { fontWeight: '600' },
+});
+```
+
+**Generic list component** — `T` is inferred from `data`, so `renderRow` receives a correctly typed item:
+
+```tsx title="src/ui/DataList.tsx"
+import type { ReactElement } from 'react';
+import { FlatList, Text, type FlatListProps, type ListRenderItem } from 'react-native';
+
+type DataListProps<T> = Omit<FlatListProps<T>, 'renderItem' | 'keyExtractor'> & {
+  getKey: (item: T) => string;
+  renderRow: (item: T, index: number) => ReactElement;
+  emptyText?: string;
+};
+
+export function DataList<T>({ getKey, renderRow, emptyText = 'Nothing here yet', ...rest }: DataListProps<T>) {
+  const renderItem: ListRenderItem<T> = ({ item, index }) => renderRow(item, index);
+  return (
+    <FlatList {...rest} keyExtractor={getKey} renderItem={renderItem} ListEmptyComponent={<Text>{emptyText}</Text>} />
+  );
+}
+
+// <DataList data={orders} getKey={(o) => o.id} renderRow={(o) => <OrderRow order={o} />} />
+//                                  ^ o: Order, inferred
+```
+
+**Refs and imperative handles**
+
+```tsx title="src/ui/OtpInput.tsx"
+import { useImperativeHandle, useRef, type Ref } from 'react';
+import { TextInput } from 'react-native';
+
+export type OtpInputHandle = { focus: () => void; clear: () => void };
+
+export function OtpInput({ ref, length = 6 }: { ref?: Ref<OtpInputHandle>; length?: number }) {
+  const inputRef = useRef<TextInput>(null);
+  useImperativeHandle(ref, () => ({
+    focus: () => inputRef.current?.focus(),
+    clear: () => inputRef.current?.clear(),
+  }), []);
+  return (
+    <TextInput
+      ref={inputRef}
+      maxLength={length}
+      keyboardType="number-pad"
+      textContentType="oneTimeCode"
+      autoComplete="sms-otp"
+    />
+  );
+}
+
+// Parent: const otpRef = useRef<OtpInputHandle>(null); otpRef.current?.focus();
+```
+
+| Need | Type |
+|---|---|
+| Children | `ReactNode`, or `PropsWithChildren<Props>` |
+| Style props | `StyleProp<ViewStyle>`, `StyleProp<TextStyle>`, `StyleProp<ImageStyle>` |
+| Extend a component's props | `ComponentProps<typeof Pressable>`, `ViewProps`, `TextInputProps` |
+| Ref to a host/class component | `useRef<TextInput>(null)`, `useRef<ScrollView>(null)`, `useRef<FlatList<T>>(null)` |
+| Ref type of any component | `ComponentRef<typeof X>` (replaces the deprecated `ElementRef`) |
+| Events | `GestureResponderEvent`, `LayoutChangeEvent`, `NativeSyntheticEvent<TextInputSubmitEditingEventData>` |
+| List render function | `ListRenderItem<T>` |
+| Variant-dependent props | Discriminated unions (`{ kind: 'link'; href: string } \| { kind: 'action'; onPress: () => void }`) |
+
+Tips: prefer letting TypeScript infer component return types over annotating `React.FC` (which historically added implicit `children`); with React 19 types, `useRef` requires an initial argument and the global `JSX` namespace moved to `React.JSX`; use `satisfies` for theme objects to keep literal types while checking shape.
+
+> [!INTERVIEW]
+> Follow-ups: "Why `StyleProp<ViewStyle>` instead of `ViewStyle`?" (callers pass arrays and conditional falsy entries), "How do you write a generic component as an arrow function in a `.tsx` file?" (`const List = <T,>(props: ListProps<T>) => ...` — the trailing comma disambiguates from JSX).
+
+## Error handling
+
+### What do React Error Boundaries catch, what don't they catch, and where do you place them?
+
+**Short answer:** An Error Boundary is a class component implementing `getDerivedStateFromError` (render a fallback) and `componentDidCatch` (report). It catches errors thrown **while rendering**, in lifecycle methods and in constructors of its **descendants**. It does **not** catch errors in event handlers, asynchronous code (`setTimeout`, promises, `await` in effects), errors in the boundary itself, native crashes, or anything outside the React tree. Place one at the app root plus smaller ones around screens and risky widgets so one broken component doesn't blank the whole app.
+
+```tsx title="src/errors/ErrorBoundary.tsx"
+import { Component, type ErrorInfo, type ReactNode } from 'react';
+
+type FallbackArgs = { error: Error; reset: () => void };
+type Props = {
+  children: ReactNode;
+  fallback: (args: FallbackArgs) => ReactNode;
+  onError?: (error: Error, info: ErrorInfo) => void;
+};
+type State = { error: Error | null };
+
+export class ErrorBoundary extends Component<Props, State> {
+  state: State = { error: null };
+
+  static getDerivedStateFromError(error: Error): State {
+    return { error }; // render phase: must be pure
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    this.props.onError?.(error, info); // commit phase: report to Sentry / Crashlytics
+  }
+
+  reset = () => this.setState({ error: null });
+
+  render() {
+    const { error } = this.state;
+    return error ? this.props.fallback({ error, reset: this.reset }) : this.props.children;
+  }
+}
+```
+
+```tsx
+<ErrorBoundary
+  onError={(error, info) => crashReporter.captureException(error, { extra: { componentStack: info.componentStack } })}
+  fallback={({ reset }) => <ScreenError message="This screen failed to load." onRetry={reset} />}
+>
+  <OrdersScreen />
+</ErrorBoundary>
+```
+
+| Error source | Caught by boundary? | How to handle |
+|---|---|---|
+| Throw during render / lifecycle | Yes | Boundary fallback |
+| Event handler (`onPress`) | No | `try/catch`, show a toast, report |
+| `async` code, promises, timers | No | `try/catch`; to show a fallback, rethrow into render (`showBoundary` from react-error-boundary) |
+| TanStack Query error | Only with `throwOnError: true` | Pair with `QueryErrorResetBoundary` |
+| Error in the boundary's own render | No | The next boundary up handles it |
+| Native crash (Java/Kotlin/ObjC/Swift) | No | Native crash reporter |
+
+Practical choices: use the `react-error-boundary` package (hooks-friendly `useErrorBoundary`, `resetKeys`) or Sentry's `ErrorBoundary`; reset boundaries when the route or query key changes; and make fallbacks actionable (retry, go home, contact support) rather than a blank "Something went wrong".
+
+> [!INTERVIEW]
+> Red flag: claiming boundaries catch promise rejections. Strong answers list the gaps and explain how each is covered: local `try/catch`, global handlers, native crash reporting.
+
+### How do you handle global JS errors, unhandled promise rejections and crash reporting in React Native?
+
+**Short answer:** Uncaught JS exceptions go to RN's global handler; you can wrap it with `ErrorUtils.setGlobalHandler((error, isFatal) => …)` to report before delegating to the default. Unhandled promise rejections only produce a **dev** warning — in release they disappear silently unless a crash reporter hooks Hermes' rejection tracker. Native crashes and ANRs need a native SDK. In practice, use Sentry (`@sentry/react-native`) or Firebase Crashlytics, which install all these hooks, and upload source maps and dSYMs so stack traces are readable.
+
+```ts title="src/errors/installGlobalHandlers.ts"
+export function installGlobalHandlers(report: (error: unknown, context: Record<string, unknown>) => void) {
+  const defaultHandler = ErrorUtils.getGlobalHandler();
+
+  ErrorUtils.setGlobalHandler((error, isFatal) => {
+    report(error, { isFatal, source: 'global' });
+    // Delegate: dev shows the red box; release crashes on fatal errors so the process
+    // doesn't keep running with corrupted JS state.
+    defaultHandler(error, isFatal);
+  });
+}
+```
+
+| Failure type | Where it surfaces | Captured by |
+|---|---|---|
+| Render error | Error Boundary | `componentDidCatch` → reporter |
+| Uncaught JS exception (handler, timer) | `ErrorUtils` global handler | Reporter's global handler integration |
+| Unhandled promise rejection | Hermes rejection tracker; dev LogBox warning | Reporter's rejection integration |
+| Native crash (NPE, `EXC_BAD_ACCESS`) | Native signal/exception handlers | Native SDK (Sentry, Crashlytics) |
+| ANR / app hang | OS watchdog | Sentry ANR/app hang detection, Play Console vitals |
+| OOM kill | Process disappears | Inferred from missing session end; Xcode Organizer, Play vitals |
+
+Essentials for readable reports:
+
+- Upload **source maps** for every release (and every OTA update) and **dSYMs** for iOS native symbols, and tag events with `release` and `dist` so the right map is used.
+- Record **breadcrumbs** (navigation, network, user actions) and set a user ID (not an email) for triage.
+- Don't try to "keep the app alive" after a fatal JS error — show a restart screen at most; the JS heap may be inconsistent.
+- Track crash-free sessions/users as a release gate.
+
+> [!NOTE]
+> Hermes exposes a promise-rejection tracker (`HermesInternal.enablePromiseRejectionTracker`) that React Native itself uses in development. Crash reporters hook it for you; wiring it yourself can replace RN's own dev warnings, so prefer the SDK integration.
+
+Details on SDK setup, source-map upload in CI and alerting are in the [Monitoring, Crash Reporting & Analytics guide](../guides/monitoring.html).
+
+> [!INTERVIEW]
+> Likely follow-ups: "Why is my Sentry stack trace minified?" (source maps missing or wrong `release`/`dist`, especially after an OTA update), "How do you catch errors in native modules?" (native SDK plus proper promise rejection from the module).
+
+## Testing basics
+
+### How do you test components with Jest and React Native Testing Library, and how do you mock native modules?
+
+**Short answer:** RNTL renders components in Jest (no device) and encourages testing **what the user sees and does**: query by role and accessible name first, interact with `userEvent`, assert on visible output. Native modules don't exist in Jest, so you mock them — ideally with the mocks libraries ship, or by mocking your own thin wrapper module rather than the native library directly. Network calls are best mocked at the HTTP layer with MSW.
+
+```tsx title="src/auth/__tests__/SignUpScreen.test.tsx"
+import { render, screen, userEvent } from '@testing-library/react-native';
+import { SignUpScreen } from '../SignUpScreen';
+
+jest.mock('../authApi'); // automock our own API module
+
+test('shows a validation error for an invalid email', async () => {
+  const user = userEvent.setup();
+  render(<SignUpScreen />);
+
+  await user.type(screen.getByLabelText('Email'), 'not-an-email');
+  await user.press(screen.getByRole('button', { name: 'Create account' }));
+
+  expect(await screen.findByText('Enter a valid email')).toBeOnTheScreen();
+});
+```
+
+**Query priority** (most to least preferred):
+
+| Query | Matches | Why |
+|---|---|---|
+| `getByRole('button', { name })` | Accessibility role + label | Mirrors assistive tech; enforces accessible UI |
+| `getByLabelText` | `accessibilityLabel` / `aria-label` | Inputs and icon buttons |
+| `getByPlaceholderText` | `placeholder` | Inputs without labels |
+| `getByText` | Visible text | Non-interactive content |
+| `getByDisplayValue` | Current `TextInput` value | Filled forms |
+| `getByTestId` | `testID` | Last resort when nothing user-visible identifies it |
+
+`getBy*` throws if missing, `queryBy*` returns `null` (for asserting absence), `findBy*` waits (for async UI).
+
+```ts title="jest.setup.ts"
+import mockAsyncStorage from '@react-native-async-storage/async-storage/jest/async-storage-mock';
+import mockRNCNetInfo from '@react-native-community/netinfo/jest/netinfo-mock';
+import 'react-native-gesture-handler/jestSetup';
+
+jest.mock('@react-native-async-storage/async-storage', () => mockAsyncStorage);
+jest.mock('@react-native-community/netinfo', () => mockRNCNetInfo);
+// Reanimated ships its own Jest setup helper; follow its testing docs.
+
+// Mock our wrapper around MMKV instead of the native library itself
+jest.mock('./src/storage/kv', () => {
+  const store = new Map<string, unknown>();
+  return {
+    kv: {
+      set: jest.fn((key: string, value: unknown) => store.set(key, value)),
+      getBoolean: jest.fn((key: string) => store.get(key) as boolean | undefined),
+      getString: jest.fn((key: string) => store.get(key) as string | undefined),
+      remove: jest.fn((key: string) => store.delete(key)),
+    },
+  };
+});
+```
+
+Setup notes: use the `react-native` Jest preset (or `jest-expo` for Expo projects); add untranspiled packages to `transformIgnorePatterns`; wrap components that need providers (QueryClient with `retry: false`, NavigationContainer, SafeAreaProvider) in a custom `renderWithProviders`; use fake timers for debounce logic. Jest tests exercise JS only — native integration belongs to E2E (Maestro, Detox). The full pyramid is in the [Testing Strategy guide](../guides/testing.html).
+
+> [!INTERVIEW]
+> Red flags: tests that query by `testID` everywhere, assert on internal state, or call component methods directly. Strong answers mention user-event, role queries doubling as accessibility checks, MSW, and a thin wrapper around native modules to keep mocks small.
+
+### What are the trade-offs of snapshot testing in React Native?
+
+**Short answer:** Snapshots serialize the rendered tree and fail when it changes. They are cheap to write and catch unintended changes in small, stable, presentational components, but large snapshots become noise: every intentional change updates them, reviewers rubber-stamp `-u`, and they assert on implementation details (style objects, wrapper views) rather than behavior. Use them sparingly and small; prefer explicit assertions.
+
+| Snapshots are good for | Snapshots are bad for |
+|---|---|
+| Small design-system primitives (a `Badge` in each variant) | Whole screens |
+| Serializable outputs (a formatter, a reducer's result, generated config) | Components with dates, random IDs or animated values |
+| Detecting accidental prop or style regressions in stable code | Asserting behavior ("tapping submit shows an error") |
+| Inline snapshots of short values (`toMatchInlineSnapshot`) | Anything reviewers won't actually read |
+
+```tsx
+// Focused, reviewable snapshot of a small component variant
+test('Badge renders the warning variant', () => {
+  render(<Badge variant="warning" label="Low stock" />);
+  expect(screen.getByText('Low stock')).toHaveStyle({ color: '#9a6700' });
+  expect(screen.toJSON()).toMatchSnapshot();
+});
+
+// Better for behavior: explicit expectations
+test('Badge is announced with its label', () => {
+  render(<Badge variant="warning" label="Low stock" />);
+  expect(screen.getByLabelText('Warning: Low stock')).toBeOnTheScreen();
+});
+```
+
+Rules of thumb: keep snapshots under a screenful, review snapshot diffs like code, stabilize non-determinism (mock dates, fixed IDs), and for visual regressions use real screenshot testing on devices or simulators (for example with Maestro or a dedicated visual-diff service) instead of JSON trees — a JSON snapshot can't tell you that a view is clipped or off-screen.
+
+> [!INTERVIEW]
+> A senior answer isn't "never" or "always": it names the maintenance cost, the rubber-stamp problem, and where snapshots genuinely pay off.
+
+## Configuration and platform
+
+### How do you manage environment configs and build variants, and are those env values secret?
+
+**Short answer:** Use build-time configuration per environment (dev, staging, prod): `react-native-config` reads `.env` files and exposes values to JS and native code in bare apps; Expo inlines `EXPO_PUBLIC_*` variables into the JS bundle and uses a dynamic `app.config.ts` for per-variant bundle IDs and names. Pair them with real **build variants** — Android `productFlavors`, iOS schemes and build configurations, or EAS build profiles — so dev, staging and prod install side by side. None of these values are secret: anything in the bundle or binary can be extracted.
+
+```ts title="app.config.ts"
+import type { ExpoConfig } from 'expo/config';
+
+const variant = (process.env.APP_VARIANT ?? 'production') as 'development' | 'staging' | 'production';
+const suffix = variant === 'production' ? '' : `.${variant}`;
+
+const config: ExpoConfig = {
+  name: variant === 'production' ? 'Acme' : `Acme (${variant})`,
+  slug: 'acme',
+  scheme: `acme${variant === 'production' ? '' : `-${variant}`}`,
+  ios: { bundleIdentifier: `com.acme.app${suffix}` },
+  android: { package: `com.acme.app${suffix}` },
+  extra: { variant },
+};
+
+export default config;
+```
+
+```json title="eas.json"
+{
+  "build": {
+    "development": { "developmentClient": true, "distribution": "internal", "env": { "APP_VARIANT": "development" } },
+    "staging": { "distribution": "internal", "channel": "staging", "env": { "APP_VARIANT": "staging" } },
+    "production": { "channel": "production", "env": { "APP_VARIANT": "production" } }
+  }
+}
+```
+
+```ts
+// Expo: inlined at build time. Must be accessed exactly like this (no destructuring, no dynamic keys).
+const apiUrl = process.env.EXPO_PUBLIC_API_URL;
+
+// Bare with react-native-config (ENVFILE=.env.staging picks the file at build time):
+// import Config from 'react-native-config';
+// const apiUrl = Config.API_URL;
+```
+
+```gradle title="android/app/build.gradle"
+android {
+    flavorDimensions "env"
+    productFlavors {
+        dev {
+            dimension "env"
+            applicationIdSuffix ".dev"
+            versionNameSuffix "-dev"
+        }
+        prod {
+            dimension "env"
+        }
+    }
+}
+```
+
+On iOS, create build configurations (e.g. `Debug-Staging`, `Release-Staging`) with their own `.xcconfig`, bundle ID and `GoogleService-Info.plist`, and a scheme per environment.
+
+| Mechanism | Scope | Visible in shipped app? |
+|---|---|---|
+| `EXPO_PUBLIC_*` | Inlined into the JS bundle | **Yes** |
+| `react-native-config` | JS plus native build files | **Yes** (strings in the binary) |
+| `app.config.ts` `extra` | Embedded in the app manifest, read via `expo-constants` | **Yes** |
+| EAS env vars with secret visibility, CI secrets | Build machine only (signing keys, Sentry auth token) | No, unless you inline them |
+
+> [!CAUTION]
+> Never ship private API keys, database credentials or third-party secret keys in env files. Public identifiers (a Stripe **publishable** key, a Maps key restricted by bundle ID/SHA-1, a Sentry DSN) are fine. Anything truly secret stays on your server, which the app calls with the user's session.
+
+> [!INTERVIEW]
+> Red flag: "we keep the secret in `.env`, so it's not in Git and therefore safe". Follow-ups: separate Firebase projects per environment, OTA channels per variant (see [OTA Updates](../guides/ota-updates.html)), and signing per flavor (see [Deployment, Signing & CI/CD](../guides/deployment.html)).
+
+### What does Hermes give you over JavaScriptCore?
+
+**Short answer:** Hermes is a JS engine built for React Native: the build step compiles JavaScript to **bytecode ahead of time**, so the app doesn't parse and compile JS at startup — faster time-to-interactive, lower memory use, and a smaller Android app than bundling JSC. It has a concurrent garbage collector designed for mobile, first-class debugging via React Native DevTools, and a sampling profiler. It's been the default since RN 0.70; JSC now lives in a community package.
+
+| | Hermes | JavaScriptCore (community package) |
+|---|---|---|
+| Startup | Precompiled bytecode — no parse/compile at launch | Parses and compiles JS at runtime |
+| Memory | Lower; GC tuned for mobile | Higher |
+| JIT | No (bytecode interpreter; predictable startup) | Yes on some platforms |
+| Debugging | React Native DevTools (CDP) | Limited in modern RN |
+| Status | Default; the path forward (Hermes V1 work continues) | Community-maintained |
+
+Practical notes:
+
+- Check the engine at runtime with `typeof HermesInternal !== 'undefined'`.
+- Language and API support is broad but not identical to V8: verify newer APIs, and `Intl` coverage for your locales, before relying on them.
+- Profile with the Hermes sampling profiler through React Native DevTools, in a release-like build.
+- Because there's no JIT, CPU-heavy JS (crypto, image processing, big JSON transforms) is better moved to native code (Nitro/TurboModules) or a worklet runtime.
+- Next-generation "Hermes V1" work (from the Static Hermes effort) has been shipping experimentally in recent RN releases — treat it as opt-in until the RN release notes say otherwise.
+
+> [!INTERVIEW]
+> Follow-ups: "Why is bytecode faster at startup?" (no parse/compile on the critical path; bytecode can be memory-mapped), "Why might a library behave differently on Hermes?" (engine differences in less common APIs).
+
+### How does AppState work across iOS and Android, and what do you use it for?
+
+**Short answer:** `AppState` reports `active` (foreground, interactive), `background` (not visible) and — on **iOS only** — `inactive`, a transitional state during the app switcher, Control Center, an incoming call or permission dialogs. Subscribe with `AppState.addEventListener('change', …)` and remove the subscription on cleanup. Use it to refresh data on foreground, pause timers and sockets in background, lock sensitive screens after a timeout, and blur content in the app switcher.
+
+```mermaid
+stateDiagram-v2
+    [*] --> active : launched in foreground
+    active --> inactive : iOS - app switcher, Control Center, call
+    inactive --> active : user returns
+    inactive --> background : user leaves the app
+    active --> background : Android - home or switch app
+    background --> active : user reopens app
+    background --> [*] : OS kills the process (no event)
+```
+*Figure: AppState transitions — inactive exists only on iOS, and process death sends no event.*
+
+```tsx title="src/security/usePrivacyLock.ts"
+import { useEffect, useRef, useState } from 'react';
+import { AppState } from 'react-native';
+
+const LOCK_AFTER_MS = 5 * 60_000;
+
+export function usePrivacyLock() {
+  const [obscured, setObscured] = useState(false);   // cover UI in the app switcher
+  const [locked, setLocked] = useState(false);       // require biometrics again
+  const backgroundedAt = useRef<number | null>(null);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'inactive' || next === 'background') {
+        setObscured(true);
+        if (next === 'background') backgroundedAt.current = Date.now();
+      } else if (next === 'active') {
+        setObscured(false);
+        if (backgroundedAt.current && Date.now() - backgroundedAt.current > LOCK_AFTER_MS) setLocked(true);
+        backgroundedAt.current = null;
+      }
+    });
+    return () => sub.remove();
+  }, []);
+
+  return { obscured, locked, unlock: () => setLocked(false) };
+}
+```
+
+| | iOS | Android |
+|---|---|---|
+| `inactive` | Yes (transitions, overlays) | Never |
+| App switcher snapshot | Taken while inactive — cover sensitive UI | Use `FLAG_SECURE` natively to block screenshots/recents preview |
+| Background execution | Suspended within seconds | Can run a bit longer; restricted by Doze/background limits |
+| Extra events | `memoryWarning` | `focus` / `blur` (Android-only AppState events) |
+
+Pitfalls: `AppState.currentState` can be `unknown` very early at launch; there's no event when the OS kills a backgrounded process, so persist anything important *when going to background*, not on "exit"; and `active` fires after returning from system dialogs such as the permission prompt on iOS — don't treat every `active` as "the user reopened the app". Real background work belongs to the [Background Tasks guide](../guides/background-tasks.html).
+
+### How do you implement internationalization and right-to-left layouts in React Native?
+
+**Short answer:** Use an i18n library (commonly `i18next` + `react-i18next`) with JSON resources per language, detect the device locale with `expo-localization` or `react-native-localize`, and format numbers, dates and currencies with `Intl`. For RTL languages (Arabic, Hebrew, Persian, Urdu), use `I18nManager` — `allowRTL`/`forceRTL` — and **restart** the app for the direction change to apply; write styles with logical `start`/`end` properties so layouts flip automatically.
+
+```ts title="src/i18n/index.ts"
+import i18n from 'i18next';
+import { initReactI18next } from 'react-i18next';
+import { getLocales } from 'expo-localization';
+import en from './locales/en.json';
+import ar from './locales/ar.json';
+
+i18n.use(initReactI18next).init({
+  resources: { en: { translation: en }, ar: { translation: ar } },
+  lng: kv.getString('lang') ?? getLocales()[0]?.languageCode ?? 'en',
+  fallbackLng: 'en',
+  interpolation: { escapeValue: false }, // React already escapes
+});
+
+export default i18n;
+```
+
+```ts title="src/i18n/applyLanguage.ts"
+import { I18nManager } from 'react-native';
+import * as Updates from 'expo-updates';
+
+export async function applyLanguage(lang: string) {
+  kv.set('lang', lang);
+  await i18n.changeLanguage(lang);
+  const shouldBeRTL = i18n.dir(lang) === 'rtl';
+  if (I18nManager.isRTL !== shouldBeRTL) {
+    I18nManager.allowRTL(shouldBeRTL);
+    I18nManager.forceRTL(shouldBeRTL);
+    await Updates.reloadAsync(); // direction is applied at startup; bare apps use a restart library
+  }
+}
+```
+
+```tsx
+// Pluralization and interpolation live in the resource files:
+// "cart_items_one": "{{count}} item", "cart_items_other": "{{count}} items"
+const { t } = useTranslation();
+<Text>{t('cart_items', { count })}</Text>;
+<Text>{new Intl.NumberFormat(i18n.language, { style: 'currency', currency: 'EUR' }).format(total)}</Text>;
+```
+
+**RTL checklist**
+
+| Do | Avoid |
+|---|---|
+| `marginStart`, `paddingEnd`, `start`, `end`, `borderStartWidth` | `marginLeft`, `left`, `paddingRight` (whether they flip depends on `I18nManager.swapLeftAndRightInRTL`) |
+| `flexDirection: 'row'` (auto-flips in RTL) | Hard-coded `row-reverse` to "fix" RTL |
+| Mirror directional icons (`transform: [{ scaleX: I18nManager.isRTL ? -1 : 1 }]`) | Mirroring logos, media controls or clocks |
+| Test with a pseudo-RTL or real RTL language on both platforms | Only testing in English |
+
+Also: Android needs `android:supportsRtl="true"` in `AndroidManifest.xml` (present in RN templates); Expo projects enable RTL support through app config (see the `expo-localization` docs); i18next pluralization relies on `Intl.PluralRules`, so confirm your engine version provides it or add a polyfill; and long German or Finnish strings will break fixed-width buttons — design for about 30% text expansion.
+
+> [!INTERVIEW]
+> Follow-ups: "Why does changing to Arabic need a restart?" (layout direction is read when the root view is created), "How do you handle server-provided content?" (API returns localized strings via an `Accept-Language` header; format dates on the client with `Intl`).
+
+### How do you make a React Native app accessible, and how do you test it?
+
+**Short answer:** Give every interactive element a **role**, an **accessible name** (label) and its **state**, group related content so screen readers announce it as one item, hide decorative elements, respect **font scaling** and reduced motion, keep touch targets at least 44×44 pt (iOS) / 48×48 dp (Android), and test with **VoiceOver** and **TalkBack** on real devices — plus automated checks via RNTL role queries and platform scanners.
+
+```tsx title="src/settings/ToggleRow.tsx"
+import { Pressable, Switch, Text, View } from 'react-native';
+
+type Props = { label: string; description?: string; value: boolean; disabled?: boolean; onChange: (v: boolean) => void };
+
+export function ToggleRow({ label, description, value, disabled, onChange }: Props) {
+  return (
+    <Pressable
+      accessibilityRole="switch"
+      accessibilityLabel={label}
+      accessibilityHint={description}
+      accessibilityState={{ checked: value, disabled }}
+      onPress={() => onChange(!value)}
+      disabled={disabled}
+      hitSlop={8}
+      style={{ minHeight: 48, flexDirection: 'row', alignItems: 'center' }}
+    >
+      <View style={{ flex: 1 }}>
+        <Text maxFontSizeMultiplier={2}>{label}</Text>
+        {description ? <Text maxFontSizeMultiplier={2}>{description}</Text> : null}
+      </View>
+      {/* The row is the accessible element; hide the inner Switch from screen readers */}
+      <Switch value={value} onValueChange={onChange} disabled={disabled} accessibilityElementsHidden importantForAccessibility="no-hide-descendants" />
+    </Pressable>
+  );
+}
+```
+
+| Concern | API |
+|---|---|
+| What it is | `accessibilityRole` / `role` (`button`, `link`, `header`, `switch`, `checkbox`, `image`, `adjustable`, ...) |
+| What it's called | `accessibilityLabel` / `aria-label`; `accessibilityHint` for the result of the action |
+| Current state | `accessibilityState` (`disabled`, `selected`, `checked`, `busy`, `expanded`) or `aria-*` equivalents |
+| Values (sliders, progress) | `accessibilityValue={{ min, max, now }}` or `{ text }` |
+| Custom actions | `accessibilityActions` + `onAccessibilityAction` (e.g. swipe-to-delete alternatives) |
+| Grouping | `accessible` on a parent `View` (Pressables are accessible by default) |
+| Hiding decorative content | `accessibilityElementsHidden` (iOS), `importantForAccessibility="no-hide-descendants"` (Android), or `aria-hidden` |
+| Dynamic announcements | `AccessibilityInfo.announceForAccessibility`, `accessibilityLiveRegion` (Android) |
+| Modals | `accessibilityViewIsModal` (iOS) so focus stays inside |
+| Preferences | `AccessibilityInfo.isScreenReaderEnabled()`, `isReduceMotionEnabled()`, Reanimated `useReducedMotion()` |
+
+**Dynamic type / font scaling:** `Text` scales with the OS font size by default (`allowFontScaling` is `true`). Don't disable it globally; cap extreme sizes where layout truly can't cope with `maxFontSizeMultiplier`, read `useWindowDimensions().fontScale` to switch layouts (e.g. stack horizontally arranged items vertically), and avoid fixed heights on text containers.
+
+**Testing:** turn on VoiceOver (iOS) and TalkBack (Android) and complete core flows eyes-free; use Xcode's Accessibility Inspector and Google's Accessibility Scanner; check contrast (WCAG AA 4.5:1 for body text); and in unit tests query with `getByRole('button', { name: 'Save' })` — if the query fails, a screen-reader user can't find it either.
+
+> [!INTERVIEW]
+> What a senior answer includes: role + name + state as the core triad, grouping and focus order, font scaling rather than disabling it, reduced motion, platform differences (live regions, modal focus), and a testing routine with real screen readers. Red flag: `allowFontScaling={false}` everywhere "because it breaks the design".
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

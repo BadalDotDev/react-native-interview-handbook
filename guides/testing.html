@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testing Strategy · React Native Interview Handbook</title>
+<meta name="description" content="How to design, build and run a test suite for a production React Native app. It covers what to test at each layer, setting up Jest and React Native Testing Library, reliable…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Testing Strategy · React Native Interview Handbook">
+<meta property="og:description" content="How to design, build and run a test suite for a production React Native app. It covers what to test at each layer, setting up Jest and React Native Testing Library, reliable…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/testing.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Testing Strategy
+
+How to design, build and run a test suite for a production React Native app. It covers what to test at each layer, setting up Jest and React Native Testing Library, reliable end-to-end tests with Detox and Maestro, native and visual tests, platform features such as push and deep links, CI wiring, and the manual and beta testing that still matters before release.
+
+## How it works
+
+A React Native app has five layers that fail in different ways: **pure TS logic** (formatters, reducers, sync queues), **React components and hooks**, **native code** (TurboModules, Fabric, third-party SDKs, Hermes itself), **the OS** (permissions, notifications, deep links, background execution, system sheets), and **the backend/network**.
+
+The key point: **Jest tests never run native code.** Jest runs your JS in Node (V8, not Hermes) with native modules mocked, and RNTL renders through a test renderer. So there's no Fabric, no Yoga layout, no real gestures and no OS. The native and OS layers are all mocks, and mocks drift from reality. Only E2E tests on simulators or devices, native unit tests and humans can cover this **native gap**.
+
+### Pyramid vs trophy
+
+The classic **test pyramid** says "mostly unit tests, some integration tests, few E2E tests". The **testing trophy** (Kent C. Dodds) moves the weight to *integration* tests and puts static analysis at the base. For React Native the trophy fits better, with one change: E2E is more valuable in RN than on the web, because it's the only automated layer that runs the native half of the app.
+
+```mermaid
+flowchart TD
+    subgraph pyramid["Classic pyramid"]
+        P1["Manual / exploratory (few)"]
+        P2["E2E UI tests (some)"]
+        P3["Integration tests (more)"]
+        P4["Unit tests (most)"]
+        P1 --> P2 --> P3 --> P4
+    end
+    subgraph trophy["RN-adapted trophy"]
+        T1["E2E: 10-40 critical journeys<br/>Detox or Maestro on release builds"]
+        T2["Integration: screens with real providers,<br/>navigation and MSW (largest share)"]
+        T3["Unit: logic, hooks, reducers, stores"]
+        T4["Static: TypeScript strict, ESLint"]
+        T1 --> T2 --> T3 --> T4
+    end
+```
+*Figure: The classic pyramid vs. an RN-adapted trophy. Arrows point from top to base. The trophy puts most effort into screen-level integration tests and keeps a small, high-value E2E layer.*
+
+### Cost vs confidence
+
+| Layer | Tooling | Time per test | Catches | Misses |
+|---|---|---|---|---|
+| Static | `tsc --noEmit`, ESLint | Seconds for the repo | Type errors, wrong props, hook deps | Runtime behaviour |
+| Unit | Jest (Node) | 1–10 ms | Logic bugs, edge cases | Wiring between components |
+| Integration | Jest + RNTL + MSW (Node) | 50–500 ms | Screen behaviour, data fetching, error/empty states, navigation logic | Native modules, layout, gestures, Hermes quirks |
+| E2E | Detox / Maestro / Appium on simulators and devices | 10–120 s | Native crashes, release config (R8, Hermes), permissions, staging integration | OEM quirks, unasserted visuals |
+| Manual / beta | TestFlight, Play testing tracks | Minutes–hours | UX, low-end performance, real payments and push | Anything nobody tried |
+
+Further down the table, tests cost more, run slower, flake more and are harder to debug, but they're closer to real usage. The question is **where each unit of effort buys the most confidence**. For most product apps, that means many integration tests and a few well-chosen E2E journeys.
+
+### What belongs at each layer
+
+| Layer | Put here | Don't put here |
+|---|---|---|
+| Static | Strict TS, typed navigation params, generated API types, hooks and floating-promise lint rules | Anything that needs runtime values |
+| Unit | Formatting, validation, reducers, store actions, selectors, retry logic, deep-link parsing, sync conflict resolution | Rendering details, implementation-detail spies |
+| Integration | "Orders shows a list, pull-to-refresh works, a 500 shows an error banner", forms, auth-gated navigation, optimistic updates | Pixel layout, native animations, real network |
+| E2E | Log in, core purchase/booking funnel, onboarding with permissions, deep link into a screen, OTA smoke, offline launch | Every validation message or form edge case |
+| Native unit | Logic in your own Swift/Kotlin modules | Third-party SDK internals |
+| Manual | Exploratory sessions, device matrix, VoiceOver/TalkBack, real payments | Repetitive steps that could be automated |
+
+### Which test should I write?
+
+```mermaid
+flowchart TD
+    Start(["New behaviour or bug fix"]) --> Q1{"Pure logic with no UI?<br/>(util, reducer, selector)"}
+    Q1 -->|"yes"| Unit["Unit test in Jest"]
+    Q1 -->|"no"| Q2{"Needs real native code,<br/>OS UI or device state?"}
+    Q2 -->|"no"| Q3{"Reusable hook or store<br/>used by many screens?"}
+    Q3 -->|"yes"| Hook["renderHook or store test"]
+    Q3 -->|"no"| Comp["RNTL integration test<br/>(screen + providers + MSW)"]
+    Q2 -->|"yes"| Q4{"Inside our own<br/>native module?"}
+    Q4 -->|"yes"| Native["XCTest / JUnit for the module<br/>+ one E2E smoke path"]
+    Q4 -->|"no"| Q5{"Critical journey:<br/>revenue, auth, onboarding?"}
+    Q5 -->|"yes"| E2E["E2E flow in Detox or Maestro"]
+    Q5 -->|"no"| Manual["Release checklist or<br/>exploratory QA charter"]
+```
+*Figure: A decision flow the team can apply in code review. Bug fixes follow the same path: reproduce the bug at the lowest layer that can show it, then fix it.*
+
+### Writing a team test strategy
+
+A test strategy is a one- or two-page document that stops "should we test this?" turning into a debate on every PR. A good one answers:
+
+| Section | Example decisions |
+|---|---|
+| Goals | "Catch checkout/auth regressions before merge; PR CI under 15 minutes." |
+| Ownership | Feature teams own unit and integration tests; a platform team owns E2E infrastructure, the device matrix and flake triage. |
+| Required per PR | Unit tests for new logic; integration tests for new screens (happy, loading, empty, error); a regression test with every bug fix. |
+| E2E scope | A named list of 10–40 critical journeys: a smoke subset on PRs, the full suite nightly. |
+| Conventions | `Foo.test.tsx` next to the source, MSW handlers in `src/test/msw`, factories in `src/test/factories`, `testID` named `screen-element`. |
+| CI gates & flakes | Required checks, a ratcheted coverage floor. Tests that pass only on retry are logged, and above a 2% flake rate they're quarantined and ticketed. |
+| Release testing | Device/OS matrix, regression checklist, beta cohorts, staged rollout gates (see [Monitoring](monitoring.html)). |
+| Non-goals | "We don't snapshot component trees or E2E test third-party payment sheets." |
+
+Put the per-PR rules into the PR template as checkboxes, and have CI enforce whatever it can check automatically.
+
+## Requirements & prerequisites
+
+| Item | Notes |
+|---|---|
+| Node.js 20+ (22 LTS) | Match your RN release's requirement; pin it in `.nvmrc` and CI. |
+| Jest 29/30, `@testing-library/react-native`, `msw` v2 | Use `jest-expo` as the preset on Expo (install with `npx expo install` so versions match the SDK). |
+| Detox 20.x | macOS + Xcode for iOS, plus `applesimutils` (`brew tap wix/brew && brew install applesimutils`) for permissions; Android SDK + emulator image. |
+| Maestro CLI | Needs Java 17+. Runs on iOS simulators and Android emulators/devices. |
+| CI runners | macOS runners for iOS (several times the cost of Linux per minute); Linux with KVM for Android emulators; JDK 17. |
+| Test backend | A staging environment with a seeding API, or a hermetic mock server. |
+| Devices & betas | Optional device cloud (Firebase Test Lab, BrowserStack, AWS Device Farm, Maestro Cloud); TestFlight, Play testing tracks, Firebase App Distribution or EAS internal distribution. |
+
+## Choosing a library / approach
+
+| Need | Recommended | Why |
+|---|---|---|
+| Runner | Jest (template / `jest-expo`) | Every RN library ships Jest mocks and presets; no Vitest RN preset is mature yet. |
+| Component tests | React Native Testing Library | User-centric queries and `userEvent`. Enzyme is dead, and `react-test-renderer` is deprecated in React 19. |
+| Network mocking | MSW | Exercises your real API client (headers, auth refresh, error mapping). |
+| E2E, engineering-owned | Detox | Synchronisation, TS tests, deep control (launch args, permissions). |
+| E2E, QA-owned / Expo | Maestro | No app changes, YAML flows, Studio, EAS / Maestro Cloud. |
+| Device farms | Appium + WebdriverIO | WebDriver standard, supported by every device cloud. |
+| Render perf | Reassure | Statistical render time/count comparison between branches. |
+
+**Recommendation:** Put 80–90% of test effort into Jest + RNTL + MSW. Use Detox (engineers own E2E, bare/prebuild) or Maestro (QA owns E2E, or you want the lowest setup cost) for the critical journeys, with a smoke subset on PRs and the full suite nightly.
+
+## Unit tests with Jest
+
+### Step 1 — Configure Jest (bare React Native)
+
+The community template ships a minimal `jest.config.js`. Production apps need more: a setup file, `transformIgnorePatterns` for untranspiled packages, path aliases and coverage settings.
+
+```js title="jest.config.js"
+/** @type {import('jest').Config} */
+const sharded = process.env.JEST_SHARDED === 'true';
+
+module.exports = {
+  preset: 'react-native',
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.ts'],
+  // Jest does not transform node_modules by default, but many RN packages
+  // ship untranspiled ESM/Flow/TS. Whitelist them with a negative lookahead.
+  transformIgnorePatterns: [
+    'node_modules/(?!((jest-)?react-native|@react-native(-community)?|@react-navigation|react-native-reanimated|react-native-worklets|react-native-gesture-handler|react-native-safe-area-context|react-native-screens|@shopify/flash-list)/)',
+  ],
+  moduleNameMapper: {
+    '^@/(.*)$': '<rootDir>/src/$1',
+  },
+  testPathIgnorePatterns: ['/node_modules/', '<rootDir>/e2e/'],
+  collectCoverageFrom: [
+    'src/**/*.{ts,tsx}',
+    '!src/**/*.stories.tsx',
+    '!src/**/*.d.ts',
+    '!src/test/**',
+    '!src/**/__generated__/**',
+  ],
+  // Per-shard coverage is partial; enforce thresholds after merging shards in CI.
+  coverageThreshold: sharded
+    ? undefined
+    : { global: { statements: 70, branches: 60, functions: 65, lines: 70 } },
+};
+```
+
+Recent React Native releases may point you to a separate Jest preset package; if so, follow your template's `jest.config.js` and keep the rest of this config.
+
+> [!WARNING] `transformIgnorePatterns` and pnpm
+> With pnpm, packages live under `node_modules/.pnpm/<name>@<version>/node_modules/<name>`, so the usual pattern doesn't match. Allow the `.pnpm` segment, for example `'node_modules/(?!(?:\\.pnpm/)?(...your list...))'`, or set `node-linker=hoisted`. The typical symptom is `SyntaxError: Cannot use import statement outside a module` coming from inside `node_modules`.
+
+### Step 1b — Configure Jest (Expo)
+
+```bash
+npx expo install jest-expo jest @types/jest -- --save-dev
+npx expo install @testing-library/react-native -- --save-dev
+```
+
+```json title="package.json"
+{
+  "scripts": {
+    "test": "TZ=UTC jest",
+    "test:watch": "TZ=UTC jest --watch",
+    "test:ci": "TZ=UTC jest --ci --coverage"
+  },
+  "jest": {
+    "preset": "jest-expo",
+    "setupFilesAfterEnv": ["<rootDir>/jest.setup.ts"],
+    "transformIgnorePatterns": [
+      "node_modules/(?!((jest-)?react-native|@react-native(-community)?)|expo(nent)?|@expo(nent)?/.*|@expo-google-fonts/.*|react-navigation|@react-navigation/.*|@sentry/react-native|native-base|react-native-svg)"
+    ]
+  }
+}
+```
+
+`jest-expo` mocks most Expo modules for you and sets `Platform.OS` to `ios`. Use `jest-expo/universal` (or the `jest-expo/ios` and `jest-expo/android` presets) to run the suite once per platform when you have platform-specific branches.
+
+> [!TIP] Pin the timezone
+> `TZ=UTC` in the test script (or `process.env.TZ = 'UTC'` in a `globalSetup` file) stops date tests that pass in Berlin from failing on a CI runner in Virginia. Pin the locale for `Intl` tests the same way.
+
+### Step 2 — Setup file and native module mocks
+
+Every native module your JS touches must be mocked in Jest, or you'll get errors like `TurboModuleRegistry.getEnforcing(...): 'RNCAsyncStorage' could not be found`. Mocks come from three places:
+
+1. **Library-provided mocks.** Always prefer these; the maintainers keep them in sync with the real API.
+2. **`__mocks__` directories.** A file at `<root>/__mocks__/<package-name>.ts`, next to `node_modules`, is used automatically for that node module (scoped packages: `__mocks__/@scope/name.ts`). Files at `src/foo/__mocks__/bar.ts` mock `src/foo/bar.ts` when you call `jest.mock('./bar')`.
+3. **Inline `jest.mock(moduleName, factory)`** for per-file behaviour.
+
+```ts title="jest.setup.ts"
+import 'react-native-gesture-handler/jestSetup';
+import { server } from '@/test/msw/server';
+
+// Reanimated: follow the testing docs for your major version.
+require('react-native-reanimated').setUpTests();
+
+jest.mock('react-native-safe-area-context', () =>
+  require('react-native-safe-area-context/jest/mock').default,
+);
+
+jest.mock('@react-native-async-storage/async-storage', () =>
+  require('@react-native-async-storage/async-storage/jest/async-storage-mock'),
+);
+
+jest.mock('@react-native-community/netinfo', () =>
+  require('@react-native-community/netinfo/jest/netinfo-mock.js'),
+);
+
+jest.mock('react-native-permissions', () => require('react-native-permissions/mock'));
+
+// Our own boundary modules (see "mock at your boundary" below)
+jest.mock('@/analytics/analytics');
+jest.mock('@/monitoring/reporter');
+
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+```
+
+Notes on the rest:
+
+- **Reanimated 4** moved worklets into `react-native-worklets`; check its docs in case it needs an extra mock.
+- **react-native-mmkv** uses an in-memory implementation under Jest in recent versions.
+- **`@react-native-firebase/*`** has no complete official mock, so hide it behind your own module.
+- **Expo modules** are mocked by `jest-expo`; override return values with `jest.mocked(...)`.
+- **In-memory mocks keep state** between tests (AsyncStorage, MMKV), so clear them in `afterEach`.
+
+#### Mock at your boundary, not the library
+
+Don't sprinkle `jest.mock('@react-native-firebase/analytics')` across 40 test files. Wrap each native dependency in a small typed module that you own (`src/analytics/analytics.ts`, `src/native/biometrics.ts`) and mock **that**. You write one mock, the interface is yours, and swapping vendors doesn't break tests.
+
+```ts title="src/native/__mocks__/biometrics.ts"
+import type { BiometricsApi } from '../biometrics';
+
+export const biometrics: jest.Mocked<BiometricsApi> = {
+  isAvailable: jest.fn().mockResolvedValue({ available: true, type: 'faceId' }),
+  authenticate: jest.fn().mockResolvedValue({ success: true }),
+};
+```
+
+In a test, call `jest.mock('@/native/biometrics')`, then override per case: `biometrics.authenticate.mockResolvedValueOnce({ success: false, error: 'user_cancel' })`.
+
+> [!WARNING] Mocks lie
+> A mock only encodes what you *believe* the native module does. When a library changes behaviour (for example, returning `limited` instead of `granted` for photo access on newer iOS), your Jest suite keeps passing. Back every critical native interaction with at least one E2E or manual check.
+
+### Step 3 — Test pure logic, reducers and stores
+
+Pure functions are the cheapest tests you'll write. Use table-driven tests (`it.each`) for edge cases such as zero, negative values, rounding and locales.
+
+> [!IMPORTANT] Jest is not Hermes
+> Jest runs on Node's V8 engine with full ICU. Your app runs on Hermes, whose `Intl`, `Date` parsing and some regex features can differ. For example, `new Date('2024-01-02 10:00')` (a non-ISO string) may parse differently. Unit tests prove your logic, not the engine's behaviour. Cover locale and date formatting on a device at least once (E2E or manual), and prefer ISO-8601 strings and explicit formatting libraries.
+
+Redux Toolkit slices are plain reducers: `expect(cartReducer(state, itemAdded(p1))).toEqual(...)`. Zustand stores are module singletons, so **reset them between tests** or state leaks from one test into the next:
+
+```ts title="src/features/session/sessionStore.test.ts"
+import { act } from '@testing-library/react-native';
+import { useSessionStore, initialSessionState } from './sessionStore';
+
+beforeEach(() => {
+  useSessionStore.setState(initialSessionState, true); // replace, don't merge
+});
+
+test('signOut clears tokens and user', () => {
+  act(() => {
+    useSessionStore.getState().signIn({ userId: 'u1', accessToken: 'a', refreshToken: 'r' });
+    useSessionStore.getState().signOut();
+  });
+  expect(useSessionStore.getState()).toMatchObject({ userId: null, accessToken: null });
+});
+```
+
+### Step 4 — Fake timers and hooks with `renderHook`
+
+Use fake timers (`jest.useFakeTimers()`, which also mocks `Date`) for debounce, polling, retry backoff and auto-dismissing toasts. When timers and `await` are interleaved, as in retry logic, use `await jest.advanceTimersByTimeAsync(ms)` (Jest 29.5+). It also flushes promise callbacks. RNTL's `waitFor`, `findBy*` and `userEvent` detect fake timers and advance them for you.
+
+```ts title="src/hooks/useDebouncedValue.test.ts"
+import { act, renderHook } from '@testing-library/react-native';
+import { useDebouncedValue } from './useDebouncedValue';
+
+beforeEach(() => jest.useFakeTimers());
+afterEach(() => jest.useRealTimers());
+
+test('only publishes the latest value after the delay', () => {
+  const { result, rerender } = renderHook(
+    ({ value }: { value: string }) => useDebouncedValue(value, 300),
+    { initialProps: { value: 'r' } },
+  );
+
+  rerender({ value: 're' });
+  rerender({ value: 'rea' });
+  expect(result.current).toBe('r');
+
+  act(() => jest.advanceTimersByTime(300));
+  expect(result.current).toBe('rea');
+});
+```
+
+Hooks that need context (a QueryClient, a store provider, navigation) take a `wrapper` option. Use the same provider tree as your custom render, described below.
+
+## Component and integration tests with RNTL
+
+React Native Testing Library renders components in Node and lets you query them the way a user (or a screen reader) finds them. The guiding rule: **the more your tests resemble how the software is used, the more confidence they give you.** Assert on what's visible and accessible, not on state, props or which hook was called.
+
+### Query priority
+
+| Priority | Query | Use for |
+|---|---|---|
+| 1 | `getByRole('button', { name: 'Pay now' })` | Anything interactive or structural: `button`, `header`, `switch`, `checkbox`, `link`, `alert`, `tab`. Requires the element to be an accessibility element with a role. |
+| 2 | `getByLabelText('Email')` | Inputs and icon buttons that carry an `accessibilityLabel` / `aria-label`. |
+| 3 | `getByPlaceholderText`, `getByDisplayValue` | Text inputs, when there's no label. |
+| 4 | `getByText('Order confirmed')` | Non-interactive content. |
+| 5 | `getByHintText` | Rarely; hints are secondary. |
+| Last | `getByTestId('order-row-42')` | When nothing user-visible identifies the element, such as a list row or an image. |
+
+Variants: `getBy*` throws if the element is missing (synchronous), `queryBy*` returns `null` (use it to assert absence), `findBy*` returns a promise and retries until the element appears or the timeout passes. `*AllBy*` variants return arrays.
+
+> [!TIP] Role queries improve accessibility as a side effect
+> `getByRole('button', { name: 'Delete' })` only passes if the `Pressable` has `accessibilityRole="button"` (or `role="button"`) and an accessible name. Tests written this way push the team toward screens that work with VoiceOver and TalkBack.
+
+### User events vs `fireEvent`
+
+`userEvent` simulates realistic sequences: `press` fires `pressIn`/`pressOut`/`press` with real timing, and `type` focuses the input and emits `keyPress` + `changeText` per character, then `endEditing` and `blur`. It also respects `editable={false}` and disabled state. `fireEvent.press` just calls `onPress`. Prefer `userEvent`, and **always `await` it**.
+
+```tsx title="src/features/auth/LoginScreen.test.tsx"
+import { screen, userEvent } from '@testing-library/react-native';
+import { renderWithProviders } from '@/test/test-utils';
+import { LoginScreen } from './LoginScreen';
+
+test('signs in with valid credentials', async () => {
+  const user = userEvent.setup();
+  const onSignedIn = jest.fn();
+  renderWithProviders(<LoginScreen onSignedIn={onSignedIn} />, { auth: { status: 'signedOut' } });
+
+  await user.type(screen.getByLabelText('Email'), 'ada@example.com');
+  await user.type(screen.getByLabelText('Password'), 'correct-horse');
+  await user.press(screen.getByRole('button', { name: 'Sign in' }));
+
+  expect(await screen.findByText('Welcome back')).toBeOnTheScreen();
+  expect(onSignedIn).toHaveBeenCalledWith({ userId: 'user-1' });
+});
+```
+
+For the error path, override the login handler with `server.use(...)` to return a 401, then assert on `findByRole('alert')` and that the button is enabled again.
+
+### Async: `findBy*` and `waitFor`
+
+- `await screen.findByText(...)` for something that *appears* (`waitFor` + `getBy` in one call).
+- `await waitFor(() => expect(...))` for an assertion that eventually holds. Use one assertion and **no side effects** inside, because the callback re-runs.
+- `await waitForElementToBeRemoved(...)` for spinners.
+- An "update not wrapped in act(...)" warning means an async update landed after the test stopped awaiting. Await the resulting UI rather than adding manual `act` calls.
+
+### Built-in Jest matchers
+
+RNTL ships its own Jest matchers. They replace the deprecated `@testing-library/jest-native` package. On RNTL 12.4+ you enable them with `import '@testing-library/react-native/extend-expect'` in your setup file. Newer majors (v13+) register them automatically when you import RNTL. Check the docs for your version, and remove `jest-native` when you migrate.
+
+| Matcher | Checks |
+|---|---|
+| `toBeOnTheScreen()` | Element is in the rendered tree (`queryBy*` + `.not` for absence). |
+| `toHaveTextContent(text \| regex)` | Text of the element and its children. |
+| `toBeVisible()` | Not hidden by `display: 'none'`, `opacity: 0` or accessibility hiding. |
+| `toBeEnabled()` / `toBeDisabled()` | `disabled`, `aria-disabled` / `accessibilityState`, `editable={false}`. |
+| `toBeChecked()`, `toBePartiallyChecked()`, `toBeSelected()`, `toBeExpanded()`, `toBeBusy()` | Accessibility state. |
+| `toHaveDisplayValue()`, `toHaveAccessibleName()`, `toHaveAccessibilityValue()` | Input value and accessibility tree. |
+| `toHaveProp()`, `toHaveStyle()`, `toContainElement()`, `toBeEmptyElement()` | Escape hatches and structure; use sparingly. |
+
+### Custom render with providers
+
+Every screen needs the same provider tree, so define it in one place:
+
+```tsx title="src/test/test-utils.tsx"
+import React, { type ReactElement, type ReactNode } from 'react';
+import { render, type RenderOptions } from '@testing-library/react-native';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { ThemeProvider } from '@/theme/ThemeProvider';
+import { AuthContext, type AuthState } from '@/auth/AuthContext';
+
+const defaultAuth: AuthState = { status: 'signedIn', userId: 'user-1' };
+
+export function createTestQueryClient() {
+  return new QueryClient({
+    defaultOptions: {
+      // No retries: error-state tests would otherwise wait through exponential backoff.
+      // gcTime Infinity: no garbage-collection timers left running after the test.
+      queries: { retry: false, gcTime: Infinity },
+      mutations: { retry: false },
+    },
+  });
+}
+
+type Options = Omit<RenderOptions, 'wrapper'> & {
+  auth?: Partial<AuthState>;
+  queryClient?: QueryClient;
+};
+
+export function renderWithProviders(
+  ui: ReactElement,
+  { auth, queryClient = createTestQueryClient(), ...options }: Options = {},
+) {
+  const authValue = { ...defaultAuth, ...auth } as AuthState;
+
+  function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <SafeAreaProvider>
+        <QueryClientProvider client={queryClient}>
+          <ThemeProvider>
+            <AuthContext.Provider value={authValue}>{children}</AuthContext.Provider>
+          </ThemeProvider>
+        </QueryClientProvider>
+      </SafeAreaProvider>
+    );
+  }
+
+  return { queryClient, ...render(ui, { wrapper: Wrapper, ...options }) };
+}
+```
+
+> [!NOTE] React 19 and async rendering
+> React 19 deprecated `react-test-renderer`, and newer RNTL majors are moving to a new renderer and async `render` APIs. The pattern stays the same, but you `await` the render. Follow the RNTL migration guide when upgrading.
+
+### Testing navigation with a real `NavigationContainer`
+
+Don't mock `useNavigation` in integration tests. That only proves you called `navigate('Checkout')`, not that the user ends up on Checkout. Render a real navigator, either the production one or a minimal stack containing the screens involved:
+
+```tsx title="src/features/cart/CartFlow.test.tsx"
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { screen, userEvent } from '@testing-library/react-native';
+import { renderWithProviders } from '@/test/test-utils';
+import type { RootStackParamList } from '@/navigation/types';
+import { CartScreen } from './CartScreen';
+import { CheckoutScreen } from '../checkout/CheckoutScreen';
+
+const Stack = createNativeStackNavigator<RootStackParamList>();
+
+function renderCartFlow() {
+  return renderWithProviders(
+    <NavigationContainer>
+      <Stack.Navigator initialRouteName="Cart" screenOptions={{ animation: 'none' }}>
+        <Stack.Screen name="Cart" component={CartScreen} />
+        <Stack.Screen name="Checkout" component={CheckoutScreen} />
+      </Stack.Navigator>
+    </NavigationContainer>,
+  );
+}
+
+test('moves from cart to checkout with the cart total', async () => {
+  const user = userEvent.setup();
+  renderCartFlow();
+
+  await user.press(await screen.findByRole('button', { name: 'Checkout' }));
+
+  expect(await screen.findByText('Order summary')).toBeOnTheScreen();
+  expect(screen.getByLabelText('Order total')).toHaveTextContent('$42.00');
+});
+```
+
+Assert on screen *content* rather than native-stack header titles, because native headers are rendered by `react-native-screens` and may not show up in the test tree. Test your linking config separately as a unit test: call `getStateFromPath('orders/42', linking.config)` from `@react-navigation/native` and assert on the resulting state.
+
+### TanStack Query
+
+- **New `QueryClient` per test.** A shared client leaks cache between tests and causes failures that depend on test order.
+- **Retries off.** The default of three retries with backoff makes error tests slow or time out.
+- **Test user-visible states**: loading, data, empty, error with retry, and optimistic updates with rollback.
+- For hooks: `renderHook(() => useOrders(), { wrapper })`, then `await waitFor(() => expect(result.current.isSuccess).toBe(true))`.
+
+### Network mocking: MSW vs mocking fetch
+
+| Approach | What it tests | Downsides |
+|---|---|---|
+| `jest.mock('@/api/orders')` | Component with a fake data layer | Skips client, serialisation and error mapping. |
+| `global.fetch = jest.fn()` | Component + client, crudely | Brittle (call order, exact args). Misses axios/XHR. |
+| **MSW** (`msw/node`) | Component + client + HTTP contract | Small setup. Handlers must track the API (generate from OpenAPI). |
+
+MSW intercepts requests at the network layer (fetch, XHR and Node http), so your real client code runs, including auth headers, token refresh and error parsing:
+
+```ts title="src/test/msw/handlers.ts"
+import { http, HttpResponse } from 'msw';
+import { API_URL } from '@/config';
+import { makeOrder } from '@/test/factories';
+
+export const handlers = [
+  http.get(`${API_URL}/orders`, () =>
+    HttpResponse.json([makeOrder({ id: 'o1', totalCents: 4200 }), makeOrder({ id: 'o2' })]),
+  ),
+  http.post(`${API_URL}/auth/login`, async ({ request }) => {
+    const body = (await request.json()) as { email: string; password: string };
+    if (body.password !== 'correct-horse') {
+      return HttpResponse.json({ code: 'INVALID_CREDENTIALS' }, { status: 401 });
+    }
+    return HttpResponse.json({ accessToken: 'test-token', userId: 'user-1' });
+  }),
+];
+```
+
+```ts title="src/test/msw/server.ts"
+import { setupServer } from 'msw/node';
+import { handlers } from './handlers';
+
+export const server = setupServer(...handlers);
+```
+
+Override handlers per test with `server.use(...)` (reset by `server.resetHandlers()` in `afterEach`). Simulate network failure with `HttpResponse.error()` and latency with `await delay(2000)`. `onUnhandledRequest: 'error'` makes any request you forgot to mock fail loudly.
+
+> [!WARNING] MSW 2 needs web globals
+> MSW 2 relies on `fetch`, `Response`, `TextEncoder` and streams. If you see `ReferenceError: Response is not defined`, polyfill them in a setup file (MSW's Jest FAQ has the recipe). For in-app mocking during development, use `msw/native` with its documented polyfills.
+
+### Snapshot tests: use sparingly
+
+Large component-tree snapshots are **change detectors, not tests**. They fail on any markup change, reviewers approve the updates without reading them, and they never check behaviour. Use `toMatchInlineSnapshot()` only for small, deterministic output (a navigation state, a generated deep-link URL), and catch visual regressions with real screenshots.
+
+## End-to-end tests
+
+### How Detox works
+
+Detox is **gray-box**. Tests run in Node (Jest is the runner) and send commands over a WebSocket to a native library linked into the app: EarlGrey on iOS, Espresso on Android. Because that library runs *inside* the app, Detox **synchronises automatically**. Before each action and expectation it waits until there are no in-flight requests, pending timers, running animations or queued main-thread/JS-thread work. So tests need no `sleep()` calls and flake less than black-box tools.
+
+```mermaid
+flowchart TD
+    subgraph host["Host machine or CI runner"]
+        Tests["Jest test files<br/>(e2e/*.test.ts)"]
+        Client["Detox client (Node)"]
+        Server["Detox server<br/>(WebSocket)"]
+        Tools["adb / simctl / applesimutils<br/>(install, launch, permissions)"]
+    end
+    subgraph device["Simulator or emulator"]
+        Native["Detox native library<br/>(EarlGrey on iOS, Espresso on Android)"]
+        Sync["Idle tracking: network, timers,<br/>animations, main and JS threads"]
+        AppUT["App under test<br/>(release-like build)"]
+    end
+    Tests --> Client
+    Client --> Server
+    Client --> Tools
+    Server -->|"actions and expectations"| Native
+    Native -.->|"results, idle status"| Server
+    Native --> Sync
+    Sync --> AppUT
+    Tools --> AppUT
+```
+*Figure: Detox architecture. The native library runs inside the app process, so Detox knows when the app is idle. That's what makes it "gray-box".*
+
+The same synchronisation can **hurt**: a looping Lottie or shimmer, a WebSocket, polling or a `setInterval` keeps the app "busy" forever, and tests time out. Fixes, in order of preference: disable looping animations in E2E builds (via a launch argument), exclude background URLs with `device.setURLBlacklist([...])`, or, as a last resort, wrap a single step in `device.disableSynchronization()` / `enableSynchronization()`.
+
+### Detox setup
+
+1. `npm i -D detox` (Detox uses the project's Jest), then `npx detox init`, which creates `.detoxrc.js` and `e2e/jest.config.js`.
+2. **iOS:** install `applesimutils` (needed for `permissions`). No native code changes are needed.
+3. **Android (bare):** follow the Detox Android guide. In short: add the Detox Maven repository in `android/build.gradle`; add `testBuildType`, `testInstrumentationRunner` and `androidTestImplementation('com.wix:detox:+')` in `android/app/build.gradle`; create `android/app/src/androidTest/java/com/example/shop/DetoxTest.java`; and allow cleartext traffic to `localhost`/`10.0.2.2` in a debug network security config.
+4. **Expo:** add the `@config-plugins/detox` config plugin to `app.json` and run `npx expo prebuild`. It applies all the Android changes for you.
+
+```js title=".detoxrc.js"
+/** @type {Detox.DetoxConfig} */
+module.exports = {
+  testRunner: {
+    args: { $0: 'jest', config: 'e2e/jest.config.js' },
+    jest: { setupTimeout: 180000 },
+  },
+  apps: {
+    'ios.release': {
+      type: 'ios.app',
+      binaryPath: 'ios/build/Build/Products/Release-iphonesimulator/Shop.app',
+      build:
+        'xcodebuild -workspace ios/Shop.xcworkspace -scheme Shop -configuration Release -sdk iphonesimulator -derivedDataPath ios/build',
+    },
+    'android.release': {
+      type: 'android.apk',
+      binaryPath: 'android/app/build/outputs/apk/release/app-release.apk',
+      testBinaryPath: 'android/app/build/outputs/apk/androidTest/release/app-release-androidTest.apk',
+      build:
+        'cd android && ./gradlew assembleRelease assembleAndroidTest -DtestBuildType=release && cd ..',
+    },
+  },
+  devices: {
+    simulator: { type: 'ios.simulator', device: { type: 'iPhone 16' } },
+    attached: { type: 'android.attached', device: { adbName: 'emulator-5554' } },
+  },
+  configurations: {
+    'ios.sim.release': { device: 'simulator', app: 'ios.release' },
+    'android.att.release': { device: 'attached', app: 'android.release' }, // CI: emulator already booted
+  },
+  artifacts: { rootDir: 'artifacts' },
+};
+```
+
+```ts title="e2e/checkout.test.ts"
+import { by, device, element, expect, waitFor } from 'detox';
+
+describe('Checkout', () => {
+  beforeAll(async () => {
+    await device.launchApp({
+      newInstance: true,
+      delete: true, // fresh install: no leftover storage
+      permissions: { notifications: 'YES' }, // iOS only
+      launchArgs: { e2e: 'true', seedScenario: 'buyer_with_cart', disableAnimations: 'true' },
+    });
+  });
+
+  it('pays for the cart with a saved test card', async () => {
+    await element(by.id('tab-cart')).tap();
+    await expect(element(by.id('cart-row-0'))).toBeVisible();
+
+    await element(by.id('checkout-button')).tap();
+    await element(by.id('promo-input')).replaceText('WELCOME10');
+    await element(by.label('Apply promo code')).tap();
+
+    await element(by.id('pay-button')).tap();
+    await waitFor(element(by.text('Order confirmed')))
+      .toBeVisible()
+      .withTimeout(15000);
+  });
+});
+```
+
+Read `launchArgs` in the app (for example with `react-native-launch-arguments`) to pick a seeded account, turn off animations or point the app at a mock server. Only honour them in test builds.
+
+```bash
+npx detox build -c ios.sim.release
+npx detox test -c ios.sim.release --record-logs failing --take-screenshots failing --record-videos failing
+npx detox test -c android.att.release --headless --retries 1
+```
+
+> [!TIP] Author on debug, gate on release
+> Use a debug build with Metro while writing tests, because you get fast iteration and can use `device.reloadReactNative()`. Run CI against **release** builds: they're faster, don't need Metro, and exercise R8/ProGuard, Hermes bytecode and production config, which are exactly the things that break only in release.
+
+### Maestro
+
+Maestro drives the app from the outside through the platform's accessibility and UI automation layers. You describe flows in YAML, and Maestro waits and retries automatically, which absorbs a lot of timing flakiness. It needs **no changes to the app**, works with any build (including Expo/EAS builds), and has Maestro Studio for inspecting elements and recording flows. Maestro Cloud (and EAS Workflows) can run flows on hosted devices.
+
+```yaml title=".maestro/checkout.yaml"
+appId: com.example.shop
+name: Checkout with saved card
+tags:
+  - smoke
+  - checkout
+---
+- launchApp:
+    clearState: true
+    permissions:
+      notifications: allow
+- runFlow: subflows/login.yaml
+- tapOn:
+    id: "tab-cart"
+- assertVisible:
+    id: "cart-row-0"
+- tapOn: "Checkout"
+- tapOn:
+    id: "pay-button"
+- extendedWaitUntil:
+    visible: "Order confirmed"
+    timeout: 15000
+- takeScreenshot: checkout-confirmed
+```
+
+```yaml title=".maestro/subflows/login.yaml"
+appId: com.example.shop
+---
+- tapOn:
+    id: "email-input"
+- inputText: ${EMAIL}
+- tapOn:
+    id: "password-input"
+- inputText: ${PASSWORD}
+- tapOn: "Sign in"
+- assertVisible: "Home"
+```
+
+```bash
+maestro test -e EMAIL=buyer@example.test -e PASSWORD="$E2E_PASSWORD" .maestro/checkout.yaml
+maestro test --include-tags smoke --format junit --output reports/maestro.xml .maestro
+maestro studio            # inspect the hierarchy and try commands interactively
+```
+
+Trade-offs: there's no in-app idle synchronisation, complex logic needs `runScript` JavaScript, and iOS support centres on simulators. For most teams, how quickly you can write flows outweighs these.
+
+### Appium
+
+Appium implements the W3C **WebDriver** protocol on top of platform drivers (UiAutomator2 on Android, XCUITest on iOS), installed separately (`appium driver install uiautomator2`). Tests use any WebDriver client, most often WebdriverIO (`await driver.$('~Pay now').click()`, where `~` means accessibility id). It's fully **black-box**: no synchronisation with RN internals, so you need explicit waits. Its strength is reach: every device cloud supports it, and QA teams can reuse skills from web automation.
+
+### Comparison
+
+| | Detox | Maestro | Appium |
+|---|---|---|---|
+| Approach | Gray-box, in-app native library | Black-box, UI automation | Black-box, WebDriver |
+| Test language | JS/TS (Jest) | YAML (+ JS snippets) | Any WebDriver client (JS/TS, Java, Python) |
+| Synchronisation | Automatic idle sync | Automatic waiting/retry at the UI level | Manual explicit waits |
+| App changes | Android native setup / config plugin | None | None |
+| Setup effort | Medium–high | Low | High |
+| Speed | Fast | Fast | Slow |
+| Flakiness | Low (if app can go idle) | Low–medium | Medium–high |
+| Real devices | Limited (mainly simulators/emulators) | Android devices; iOS mainly simulators | Excellent (device clouds) |
+| Best for | Engineering-owned critical journeys in bare RN/prebuild apps | QA-owned flows, Expo/EAS, fast adoption | Cross-platform QA orgs, device farms, native + hybrid apps |
+
+### Selectors: testIDs and accessibility labels
+
+| Attribute | iOS maps to | Android maps to | Found by |
+|---|---|---|---|
+| `testID` | `accessibilityIdentifier` | View tag / resource id | Detox `by.id`, Maestro `id:`, RNTL `getByTestId`, Appium iOS `~` |
+| `accessibilityLabel` / `aria-label` | `accessibilityLabel` | `contentDescription` | Detox `by.label`, RNTL `getByLabelText`, Appium Android `~`, Maestro text matching |
+| Visible text | Label/value | Text | Detox `by.text`, Maestro `tapOn: "text"`, RNTL `getByText` |
+
+Rules that save hours:
+
+- Name testIDs consistently, as `screen-element[-id]` (`cart-row-0`, `checkout-pay-button`), and use stable IDs in lists.
+- `accessible={true}` on a container merges its children into one accessibility element on iOS, so child `testID`s disappear from automation. Put the `testID` on the container instead.
+- In localised apps, select by testID in E2E; prefer labels in RNTL. Never mount two elements with the same testID (tabs keep inactive screens mounted).
+
+### Test data and seeded backends
+
+E2E tests are only deterministic when the data is. There are three options. A **hermetic mock backend** (mock-server flavour, WireMock, `msw/native`) is fast but doesn't test the real API. A **seeded staging environment** is realistic but slower and shared. **Ephemeral per-PR environments** give you both, at the highest cost. Most teams run PR smoke tests against seeded staging and use mocks for hard-to-reproduce cases (payment declines, 500s).
+
+```mermaid
+sequenceDiagram
+    participant CI as CI job
+    participant Seed as Test-data API
+    participant DB as Staging DB
+    participant App as App under test
+    participant API as Staging API
+    CI->>Seed: POST /test/scenarios buyer_with_cart
+    Seed->>DB: create user, cart, test card token
+    Seed-->>CI: credentials and ids (run-scoped)
+    CI->>App: launchApp with launch args
+    App->>API: login, fetch cart
+    API-->>App: seeded data
+    Note over CI,App: assertions run against known data
+    CI->>Seed: DELETE /test/scenarios run-id
+```
+*Figure: Seeding run-scoped test data. Unique users per CI run mean parallel jobs never collide, and a nightly job cleans up after crashed runs.*
+
+Never point E2E at production. Protect the seeding API (staging-only, with a CI-held secret) and make scenarios idempotent.
+
+### Fighting flakiness
+
+- **Release builds, animations off** (the emulator's `disable-animations` plus an app-level flag for Reanimated and Lottie).
+- **Deterministic data and time**: seeded users, fixed locale and timezone. **No sleeps**; use `waitFor(...).withTimeout()` / `extendedWaitUntil`.
+- **Isolated tests**: each starts from a known state (`delete: true`, `clearState: true` or a reset endpoint). Never let test B depend on test A.
+- **Pre-grant permissions** and test the prompts in dedicated tests. **Turn off third-party SDKs that poll** (ads, chat) in E2E builds.
+- **Retry at most once and log every retry.** Quarantine tests that pass only on retry, with a ticket and an SLA to fix or delete them.
+- **Artifacts on failure** (video, screenshots, logs). **Enough CI resources** (x86_64 image, KVM, 4 GB+ RAM, `-gpu swiftshader_indirect`).
+
+## Native tests for native modules
+
+When you own Swift/Kotlin code (TurboModules, Nitro or Expo modules), keep the RN binding layer thin and put the logic in plain native classes you can test without React Native. Then: the pure native class gets **XCTest / JUnit** tests, the JS wrapper gets a Jest test against a mock, and **one E2E path** exercises the real bridge.
+
+```kotlin title="android/app/src/test/java/com/example/shop/receipt/ReceiptParserTest.kt"
+package com.example.shop.receipt
+
+import org.junit.Assert.assertEquals
+import org.junit.Test
+
+class ReceiptParserTest {
+    @Test
+    fun parsesTotalInMinorUnits() {
+        val result = ReceiptParser.parse("TOTAL 12.34 EUR")
+        assertEquals(1234L, result.totalMinor)
+        assertEquals("EUR", result.currency)
+    }
+}
+```
+
+```swift title="ios/ShopTests/ReceiptParserTests.swift"
+import XCTest
+@testable import Shop
+
+final class ReceiptParserTests: XCTestCase {
+  func testParsesTotalInMinorUnits() throws {
+    let result = try ReceiptParser.parse("TOTAL 12.34 EUR")
+    XCTAssertEqual(result.totalMinor, 1234)
+    XCTAssertEqual(result.currency, "EUR")
+  }
+}
+```
+
+```bash
+cd android && ./gradlew testDebugUnitTest                 # JVM unit tests (add Robolectric for Android APIs)
+cd android && ./gradlew connectedDebugAndroidTest         # instrumented / Espresso, needs a device
+xcodebuild test -workspace ios/Shop.xcworkspace -scheme Shop \
+  -destination 'platform=iOS Simulator,name=iPhone 16'
+```
+
+For reusable libraries, scaffold with `create-react-native-library`, which produces an example app you can run E2E tests against.
+
+## Visual and performance regression
+
+### Storybook for React Native
+
+Storybook for React Native runs *on device*: a toggle swaps the app root for the Storybook UI, and each story renders a component in one state (loading, error, long text, RTL, dark mode). Stories document components for designers and QA, and their fixtures can be reused in RNTL tests.
+
+### Screenshot testing
+
+There's no single standard tool for RN. The options are: **device screenshots from E2E runs** (`device.takeScreenshot()` in Detox, `takeScreenshot` in Maestro) diffed against approved baselines, which catches real native rendering; **story-driven screenshots**, captured per Storybook story on a simulator or through react-native-web in a web visual-testing service (fast, but not native rendering); and **hosted visual-AI services** attached to Appium or device clouds. In every case: fix the device, OS version, font scale and locale; freeze the status bar (`xcrun simctl status_bar booted override --time 9:41`, Android demo mode); mask dynamic regions; and review baseline updates like code.
+
+### Reassure
+
+Reassure (by Callstack) measures **render duration and count** for a component scenario through the React Profiler. It runs each scenario many times and compares your branch with a `main` baseline statistically, so it catches "this PR made the feed re-render 3× per like".
+
+```tsx title="src/features/feed/FeedList.perf-test.tsx"
+import { measureRenders } from 'reassure';
+import { screen, userEvent } from '@testing-library/react-native';
+import { makePosts } from '@/test/factories';
+import { FeedList } from './FeedList';
+
+test('FeedList: like the first post', async () => {
+  const scenario = async () => {
+    const user = userEvent.setup();
+    await user.press(screen.getAllByRole('button', { name: 'Like' })[0]);
+    await screen.findByText('1 like');
+  };
+  await measureRenders(<FeedList posts={makePosts(100)} />, { scenario });
+});
+```
+
+```bash
+git switch main && npx reassure --baseline
+git switch my-branch && npx reassure      # writes .reassure/output.md; post it as a PR comment
+```
+
+Reassure measures React work in Node. It doesn't measure native frame rate, startup or memory; for those use on-device tools (Flashlight on Android, Xcode Instruments, Android Macrobenchmark). See [Performance](performance.html).
+
+## Testing special features
+
+| Feature | Unit / integration (Jest) | E2E / device | Manual / beta |
+|---|---|---|---|
+| Push notifications | Payload → route mapping, permission-state UI | Simulated notification tap; `simctl push` | Real APNs/FCM delivery in all app states |
+| Deep links | Linking config via `getStateFromPath`; auth-gated redirects | `device.openURL`, Maestro `openLink` | Universal/App Links from Mail, Notes, browsers |
+| Permissions | Mocked statuses: granted, denied, blocked, limited | Pre-granted and denied launches | First-run prompts on real OS versions |
+| Payments | Checkout state machine, error mapping | Stripe test mode, mocked IAP service | Sandbox testers, real small purchases, refunds |
+| OTA updates | Update-check logic, runtime version gating | Release binary + staging update | Staged rollout, rollback drill |
+| Offline | Sync queue, retry, NetInfo-driven UI | Emulator network off, unreachable API | Real flaky networks, airplane mode |
+
+**Push notifications** (see [Push Notifications](push-notifications.html)). Unit-test a pure `notificationToRoute(payload)`. On iOS simulators, use `xcrun simctl push booted com.example.shop payload.apns` (recent Xcode on Apple silicon also receives real sandbox pushes). Detox's `launchApp({ userNotification })` / `device.sendUserNotification()` simulate a tap: that tests your tap handling, not delivery. On Android, send through FCM HTTP v1 to an emulator image that has Google Play services.
+
+**Deep links** (see [Deep Linking](deep-linking.html)):
+
+```bash
+xcrun simctl openurl booted "shop://orders/42"
+xcrun simctl openurl booted "https://shop.example.com/orders/42"     # universal link
+adb shell am start -W -a android.intent.action.VIEW -d "shop://orders/42" com.example.shop
+adb shell pm get-app-links com.example.shop                          # App Links verification state
+```
+
+In Detox, `device.openURL({ url })` handles a link while the app is running, and `device.launchApp({ newInstance: true, url })` tests cold start. Maestro uses `- openLink: shop://orders/42`.
+
+**Permissions** (see [Permissions](permissions.html)). Detox `launchApp({ permissions: { camera: 'NO', location: 'inuse', photos: 'YES' } })` sets iOS permission state before launch. Reset with `xcrun simctl privacy booted reset all com.example.shop`. On Android, `permissions` isn't supported. Grant and revoke with `adb shell pm grant|revoke com.example.shop android.permission.CAMERA`, and remember that revoking a permission kills the process. Maestro's `launchApp` accepts `permissions: { all: deny }` or per-permission values.
+
+**Payments** (see [Payments](payments.html)). Use Stripe test mode and test cards (`4242 4242 4242 4242`, plus the 3-D Secure and decline cards), and test webhooks with `stripe listen --forward-to localhost:3000/webhooks` and `stripe trigger payment_intent.succeeded`. Apple Pay, Google Pay and IAP sheets are system UI, so put purchasing behind a `PurchaseService` interface and inject a fake in E2E builds. Test real IAP with a StoreKit Configuration file, App Store sandbox testers and Play license testers.
+
+**OTA updates** (see [OTA Updates](ota-updates.html)). Test every update on the **exact release binary** it targets (same runtime version) through a staging channel. Check that it downloads, applies on the next launch, and rolls back if the new bundle crashes on start.
+
+**Offline** (see [Offline Storage & Sync](offline-storage.html)). Unit-test the sync queue with mocked NetInfo and MSW `HttpResponse.error()`. On Android emulators, run `adb shell svc wifi disable && adb shell svc data disable`. iOS simulators share the Mac's network, so simulate offline at the app level: a launch argument that points the API at an unreachable host, or a throttling proxy. Detox's URL blacklist only stops Detox *waiting* on URLs; it doesn't block them. Also test process death (`device.terminateApp()`, then `launchApp({ newInstance: true })`).
+
+## CI
+
+```mermaid
+flowchart TD
+    PR(["Pull request"]) --> Static["Lint + typecheck"]
+    PR --> Jest["Jest unit + integration<br/>(sharded, coverage)"]
+    Static --> Gate1{"Fast checks green?"}
+    Jest --> Gate1
+    Gate1 -->|"no"| Blocked["Block merge,<br/>annotate failures"]
+    Gate1 -->|"yes"| BuildA["Build Android release APK<br/>+ androidTest APK"]
+    Gate1 -->|"yes"| BuildI["Build iOS simulator app<br/>(macOS runner)"]
+    BuildA --> DetoxA["Detox smoke on emulator"]
+    BuildI --> MaestroI["Maestro smoke on simulator"]
+    DetoxA --> Gate2{"E2E green?"}
+    MaestroI --> Gate2
+    Gate2 -->|"no"| Artifacts["Upload videos, logs,<br/>screenshots, JUnit"]
+    Gate2 -->|"yes"| Merge(["Mergeable"])
+    Merge --> Nightly["Nightly on main: full E2E,<br/>Reassure baseline, device cloud"]
+```
+*Figure: A PR pipeline. Cheap checks run first and gate the expensive E2E jobs. The full suite runs nightly, so PR feedback stays under about 15–20 minutes.*
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npx eslint . --max-warnings=0
+      - run: npx tsc --noEmit
+
+  jest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npx jest --ci --shard=${{ matrix.shard }}/3 --coverage --reporters=default --reporters=jest-junit
+        env:
+          TZ: UTC
+          JEST_SHARDED: 'true'
+          JEST_JUNIT_OUTPUT_DIR: reports
+          JEST_JUNIT_OUTPUT_NAME: jest-${{ matrix.shard }}.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jest-${{ matrix.shard }}
+          path: |
+            reports/
+            coverage/coverage-final.json
+
+  e2e-android:
+    needs: [checks, jest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+      - run: npm ci
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - run: npx detox build -c android.att.release
+      - name: Detox on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -no-snapshot-save -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: npx detox test -c android.att.release --headless --retries 1 --record-logs failing --take-screenshots failing --record-videos failing
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: detox-android, path: artifacts/ }
+
+  e2e-ios-maestro:
+    needs: [checks, jest]
+    runs-on: macos-15
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: ruby/setup-ruby@v1
+        with: { bundler-cache: true }
+      - run: npm ci
+      - uses: actions/cache@v4
+        with:
+          path: ios/Pods
+          key: pods-${{ runner.os }}-${{ hashFiles('ios/Podfile.lock') }}
+      - run: cd ios && bundle exec pod install
+      - name: Build simulator app
+        run: |
+          xcodebuild -workspace ios/Shop.xcworkspace -scheme Shop -configuration Release \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath ios/build CODE_SIGNING_ALLOWED=NO
+      - name: Install Maestro
+        run: |
+          curl -Ls "https://get.maestro.mobile.dev" | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+      - name: Boot simulator and install
+        run: |
+          xcrun simctl boot "iPhone 16" || true
+          xcrun simctl bootstatus "iPhone 16" -b
+          xcrun simctl install booted ios/build/Build/Products/Release-iphonesimulator/Shop.app
+      - run: maestro test --include-tags smoke --format junit --output reports/maestro.xml .maestro
+        env:
+          MAESTRO_DRIVER_STARTUP_TIMEOUT: 180000
+          EMAIL: ${{ vars.E2E_EMAIL }}
+          PASSWORD: ${{ secrets.E2E_PASSWORD }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: maestro-ios, path: reports/ }
+```
+
+The Maestro flows read `${EMAIL}` and `${PASSWORD}` from these environment variables. Simulator names depend on the Xcode version installed on the runner; check with `xcrun simctl list devices available`. `android.att.release` attaches Detox to the emulator the action has already booted (`emulator-5554`).
+
+| Concern | Practice |
+|---|---|
+| Caching | npm via `setup-node`, Gradle via `setup-gradle`, the AVD snapshot via `actions/cache` (see the emulator-runner README), `ios/Pods` keyed on `Podfile.lock`. |
+| Sharding | `jest --shard=i/n` across matrix jobs. Build the app once, upload it as an artifact, and fan E2E out to parallel jobs. |
+| Coverage | Shards produce partial coverage, so merge them (Codecov does this automatically, or use `nyc merge`) and enforce thresholds on the merged report. Ratchet the floor; watch **diff coverage**. |
+| Reports | `jest-junit` + a test-report action for PR annotations; Detox/Maestro artifacts on failure; Reassure output as a PR comment. |
+| Required checks | Rulesets require `checks`, `jest` and the E2E smoke jobs. Nightly failures open an issue instead of blocking PRs. |
+| Cost & Expo | macOS minutes are expensive: run iOS E2E on PRs that touch native code, and nightly otherwise. On Expo, EAS Build produces the binaries and EAS Workflows can run Maestro. |
+
+## Manual QA and release testing
+
+Automation catches regressions in what you thought to test. Humans find everything else, especially on the devices your users actually have.
+
+| Tier | Example devices | Why |
+|---|---|---|
+| Low-end Android | 2–3 GB RAM, Android Go | Startup, list jank, OOM kills; a big share of users in many markets. |
+| OEM skins | Samsung, Xiaomi, Oppo/Realme | Aggressive background killing, notification quirks. |
+| Oldest / newest OS | `minSdkVersion`, iOS deployment target, latest versions and betas | API availability, permission changes, edge-to-edge. |
+| Form factors | iPhone SE-size, Pro Max, iPad, foldables | Layout, safe areas, rotation. |
+| Settings | Largest dynamic type, dark mode, RTL, reduced motion, VoiceOver/TalkBack | Accessibility and i18n regressions. |
+
+- **Exploratory testing**: time-boxed sessions with a *charter* ("explore checkout with an expiring session on a flaky network, 45 minutes"). They find more than scripted passes.
+- **Regression checklist** on the **store-signed build** (R8, Hermes bytecode, production config): fresh install, upgrade over the previous version (migrations!), auth, core funnel, push, deep links, offline launch.
+- **Dogfooding**: everyone uses internal builds daily (TestFlight/Play internal testing, Firebase App Distribution, EAS internal distribution), with shake-to-report that attaches logs.
+- **Beta programmes**: TestFlight internal testers (up to 100 team members) need no review. External testers (up to 10,000) need Beta App Review for the first build of a version, and builds expire after 90 days. Play offers internal (up to 100), closed and open tracks; new *personal* accounts need a 12-tester, 14-day closed test before production. Check the current rules.
+- **Staged rollout** is the final test layer, gated on crash and ANR rates (see [Monitoring](monitoring.html) and [Deployment](deployment.html)).
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `SyntaxError: Cannot use import statement outside a module` from `node_modules` | Package ships untranspiled ESM/Flow | Add it to the `transformIgnorePatterns` whitelist (mind pnpm paths). |
+| `TurboModuleRegistry.getEnforcing(...): 'X' could not be found` | Native module not mocked | Use the library's Jest mock, or mock your wrapper module. |
+| "An update to X inside a test was not wrapped in act(...)" | Async state update after the test stopped awaiting | Await the resulting UI with `findBy*`/`waitFor`; await every `user.*` call. |
+| "Jest did not exit one second after the test run" | Open handles: timers, QueryClient GC, MSW server, sockets | `gcTime: Infinity`, `server.close()`, real timers restored; debug with `--detectOpenHandles`. |
+| Error-state tests take ~7 s or time out | TanStack Query retries enabled | `retry: false` in the test QueryClient. |
+| `Unable to find an element with role "button"` | Missing role/label, or `accessible` wrapper merges children | Add `accessibilityRole`/label; inspect with `screen.debug()`. |
+| Tests pass locally, fail in CI | Timezone/locale, test order, slower machine | `TZ=UTC`, fresh stores/clients per test, `--randomize` locally to expose order dependence. |
+| Detox times out: "app is busy" | Looping animation, polling, WebSocket, long timer | Disable in E2E builds, `setURLBlacklist`, inspect with `--debug-synchronization 500`. |
+| Detox Android can't find the test APK | androidTest APK not built or wrong `testBuildType` | Build with `assembleAndroidTest -DtestBuildType=release`; check `testBinaryPath`. |
+| Emulator never boots on CI | KVM disabled, arm64 image on an x86 runner, low disk | Enable KVM, use `x86_64` images. |
+| Maestro can't find `id:` | `testID` inside an `accessible` container | Move the `testID`; inspect with `maestro hierarchy`. |
+
+## Production checklist
+
+- [ ] Written test strategy: layers, ownership, E2E journey list, flake policy, CI gates.
+- [ ] TypeScript `strict` + ESLint as required checks.
+- [ ] Jest setup file with library mocks, `transformIgnorePatterns`, `TZ=UTC`; native dependencies behind owned, mocked modules.
+- [ ] `renderWithProviders` with a fresh QueryClient per test; MSW with `onUnhandledRequest: 'error'`.
+- [ ] Every screen tested for loading, success, empty and error states.
+- [ ] 10–40 E2E journeys on **release** builds, smoke subset on PRs, full suite nightly.
+- [ ] Seeded, run-scoped test data. E2E never touches production.
+- [ ] Retries logged, flaky tests quarantined within the SLA.
+- [ ] Coverage merged across shards, floor ratcheted, diff coverage visible on PRs.
+- [ ] Reassure on performance-critical lists; visual baselines for key screens.
+- [ ] Push, deep links, permissions, payments, OTA and offline covered at the right layer.
+- [ ] Device matrix including low-end Android and the oldest supported OS.
+- [ ] Release candidate regression run on the store-signed build, plus an upgrade-over-previous-version test.
+- [ ] Internal dogfooding and external beta before every major release; staged rollout gates.
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [Jest — Testing React Native apps](https://jestjs.io/docs/tutorial-react-native)
+- [React Native Testing Library](https://callstack.github.io/react-native-testing-library/)
+- [Detox](https://wix.github.io/Detox/)
+- [Maestro docs](https://docs.maestro.dev/)
+- [Mock Service Worker](https://mswjs.io/)
+- [Reassure](https://github.com/callstack/reassure)
+
+## Interview questions
+
+### How would you design the testing strategy for a new React Native app?
+
+**Short answer:** A trophy shape. Strict TypeScript and lint at the base, unit tests for pure logic, most of the effort in RNTL integration tests of screens with real providers and MSW, and a small set of E2E journeys on release builds. That's backed by a device matrix, beta testing and staged rollouts.
+
+Write down the per-PR rules, the E2E journey list, CI gates and flake policy. Explain *why*: Jest never runs native code (no Hermes, Fabric or OS), so E2E and manual testing cover the native gap, while integration tests give the most confidence for their cost.
+
+> [!INTERVIEW]
+> Strong answers mention cost vs confidence, ownership, and release-build E2E. Red flags: "100% coverage", or snapshotting everything.
+
+### How do you mock native modules, and what are the risks?
+
+**Short answer:** Prefer library-provided mocks (async-storage, netinfo, safe-area-context, gesture-handler's `jestSetup`, Reanimated's `setUpTests`). Wrap other native dependencies behind modules you own and mock those with `jest.mock` or `__mocks__`.
+
+The risk is false confidence: a mock that returns `granted` when iOS now returns `limited`. Keep mocks minimal and typed (`jest.Mocked<Api>`), and back critical paths with E2E tests.
+
+### How do you test a screen that uses TanStack Query and React Navigation?
+
+**Short answer:** Render it inside a real `NavigationContainer` and navigator, with a custom render that provides a **fresh QueryClient per test** (retries off, `gcTime: Infinity`). Mock HTTP with MSW rather than mocking the hooks.
+
+Assert on what the user sees in each state (loading, data, empty, error with retry, navigation to the next screen) with `findBy*` queries. Override handlers with `server.use()` for error cases.
+
+### What does "gray-box" mean for Detox, and when does its synchronisation hurt?
+
+**Short answer:** Detox links a native library (EarlGrey or Espresso) into the app, so it knows when the app is idle (network, timers, animations, main and JS threads) and waits automatically before each step. No sleeps, less flakiness.
+
+It hurts when the app is never idle (looping animations, polling, WebSockets), so tests time out. Disable those in E2E builds, blacklist background URLs, or turn off synchronisation for a single step.
+
+### Detox, Maestro or Appium: which would you choose?
+
+**Short answer:** Detox for engineering-owned E2E in bare or prebuild apps, where you want deep control and synchronisation. Maestro when you want the fastest setup, QA-owned YAML flows, or Expo/EAS integration. Appium when you need device clouds, a cross-platform QA organisation or WebDriver skills.
+
+Trade-offs: Detox needs native setup and mostly targets simulators; Maestro can't see inside the app; Appium needs explicit waits and is slower.
+
+### Your E2E suite is flaky. What do you do?
+
+**Short answer:** Measure first (flake rate per test from retry logs), then remove the causes: release builds, animations off, seeded run-scoped data, isolated tests with fresh state, pre-granted permissions, no sleeps, third-party network noise blocked, and enough CI resources.
+
+Allow one logged retry. Quarantine tests that pass only on retry, with an owner and an SLA. Collect artifacts on every failure, and move logic checks down to integration tests.
+
+### How do you test push notifications and deep links?
+
+**Short answer:** In layers. Unit-test the mapping from payload or URL to route. Use E2E to simulate a notification tap (Detox `userNotification`) and to open URLs (`device.openURL`, Maestro `openLink`, `simctl openurl`, `adb am start`) in foreground and cold-start states. Verify real APNs/FCM delivery and Universal/App Links manually on devices.
+
+Cover all three app states, auth-gated links (log in, then continue to the target) and invalid links.
+
+### What coverage threshold would you set?
+
+**Short answer:** A floor that stops coverage going backwards (for example 70% lines), ratcheted up over time, plus visible **diff coverage** on PRs. Coverage shows what code *ran*, not what was *verified*, so it's a smell detector, not a quality target.
+
+Merge shard coverage before enforcing it and exclude generated code. 100% coverage with weak assertions is worthless.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

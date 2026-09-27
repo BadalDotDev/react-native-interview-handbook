@@ -1,0 +1,1244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>App Icon &amp; Splash Screen · React Native Interview Handbook</title>
+<meta name="description" content="App icons and launch screens are the first pixels a user sees, and both are drawn by the operating system before a single line of your JavaScript runs. This guide covers icon…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="App Icon &amp; Splash Screen · React Native Interview Handbook">
+<meta property="og:description" content="App icons and launch screens are the first pixels a user sees, and both are drawn by the operating system before a single line of your JavaScript runs. This guide covers icon…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/app-icon-splash.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# App Icon & Splash Screen
+
+App icons and launch screens are the first pixels a user sees, and both are drawn by the operating system before a single line of your JavaScript runs. This guide covers icon specs for iOS (including dark, tinted and Liquid Glass icons) and Android (legacy, adaptive, themed), asset generation, per-environment and alternate icons, native launch screens (LaunchScreen.storyboard and the Android 12+ SplashScreen API), `react-native-bootsplash` and `expo-splash-screen`, when to hide the splash, and animated hand-offs without a white flash.
+
+## How it works
+
+The key mental model: **the splash screen is not a React component.** It is a static image the OS draws the instant the user taps your icon, while your process is still starting. Your job is to (1) make that OS-drawn screen look right, (2) keep it on screen until React has something meaningful to show, and (3) hand off to JS without a visible seam.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant OS as OS Launcher
+    participant N as Native Host
+    participant JS as Hermes JS
+    participant UI as React Tree
+    U->>OS: Taps app icon
+    OS->>OS: Draws launch screen from storyboard or theme
+    OS->>N: Starts process (didFinishLaunching / onCreate)
+    N->>N: Init React Native host and TurboModules
+    N->>JS: Load Hermes bytecode bundle
+    JS->>JS: Evaluate modules, registerComponent
+    N->>UI: runApplication, first render and commit
+    Note over OS,UI: Without a held splash the OS screen is gone here and the root view is blank
+    UI->>UI: Fonts, session, config ready
+    UI->>N: hide splash (fade)
+    N-->>U: First meaningful frame
+```
+*Figure: Cold-start timeline from icon tap to the first meaningful frame.*
+
+| Stage | Who draws / runs it | Can you run code? | Typical cost (mid-range Android, release) |
+|---|---|---|---|
+| Launch screen | OS (iOS: snapshot of `LaunchScreen.storyboard`; Android: starting window from the activity theme) | No | Appears within the first frames |
+| Process + native init | `AppDelegate` / `MainApplication` + `MainActivity` | Native only | 100–400 ms |
+| Bundle load + JS evaluation | Hermes (bytecode is memory-mapped, so no parse step) | Module top-level code | 100–800 ms, grows with bundle size and eager imports |
+| First React render | Fabric renderer | Yes | Tens of ms for a light first screen |
+| App bootstrap | Your code (fonts, keychain, remote config) | Yes | Should be capped (see below) |
+| Hide splash | Your code calls the library | Yes | A 200–300 ms fade |
+
+### Where the "white flash" comes from
+
+Both platforms remove the OS launch screen as soon as the app's own window draws its **first frame**. In a React Native app that first frame is an empty root view, because JS has not rendered yet. If that root view (or the Android window background) is white, the user sees: logo → white → app. In dark mode it is even more jarring.
+
+```mermaid
+flowchart TD
+    tap(["Icon tapped"]) --> ls["OS launch screen visible"]
+    ls --> frame["Native window draws first frame"]
+    frame --> held{"Is the splash held<br/>by a library?"}
+    held -->|"no"| removed["OS removes launch screen"]
+    removed --> blank["Empty root view shows<br/>window or root background"]
+    blank --> flash["White or black flash<br/>until JS renders"]
+    held -->|"yes"| overlay["Splash stays as overlay<br/>on top of root view"]
+    overlay --> ready["JS renders and bootstraps"]
+    ready --> hide["hide() with fade"]
+    hide --> app(["App visible, no seam"])
+    flash --> app
+```
+*Figure: Why the flash happens and how holding the splash removes it.*
+
+Three layers of defence, in order of importance:
+
+1. **Hold the native splash until JS says so** — `react-native-bootsplash` or `expo-splash-screen` keep a native overlay (iOS) or the SplashScreen API's keep-on-screen condition (Android) alive until you call `hide()`.
+2. **Match every background colour** — the post-splash Android theme's `android:windowBackground`, the iOS root view background, and your first screen's background should equal the splash background (per colour scheme).
+3. **Render something cheap first** — a skeleton of the first screen, not a spinner on white.
+
+### Cold, warm and hot starts
+
+| Start type | What happens | Splash shown? |
+|---|---|---|
+| Cold | Process doesn't exist; everything above runs | iOS: yes. Android 12+: yes |
+| Warm | Process alive but activity recreated (Android), or app evicted from memory but OS restores it | Android 12+: yes (system splash); iOS: usually a snapshot of the last UI instead |
+| Hot | App brought to foreground from background | No — the OS shows the last snapshot |
+
+> [!NOTE]
+> On iOS, returning from background shows the app-switcher **snapshot**, not the launch screen. If you need to hide sensitive content in that snapshot (banking apps), that's a privacy overlay on `AppState` change — see the [Security guide](security.html) — not a splash concern.
+
+## Requirements & prerequisites
+
+| Item | iOS | Android |
+|---|---|---|
+| Master icon artwork | 1024×1024 px PNG, **opaque** (no alpha), square — the OS applies the rounded mask | Vector (SVG/AI) or ≥ 1024 px PNG to derive adaptive layers |
+| Store listing icon | 1024×1024 (taken from the asset catalog's App Store slot) | 512×512 px, 32-bit PNG, up to 1 MB, uploaded in Play Console |
+| Icon variants | iOS 18+: dark and tinted appearances (optional but expected); iOS 26: layered Liquid Glass icon via Icon Composer | Adaptive foreground + background (API 26+), monochrome layer for themed icons (API 33+), legacy PNGs for older devices |
+| Launch screen | `LaunchScreen.storyboard` (or `UILaunchScreen` Info.plist dictionary) — required for App Store submission | SplashScreen API (all apps on Android 12+); `androidx.core:core-splashscreen` to get consistent behaviour on older versions |
+| Tooling | Xcode asset catalog; Icon Composer (ships with Xcode 26) | Android Studio Image Asset Studio, IconKitchen, or a design export |
+| Libraries | `react-native-bootsplash` (v7 at the time of writing, for RN 0.80+) or `expo-splash-screen` | Same |
+| Design assets | Logo on transparent background for the splash (roughly square, generous padding) | Same logo; must fit a circle (see Android 12 sizing) |
+
+> [!IMPORTANT]
+> Store and OS requirements move every year (Apple's minimum Xcode/SDK rises each spring; Google's `targetSdkVersion` each August). Re-check Apple's Human Interface Guidelines for app icons and Android's adaptive icon and splash screen docs before a redesign.
+
+## App icons — iOS
+
+### Single-size asset catalog
+
+Modern Xcode (14+) supports a **single 1024×1024 "Single Size"** app icon; Xcode generates every device size at build time. In a bare React Native project the asset lives at:
+
+```plaintext
+ios/<AppName>/Images.xcassets/AppIcon.appiconset/
+├── Contents.json
+├── AppIcon-1024.png          # Any appearance (light), opaque
+├── AppIcon-1024-dark.png     # Dark appearance (iOS 18+)
+└── AppIcon-1024-tinted.png   # Tinted appearance (iOS 18+)
+```
+
+```json title="ios/<AppName>/Images.xcassets/AppIcon.appiconset/Contents.json"
+{
+  "images": [
+    {
+      "filename": "AppIcon-1024.png",
+      "idiom": "universal",
+      "platform": "ios",
+      "size": "1024x1024"
+    },
+    {
+      "appearances": [{ "appearance": "luminosity", "value": "dark" }],
+      "filename": "AppIcon-1024-dark.png",
+      "idiom": "universal",
+      "platform": "ios",
+      "size": "1024x1024"
+    },
+    {
+      "appearances": [{ "appearance": "luminosity", "value": "tinted" }],
+      "filename": "AppIcon-1024-tinted.png",
+      "idiom": "universal",
+      "platform": "ios",
+      "size": "1024x1024"
+    }
+  ],
+  "info": { "author": "xcode", "version": 1 }
+}
+```
+
+Rules that cause real rejections or ugly results:
+
+- **No transparency in the primary (Any) icon.** App Store Connect rejects an App Store icon with an alpha channel. Export with alpha removed (flatten onto your background colour) — "a PNG that looks opaque" can still contain an alpha channel.
+- **Don't pre-round the corners.** iOS applies its own continuous-corner mask; baked-in corners leave visible artefacts at the edges.
+- **Full-bleed square.** Fill the whole canvas with background; keep the glyph inside the central ~80% so it survives masking and the smaller sizes.
+- The build setting **Primary App Icon Set Name** (`ASSETCATALOG_COMPILER_APPICON_NAME`) selects which set is the app icon — this is how per-environment icons work (below).
+
+### Dark and tinted icons (iOS 18+)
+
+iOS 18 lets users choose light, dark or tinted Home Screen icons. In Xcode, select the AppIcon set and set **Appearances → Any, Dark, Tinted** in the Attributes inspector. If you don't supply variants, the system generates its own dark/tinted rendering of your icon, which rarely looks as good as a designed one.
+
+| Appearance | What to supply |
+|---|---|
+| Any (light) | Your normal opaque icon |
+| Dark | The glyph designed for a dark background; Apple's templates let the system supply the dark backdrop, so the glyph typically sits on a transparent or very dark background |
+| Tinted | A grayscale version; the system applies the user's tint colour, so contrast comes from luminance only |
+
+### Liquid Glass icons and Icon Composer (iOS 26)
+
+iOS 26 introduced the Liquid Glass design language, and icons can now be **layered**: Apple's Icon Composer app (bundled with Xcode 26) takes separate foreground/background layers and produces a single `.icon` file with light, dark, clear and tinted renderings plus glass effects (specular highlights, translucency) applied by the system.
+
+Treat this as an evolving area and verify against Apple's current documentation, but the practical workflow looks like:
+
+1. Export your icon's layers from your design tool as separate artwork (background, one or more foreground groups).
+2. Build the icon in Icon Composer, preview each appearance, save the `.icon` file.
+3. Add the `.icon` file to the app target in Xcode and make sure the app icon setting points at its name.
+4. If you support older iOS versions, check how Xcode derives flat images for them, and keep an eye on App Store Connect validation warnings.
+
+> [!TIP] Expo
+> Recent Expo SDKs (54+) accept an Icon Composer `.icon` file for `ios.icon`, and earlier SDKs accept an object with `light`, `dark` and `tinted` images. Check the `app.json` reference for your SDK version.
+
+## App icons — Android
+
+### Legacy launcher icons (pre-API 26 and fallbacks)
+
+| Density | Folder | Launcher icon size |
+|---|---|---|
+| mdpi (1×) | `mipmap-mdpi` | 48×48 px |
+| hdpi (1.5×) | `mipmap-hdpi` | 72×72 px |
+| xhdpi (2×) | `mipmap-xhdpi` | 96×96 px |
+| xxhdpi (3×) | `mipmap-xxhdpi` | 144×144 px |
+| xxxhdpi (4×) | `mipmap-xxxhdpi` | 192×192 px |
+
+Icons live in `mipmap-*` (not `drawable-*`) because launchers may pick a higher density than the device's to render crisp icons, and `mipmap` resources are never stripped by density-based APK splits. React Native's template ships `ic_launcher.png` and `ic_launcher_round.png` in every `mipmap-*` folder under `android/app/src/main/res/`.
+
+### Adaptive icons (API 26+)
+
+Since Android 8.0, launchers compose your icon from **two layers**, each 108×108 dp, and apply a device-specific mask (circle, squircle, rounded square, teardrop). Only the **central 72×72 dp** is visible through the mask; the outer 18 dp on each side is reserved for parallax and pulse animations. Put essential content inside the **~66 dp diameter safe zone** so no mask shape clips it.
+
+```mermaid
+flowchart TD
+    bg["Background layer<br/>108 x 108 dp<br/>colour or full-bleed image"] --> compose["Launcher composes layers"]
+    fg["Foreground layer<br/>108 x 108 dp<br/>logo inside 66 dp safe zone"] --> compose
+    mono["Monochrome layer (API 33+)<br/>single-colour glyph"] -.->|"themed icons on"| themed["System tints with wallpaper colours"]
+    compose --> mask{"Device mask shape"}
+    mask --> mCircle["Circle"]
+    mask --> mSquircle["Squircle"]
+    mask --> mRounded["Rounded square"]
+    mCircle --> visible["Visible area: central 72 dp"]
+    mSquircle --> visible
+    mRounded --> visible
+    themed --> visible
+```
+*Figure: Adaptive icon layers, masks and the themed-icon path.*
+
+The XML that wires the layers together:
+
+```xml title="android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml"
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+    <!-- Android 13+ themed icons; ignored on older versions -->
+    <monochrome android:drawable="@mipmap/ic_launcher_monochrome" />
+</adaptive-icon>
+```
+
+```xml title="android/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml"
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+    <monochrome android:drawable="@mipmap/ic_launcher_monochrome" />
+</adaptive-icon>
+```
+
+```xml title="android/app/src/main/res/values/ic_launcher_background.xml"
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#0B1F3A</color>
+</resources>
+```
+
+```xml title="android/app/src/main/AndroidManifest.xml (excerpt)"
+<application
+    android:name=".MainApplication"
+    android:icon="@mipmap/ic_launcher"
+    android:roundIcon="@mipmap/ic_launcher_round"
+    android:label="@string/app_name"
+    android:theme="@style/AppTheme">
+```
+
+Notes:
+
+- The `-anydpi-v26` qualifier means "any density, API 26+": modern devices use the XML, older ones fall back to the PNGs in `mipmap-<density>`.
+- The foreground/background can be vector drawables (preferred — tiny and crisp) or density PNGs of 108 dp (e.g. 432×432 px at xxxhdpi).
+- **Round icons** (`android:roundIcon`) date from Android 7.1 for launchers that wanted circular icons. With adaptive icons they are effectively redundant, but keep them for API 25 devices and launchers that still read the attribute.
+- **Monochrome** (Android 13+): when the user enables *Themed icons*, the launcher renders your `<monochrome>` drawable tinted with wallpaper-derived colours. Without it, your app is the one full-colour icon in a themed grid. It should be a single-colour silhouette (only the alpha channel matters) that follows the same safe-zone rules; a foreground with gradients or multiple colours turns into a muddy blob when tinted.
+
+### Google Play listing icon
+
+Play Console requires a **512×512 px, 32-bit PNG (with alpha), up to 1 MB**. Supply a **full-bleed square**; Google Play applies the rounded corners and shadow itself, so don't bake them in. This is separate from the launcher icon — keep them visually identical.
+
+### Icon design tips (both platforms)
+
+- Design at 1024 but review at 29–48 px: thin strokes and small text disappear. **No words** in the icon unless the wordmark *is* the brand.
+- One focal element, strong silhouette, and contrast that survives dark, tinted and themed variants.
+- Keep the glyph away from edges: iOS masks corners, Android masks to arbitrary shapes (66 dp safe zone out of 108 dp).
+- Avoid photos and fine gradients; they band on tinted/monochrome modes.
+- Test on real launchers (Pixel, Samsung One UI, a circle-mask launcher) and on iOS Home Screen in light, dark and tinted modes.
+
+## Generating icon assets
+
+| Tool | Produces | Best for | Notes |
+|---|---|---|---|
+| Android Studio **Image Asset Studio** | Adaptive XML + foreground/background/monochrome layers + legacy PNGs for every density | Bare Android projects | Right-click `res` → **New → Image Asset → Launcher Icons (Adaptive and Legacy)**. Shows the safe zone and mask previews live |
+| **IconKitchen** (icon.kitchen) | Android adaptive/legacy sets, iOS sets, web icons | Quick, consistent sets from one source | Web tool; download the zip and drop folders into `res/` and the asset catalog |
+| **Xcode asset catalog** | Single-size AppIcon with appearances | iOS | Drag 1024 images into the slots; Xcode generates device sizes |
+| **Icon Composer** | Layered `.icon` for iOS 26 Liquid Glass | iOS 26+ | Ships with Xcode 26 |
+| **Expo config** (`icon`, `android.adaptiveIcon`, `ios.icon`) | Everything, regenerated on `npx expo prebuild` / EAS Build | Expo / CNG projects | Never hand-edit generated native icons in a CNG project; change the config |
+| **react-native-bootsplash generate** | Splash assets only (not launcher icons) | Splash screens | Covered in the splash section |
+
+### Android Studio Image Asset Studio
+
+1. Open `android/` in Android Studio (not the repo root).
+2. In the Project view, right-click `app/src/main/res` → **New → Image Asset**.
+3. Icon type: **Launcher Icons (Adaptive and Legacy)**, name `ic_launcher`.
+4. **Foreground Layer**: your logo SVG or PNG; use *Resize* so the logo sits inside the safe-zone circle overlay.
+5. **Background Layer**: a colour or image.
+6. **Options**: generate legacy and round icons; add the **Monochrome** layer (recent Studio versions have a tab for it).
+7. Finish — Studio overwrites `mipmap-*` and `mipmap-anydpi-v26`. Review the diff; delete stale `ic_launcher_foreground.png` files if you switched to vectors.
+
+### Expo
+
+```json title="app.json"
+{
+  "expo": {
+    "name": "Acme",
+    "icon": "./assets/icon.png",
+    "ios": {
+      "icon": {
+        "light": "./assets/icon-ios-light.png",
+        "dark": "./assets/icon-ios-dark.png",
+        "tinted": "./assets/icon-ios-tinted.png"
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-foreground.png",
+        "backgroundColor": "#0B1F3A",
+        "monochromeImage": "./assets/adaptive-monochrome.png"
+      }
+    }
+  }
+}
+```
+
+- `icon` is the fallback for every platform (1024×1024 PNG).
+- `android.adaptiveIcon.foregroundImage` should be 1024×1024 with the logo inside the central ~66% (the safe zone scales with the canvas). `backgroundImage` can replace `backgroundColor`.
+- Run `npx expo prebuild --clean` (or an EAS Build) to regenerate native icons; icons don't change via OTA updates because they are native resources.
+
+### Per-environment icons (dev / staging / prod)
+
+Installing dev, staging and prod side by side is only useful if people can tell them apart. Give each a distinct bundle ID/application ID, name and **badged icon** (a coloured ribbon or "DEV" corner label).
+
+**Android — product flavors.** Resources in `src/<flavor>/res` override `src/main/res`:
+
+```gradle title="android/app/build.gradle"
+android {
+    // ...
+    flavorDimensions "env"
+    productFlavors {
+        dev {
+            dimension "env"
+            applicationIdSuffix ".dev"
+            resValue "string", "app_name", "Acme Dev"
+        }
+        staging {
+            dimension "env"
+            applicationIdSuffix ".staging"
+            resValue "string", "app_name", "Acme Staging"
+        }
+        prod {
+            dimension "env"
+            resValue "string", "app_name", "Acme"
+        }
+    }
+}
+```
+
+```plaintext
+android/app/src/
+├── main/res/mipmap-*/ic_launcher*.png           # prod icons
+├── dev/res/mipmap-*/ic_launcher*.png            # badged DEV icons
+├── dev/res/mipmap-anydpi-v26/ic_launcher.xml
+└── staging/res/mipmap-*/ic_launcher*.png
+```
+
+> [!WARNING]
+> If `app_name` is also defined in `src/main/res/values/strings.xml`, the `resValue` above causes a duplicate resource error. Remove it from `strings.xml` (or override it per flavor with `src/<flavor>/res/values/strings.xml` instead of `resValue`). Build with `npx react-native run-android --mode=devDebug`.
+
+**iOS — one asset set per configuration.** Add `AppIcon-Dev` and `AppIcon-Staging` sets to `Images.xcassets`, then in the target's Build Settings set **Primary App Icon Set Name** (`ASSETCATALOG_COMPILER_APPICON_NAME`) per build configuration (Debug → `AppIcon-Dev`, Staging → `AppIcon-Staging`, Release → `AppIcon`). Pair this with per-configuration bundle identifiers and display names, and a scheme per environment.
+
+**Expo — `app.config.ts` keyed on an env var:**
+
+```ts title="app.config.ts"
+import type { ConfigContext, ExpoConfig } from 'expo/config';
+
+const variant = (process.env.APP_VARIANT ?? 'production') as
+  | 'development'
+  | 'staging'
+  | 'production';
+
+const suffix = { development: '.dev', staging: '.staging', production: '' }[variant];
+const iconDir = { development: 'dev', staging: 'staging', production: 'prod' }[variant];
+
+export default ({ config }: ConfigContext): ExpoConfig => ({
+  ...config,
+  name: variant === 'production' ? 'Acme' : `Acme (${variant})`,
+  slug: 'acme',
+  icon: `./assets/icons/${iconDir}/icon.png`,
+  ios: { bundleIdentifier: `com.acme.app${suffix}` },
+  android: {
+    package: `com.acme.app${suffix}`,
+    adaptiveIcon: {
+      foregroundImage: `./assets/icons/${iconDir}/adaptive-foreground.png`,
+      monochromeImage: './assets/icons/adaptive-monochrome.png',
+      backgroundColor: '#0B1F3A',
+    },
+  },
+});
+```
+
+Set `APP_VARIANT` per build profile in `eas.json` (`"env": { "APP_VARIANT": "staging" }`). Badges can be generated in CI (for example with the fastlane badge plugin) so designers only maintain the prod artwork.
+
+### Alternate app icons
+
+Some apps let users pick an icon (seasonal, premium "gold" icons, accessibility high-contrast).
+
+| | iOS | Android |
+|---|---|---|
+| Mechanism | `UIApplication.shared.setAlternateIconName(_:)` (iOS 10.3+) | Multiple `<activity-alias>` launcher entries, enabling one at a time via `PackageManager.setComponentEnabledSetting` |
+| Asset declaration | Extra app icon sets in the asset catalog, plus build setting **Include All App Icon Assets** or **Alternate App Icon Sets** (older approach: `CFBundleAlternateIcons` in `Info.plist`) | Each alias has its own `android:icon` / `android:roundIcon` |
+| User-visible side effect | The system always shows an alert telling the user the icon changed | Launcher may take a moment to refresh; pinned shortcuts can disappear; some launchers restart |
+| When to call | Only while the app is in the foreground, in response to a user action | Safest when the app goes to background, to avoid the current task being killed |
+| Library route | Community packages wrap both (for example `expo-alternate-app-icons` or `react-native-change-icon`); check maintenance and New Architecture support before adopting | Same |
+
+```swift title="ios/<AppName>/AppIconModule.swift (sketch)"
+import UIKit
+
+@objc func setIcon(_ name: String?, resolve: @escaping (Any?) -> Void, reject: @escaping (String?, String?, Error?) -> Void) {
+  DispatchQueue.main.async {
+    guard UIApplication.shared.supportsAlternateIcons else {
+      reject("unsupported", "Alternate icons not supported", nil)
+      return
+    }
+    // nil restores the primary icon
+    UIApplication.shared.setAlternateIconName(name) { error in
+      if let error = error { reject("failed", error.localizedDescription, error) } else { resolve(name) }
+    }
+  }
+}
+```
+
+```xml title="android/app/src/main/AndroidManifest.xml (activity-alias pattern)"
+<activity
+    android:name=".MainActivity"
+    android:exported="true"
+    android:launchMode="singleTask"
+    android:theme="@style/BootTheme" />
+
+<activity-alias
+    android:name=".MainActivityDefault"
+    android:targetActivity=".MainActivity"
+    android:icon="@mipmap/ic_launcher"
+    android:roundIcon="@mipmap/ic_launcher_round"
+    android:enabled="true"
+    android:exported="true">
+    <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+    </intent-filter>
+</activity-alias>
+
+<activity-alias
+    android:name=".MainActivityGold"
+    android:targetActivity=".MainActivity"
+    android:icon="@mipmap/ic_launcher_gold"
+    android:roundIcon="@mipmap/ic_launcher_gold_round"
+    android:enabled="false"
+    android:exported="true">
+    <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+    </intent-filter>
+</activity-alias>
+```
+
+> [!WARNING]
+> Never remove an activity-alias in a later release while some users have it enabled — they lose the launcher entry entirely. Keep old aliases (disabled by default) forever, and keep deep-link intent filters on the target activity so they work regardless of which alias is active.
+
+## Choosing a splash approach
+
+| Approach | How it works | Verdict |
+|---|---|---|
+| **react-native-bootsplash** | Generates storyboard + Android theme from one logo; holds the splash until `hide()`; `useHideAnimation` for seamless animated hand-off | **Recommended for bare RN.** Also has an Expo config plugin |
+| **expo-splash-screen** | Config plugin generates native splash; `preventAutoHideAsync()` / `hideAsync()` | **Recommended for Expo** (default in templates) |
+| Hand-rolled native (storyboard + `core-splashscreen` + your own keep condition) | You write what the libraries do | Fine if you need something exotic; more code to maintain |
+| JS-only splash (a React "SplashScreen" component) | Renders after JS loads | Not a splash — the OS screen still appears first, then a flash, then your component. Only valid as the animated *second stage* after the native splash |
+| Separate `SplashActivity` on Android | An activity that shows a layout, then starts `MainActivity` | **Anti-pattern** since Android 12 (see below) |
+
+Pick one library, not both — `react-native-bootsplash` and `expo-splash-screen` both own the launch storyboard and the Android launch theme, and the bootsplash README tells you to uninstall `expo-splash-screen` when using its Expo plugin.
+
+## Setup — iOS launch screen
+
+### What LaunchScreen.storyboard can and cannot do
+
+Since 2020 the App Store requires apps to provide their launch screen as a storyboard (static launch images are no longer accepted). `Info.plist` points at it:
+
+```xml title="ios/<AppName>/Info.plist (excerpt)"
+<key>UILaunchStoryboardName</key>
+<string>LaunchScreen</string>
+```
+
+The OS renders the storyboard **out of process** and caches a snapshot. Consequences:
+
+- **Static only.** No custom view classes, no code, no animation, no network images. UIKit views with Auto Layout, images and **named colours from the asset catalog** only.
+- **Dark mode works** through asset catalog colour sets and image sets with *Any/Dark* appearances — not through code.
+- **Avoid text.** Launch storyboards don't localise reliably, and custom fonts may not be available at that point.
+- **It should look like the first frame of your app**, not an ad. Apple's HIG explicitly discourages launch screens used as branding moments, although a centred logo is universally tolerated.
+
+A minimal, library-free storyboard: a view with a background named colour and a centred image view (fixed width/height constraints, centred X/Y). If you use `react-native-bootsplash`, it generates `BootSplash.storyboard` for you and switches `UILaunchStoryboardName` to `BootSplash`.
+
+> [!TIP] UILaunchScreen alternative
+> iOS 14+ also supports a `UILaunchScreen` dictionary in `Info.plist` (keys like `UIColorName` and `UIImageName`) instead of a storyboard — simple colour-plus-image launch screens without Interface Builder. Libraries in the RN ecosystem generally use storyboards, so prefer that unless you're hand-rolling.
+
+### The launch screen cache and how to force a refresh
+
+iOS aggressively caches the launch screen snapshot per app. After changing the storyboard or its images, you often still see the old one. In escalating order:
+
+1. Delete the app from the device/simulator and reinstall.
+2. Restart the simulator/device (the cache survives reinstall more often than you'd expect).
+3. **Rename the image asset** referenced by the storyboard (e.g. `SplashLogo` → `SplashLogo-v2`) — a new name defeats the cache. `react-native-bootsplash` does this automatically by adding a content hash to generated asset names.
+4. Clean the build folder (Product → Clean Build Folder) and erase the simulator (`xcrun simctl erase <udid>`).
+
+End users who update from the App Store generally get the new launch screen after an update, but the cache is why "it's still the old one on my phone" is a common QA report.
+
+### Kill the iOS flash at the root view
+
+Even with a held splash, set the root view background so any transitional frame matches:
+
+```swift title="ios/<AppName>/AppDelegate.swift (excerpt)"
+class ReactNativeDelegate: RCTDefaultReactNativeFactoryDelegate {
+  override func customize(_ rootView: RCTRootView) {
+    super.customize(rootView)
+    // Named colour with Any/Dark variants in Images.xcassets or Colors.xcassets
+    rootView.backgroundColor = UIColor(named: "SplashBackground") ?? .systemBackground
+  }
+}
+```
+
+## Setup — Android splash screen
+
+### The Android 12+ SplashScreen API
+
+From Android 12 (API 31) **every app** gets a system splash on cold and warm starts, whether you configure it or not. By default it shows your launcher icon centred on the theme's window background. You can customise, but not replace, its anatomy:
+
+| Element | Theme attribute (`core-splashscreen` names) | Notes |
+|---|---|---|
+| Background | `windowSplashScreenBackground` | Single colour; no images or gradients |
+| Icon | `windowSplashScreenAnimatedIcon` | Vector drawable, bitmap or animated vector drawable; masked to a circle |
+| Icon background | `windowSplashScreenIconBackgroundColor` (parent `Theme.SplashScreen.IconBackground`) | Draws a circle behind the icon |
+| Animation duration | `windowSplashScreenAnimationDuration` | For AVDs on API 31+; keep animations short (Google recommends ≤ 1,000 ms) |
+| Theme after splash | `postSplashScreenTheme` | Your real `AppTheme` — its `windowBackground` must match the splash background |
+| Branding image | `android:windowSplashScreenBrandingImage` (platform, API 31+) | Bottom image, 200×80 dp; Google discourages it |
+
+**Icon sizing** — the part that produces cropped logos:
+
+| Variant | Canvas | Visible circle | Where your logo must fit |
+|---|---|---|---|
+| Icon **without** icon background | 288×288 dp | 192 dp diameter | Inside the 192 dp circle (roughly a 136 dp square) |
+| Icon **with** icon background | 240×240 dp | 160 dp diameter | Inside the 160 dp circle |
+
+Most "my logo is cropped/tiny on Android 12" bugs are a full-canvas logo exported without the two-thirds padding. Export the icon drawable at the canvas size with the logo centred inside the circle.
+
+```mermaid
+flowchart TD
+    launch(["Launcher starts MainActivity"]) --> api{"Android 12 or newer?"}
+    api -->|"yes"| sys["System splash window<br/>platform SplashScreen"]
+    api -->|"no"| compat["core-splashscreen draws<br/>icon on windowBackground"]
+    sys --> install["installSplashScreen()<br/>before super.onCreate"]
+    compat --> install
+    install --> keep{"Keep-on-screen<br/>condition true?"}
+    keep -->|"yes, re-checked each frame"| keep
+    keep -->|"no"| exitAnim["Exit animation<br/>optional listener"]
+    exitAnim --> post["postSplashScreenTheme applied"]
+    post --> root["React root view visible<br/>background must match"]
+```
+*Figure: Android splash lifecycle with core-splashscreen.*
+
+### Hand-rolled setup with core-splashscreen
+
+Libraries do this for you; knowing the moving parts is what interviews probe.
+
+**Step 1 — dependency:**
+
+```gradle title="android/app/build.gradle"
+dependencies {
+    implementation("androidx.core:core-splashscreen:1.0.1") // or newer
+}
+```
+
+**Step 2 — starting theme:**
+
+```xml title="android/app/src/main/res/values/styles.xml"
+<resources>
+    <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/splash_background</item>
+    </style>
+
+    <style name="Theme.App.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/splash_background</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/splash_icon</item>
+        <item name="postSplashScreenTheme">@style/AppTheme</item>
+    </style>
+</resources>
+```
+
+```xml title="android/app/src/main/res/values-night/colors.xml"
+<resources>
+    <color name="splash_background">#0B1F3A</color>
+</resources>
+```
+
+**Step 3 — apply it to the launcher activity** in `android/app/src/main/AndroidManifest.xml`: `android:theme="@style/Theme.App.Starting"` on `.MainActivity`.
+
+**Step 4 — install and hold it:**
+
+```kotlin title="android/app/src/main/java/com/acme/app/MainActivity.kt"
+package com.acme.app
+
+import android.os.Bundle
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.facebook.react.ReactActivity
+
+object SplashState {
+  // Flipped to false by a tiny native module that JS calls when bootstrap completes
+  @Volatile var keepOnScreen = true
+}
+
+class MainActivity : ReactActivity() {
+  override fun getMainComponentName(): String = "Acme"
+
+  override fun onCreate(savedInstanceState: Bundle?) {
+    val splash = installSplashScreen() // must run before super.onCreate
+    splash.setKeepOnScreenCondition { SplashState.keepOnScreen }
+    super.onCreate(savedInstanceState) // react-native-screens setups may require null or a fragment factory
+  }
+}
+```
+
+Without `setKeepOnScreenCondition`, the splash is dismissed on the first drawn frame — the empty React root view — which is exactly the flash described earlier.
+
+### Why a separate SplashActivity is an anti-pattern
+
+The pre-2021 pattern was a `SplashActivity` with a layout (or a timer) that launched `MainActivity`. On Android 12+ this gives you:
+
+- **Two splashes**: the mandatory system splash (your launcher icon), then your SplashActivity layout.
+- **Slower startup**: an extra activity creation and transition before React Native even starts.
+- **Intent bugs**: deep links, notification extras and `singleTask` semantics must be forwarded manually and frequently break.
+- A splash that doesn't match Android's system animation or theming.
+
+Google's migration guidance is to delete the SplashActivity and use the SplashScreen API on the main activity, keeping it on screen with `setKeepOnScreenCondition` while you load.
+
+## Setup — react-native-bootsplash
+
+`react-native-bootsplash` (v7 at the time of writing, supporting the latest RN and the two previous minors; v6 docs cover RN below 0.80) generates native assets from one logo and holds the splash until you call `hide()`. On Android it uses the SplashScreen API semantics on every version.
+
+### Step 1 — install and generate
+
+```bash
+npm install react-native-bootsplash
+
+npx react-native-bootsplash generate assets/logo.svg \
+  --platforms=android,ios \
+  --background=0B1F3A \
+  --logo-width=100 \
+  --assets-output=assets/bootsplash \
+  --flavor=main
+```
+
+| Option | Default | Notes |
+|---|---|---|
+| `--platforms` | `android,ios,web` | Drop `web` if you don't ship RN Web |
+| `--background` | `#fff` | Hex colour |
+| `--logo-width` | `100` (dp at @1x) | ~100 keeps the logo inside the Android 12 circle |
+| `--assets-output` | `assets/bootsplash` | JS-side assets + `manifest.json` for `useHideAnimation` |
+| `--flavor` | `main` | Android source set to write resources into |
+| `--plist` | auto | Custom `Info.plist` path |
+| `--brand`, `--dark-background`, `--dark-logo`, `--dark-brand` | — | Require a paid `--license-key` |
+
+What it writes:
+
+| File | Purpose |
+|---|---|
+| `ios/<AppName>/BootSplash.storyboard` | Launch storyboard; `UILaunchStoryboardName` set to `BootSplash` in `Info.plist` |
+| `ios/<AppName>/Colors.xcassets/BootSplashBackground-<hash>.colorset` | Background colour (hashed name defeats the launch screen cache) |
+| `ios/<AppName>/Images.xcassets/BootSplashLogo-<hash>.imageset` | Logo at @1x/@2x/@3x |
+| `android/app/src/main/res/drawable-*/bootsplash_logo.png` | Logo per density |
+| `android/app/src/main/res/values/colors.xml` | `bootsplash_background` colour |
+| `android/app/src/main/res/values/styles.xml` | `BootTheme` (parent `Theme.BootSplash`) with `bootSplashBackground`, `bootSplashLogo`, `postBootSplashTheme` → `AppTheme` |
+| `android/app/src/main/AndroidManifest.xml` | Sets `android:theme="@style/BootTheme"` on `.MainActivity` |
+| `assets/bootsplash/manifest.json`, `logo*.png` | For the JS animated hand-off |
+
+Without a license key you can still support dark mode by hand: a `values-night/colors.xml` overriding `bootsplash_background`, and a Dark appearance on the generated iOS colour set.
+
+### Step 2 — iOS
+
+```swift title="ios/<AppName>/AppDelegate.swift"
+import ReactAppDependencyProvider
+import RNBootSplash
+
+class ReactNativeDelegate: RCTDefaultReactNativeFactoryDelegate {
+  // ...
+  override func customize(_ rootView: RCTRootView) {
+    super.customize(rootView)
+    RNBootSplash.initWithStoryboard("BootSplash", rootView: rootView)
+  }
+}
+```
+
+`initWithStoryboard` places the storyboard's view over the root view so it survives the OS removing the launch screen.
+
+### Step 3 — Android
+
+```kotlin title="android/app/src/main/java/com/acme/app/MainActivity.kt"
+import android.os.Bundle
+import com.zoontek.rnbootsplash.RNBootSplash
+
+class MainActivity : ReactActivity() {
+  // ...
+  override fun onCreate(savedInstanceState: Bundle?) {
+    RNBootSplash.init(this, R.style.BootTheme)
+    super.onCreate(savedInstanceState)
+  }
+}
+```
+
+> [!NOTE]
+> With `react-native-screens`, the README shows variants: recent versions set `supportFragmentManager.fragmentFactory = RNScreensFragmentFactory()` before `RNBootSplash.init`, older ones call `super.onCreate(null)`. Follow the README for your installed versions.
+
+### Step 4 — Expo (alternative to expo-splash-screen)
+
+Uninstall `expo-splash-screen`, then:
+
+```json title="app.json"
+{
+  "expo": {
+    "platforms": ["android", "ios"],
+    "plugins": [
+      ["react-native-bootsplash", { "logo": "./assets/logo.png", "logoWidth": 100, "background": "#0B1F3A" }]
+    ]
+  }
+}
+```
+
+Pass a license key via the `BOOTSPLASH_LICENSE_KEY` environment variable if you use the paid options, then `npx expo prebuild --clean`.
+
+### Step 5 — hide it
+
+```ts
+import BootSplash from 'react-native-bootsplash';
+
+await BootSplash.hide({ fade: true }); // Promise<void>
+BootSplash.isVisible(); // boolean
+```
+
+## Setup — expo-splash-screen
+
+Expo projects get `expo-splash-screen` by default. Configure it with its config plugin (the older top-level `splash` key is superseded by the plugin in recent SDKs):
+
+```json title="app.json"
+{
+  "expo": {
+    "plugins": [
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#FFFFFF",
+          "dark": {
+            "image": "./assets/splash-icon-dark.png",
+            "backgroundColor": "#0B1F3A"
+          }
+        }
+      ]
+    ]
+  }
+}
+```
+
+- Since SDK 52 the Android side uses the Android 12 SplashScreen API on **all** Android versions, so the image is a centred icon, not a full-screen picture. Full-screen artwork only survives on iOS (`enableFullScreenImage_legacy`).
+- Platform-specific overrides go in `ios` / `android` sub-objects.
+- Expo Go and development builds can't fully reproduce the splash; **verify in a release/preview build**.
+
+API:
+
+| Method | Behaviour |
+|---|---|
+| `preventAutoHideAsync()` | Call in **module scope** (not in an effect) so it runs before the first render auto-hides the splash |
+| `hideAsync()` / `hide()` | Hide the splash (async kept for backwards compatibility; `hide()` is synchronous) |
+| `setOptions({ duration, fade })` | Hide animation; `fade` is iOS-only, `duration` defaults to 400 ms |
+
+With Expo Router, the root layout owns it:
+
+```tsx title="app/_layout.tsx"
+import { useEffect } from 'react';
+import { Stack } from 'expo-router';
+import { useFonts } from 'expo-font';
+import * as SplashScreen from 'expo-splash-screen';
+
+SplashScreen.preventAutoHideAsync();
+SplashScreen.setOptions({ duration: 300, fade: true });
+
+export default function RootLayout() {
+  const [loaded, error] = useFonts({
+    'Inter-Regular': require('../assets/fonts/Inter-Regular.ttf'),
+    'Inter-SemiBold': require('../assets/fonts/Inter-SemiBold.ttf'),
+  });
+
+  useEffect(() => {
+    if (loaded || error) SplashScreen.hide();
+  }, [loaded, error]);
+
+  if (!loaded && !error) return null; // native splash still covers the screen
+  return <Stack />;
+}
+```
+
+## Implementation
+
+### When to hide the splash
+
+Hide as soon as the **first screen can render something truthful** — not when all data is loaded. The splash is an unresponsive screen: every extra second there reads as "this app is slow", and holding it for network calls turns a flaky connection into an app that "won't open".
+
+| Wait for (critical, local, bounded) | Don't wait for (move behind skeletons) |
+|---|---|
+| Custom fonts (Expo `useFonts`/`loadAsync`; bare RN fonts are linked natively and need no wait) | Feed / home data requests |
+| Session restore from Keychain/Keystore (a local read) | Token validation or refresh round-trips |
+| **Cached** remote config / feature flags | Fresh remote config fetch (fetch now, activate next launch) |
+| Persisted state rehydration (MMKV is synchronous; AsyncStorage-based stores are not) | Analytics, ads, attribution SDK init |
+| Initial route resolution for a cold-start deep link or notification | Image prefetching |
+
+```mermaid
+flowchart TD
+    entry(["JS entry evaluated"]) --> initAll["Start critical init in parallel<br/>fonts, keychain session, cached flags"]
+    initAll --> settled{"All settled before<br/>per-task timeouts?"}
+    settled -->|"yes"| render["Render first screen<br/>real UI or skeleton"]
+    settled -->|"a task timed out"| defaults["Continue with defaults<br/>log a slow-start event"]
+    defaults --> render
+    render --> deep{"Cold start from deep<br/>link or notification?"}
+    deep -->|"yes"| route["Navigate to target route first"]
+    deep -->|"no"| ready
+    route --> ready{"Navigation ready and<br/>first screen laid out?"}
+    ready -->|"yes"| hide["Hide splash with fade"]
+    hide --> bg["Network work continues<br/>behind skeletons"]
+    watchdog["Watchdog hard cap, e.g. 5 s"] -.->|"forces"| hide
+```
+*Figure: Hide-splash decision flow with per-task timeouts and a watchdog.*
+
+### Full bootstrap example
+
+A timeout helper that never leaves timers behind:
+
+```ts title="src/bootstrap/withTimeout.ts"
+export class TimeoutError extends Error {
+  constructor(label: string, ms: number) {
+    super(`${label} timed out after ${ms}ms`);
+    this.name = 'TimeoutError';
+  }
+}
+
+export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new TimeoutError(label, ms)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+```
+
+A thin splash adapter so the rest of the app doesn't care which library you use:
+
+```ts title="src/bootstrap/splash.ts"
+import * as SplashScreen from 'expo-splash-screen';
+// Bare RN alternative:
+// import BootSplash from 'react-native-bootsplash';
+// export const hideSplash = () => BootSplash.hide({ fade: true });
+
+let hidden = false;
+
+export function keepSplashVisible(): void {
+  // Rejects if already hidden (e.g. after a Fast Refresh); safe to ignore
+  SplashScreen.preventAutoHideAsync().catch(() => undefined);
+  SplashScreen.setOptions({ duration: 250, fade: true });
+}
+
+export async function hideSplash(): Promise<void> {
+  if (hidden) return;
+  hidden = true;
+  try {
+    await SplashScreen.hideAsync();
+  } catch {
+    // Already hidden; nothing to do
+  }
+}
+```
+
+The bootstrap itself — parallel, individually time-boxed, never rejects:
+
+```ts title="src/bootstrap/bootstrap.ts"
+import * as Font from 'expo-font';
+import { withTimeout } from './withTimeout';
+import { restoreSession, type Session } from '../auth/session';
+import { remoteConfig, DEFAULT_FLAGS, type FeatureFlags } from '../services/remoteConfig';
+import { logger } from '../services/logger';
+
+export type BootResult = {
+  session: Session | null;
+  flags: FeatureFlags;
+  degraded: Array<'fonts' | 'session' | 'remoteConfig'>;
+  durationMs: number;
+};
+
+export async function bootstrap(): Promise<BootResult> {
+  const startedAt = Date.now();
+
+  const [fonts, session, flags] = await Promise.allSettled([
+    withTimeout(
+      Font.loadAsync({
+        'Inter-Regular': require('../../assets/fonts/Inter-Regular.ttf'),
+        'Inter-SemiBold': require('../../assets/fonts/Inter-SemiBold.ttf'),
+      }),
+      3000,
+      'fonts',
+    ),
+    // Local Keychain/Keystore read only. Token refresh happens lazily in the API client.
+    withTimeout(restoreSession(), 2000, 'session'),
+    // Activate values fetched on a PREVIOUS launch; never wait on the network here.
+    withTimeout(
+      remoteConfig.activateCached().then(() => remoteConfig.getAll()),
+      1000,
+      'remoteConfig',
+    ),
+  ]);
+
+  const degraded: BootResult['degraded'] = [];
+  if (fonts.status === 'rejected') degraded.push('fonts'); // system font fallback
+  if (session.status === 'rejected') degraded.push('session'); // treated as signed out; should be ~0%
+  if (flags.status === 'rejected') degraded.push('remoteConfig'); // bundled defaults
+
+  // Fetch fresh values for the next launch without changing flags mid-session
+  remoteConfig.fetchForNextLaunch().catch((e: unknown) => logger.warn('remoteConfig.fetch', e));
+
+  const durationMs = Date.now() - startedAt;
+  logger.info('bootstrap.complete', { durationMs, degraded });
+
+  return {
+    session: session.status === 'fulfilled' ? session.value : null,
+    flags: flags.status === 'fulfilled' ? flags.value : DEFAULT_FLAGS,
+    degraded,
+    durationMs,
+  };
+}
+```
+
+`App.tsx` ties it together — hide only once navigation is ready (the first screen is mounted), with a watchdog so a bug can never trap users behind the splash:
+
+```tsx title="App.tsx"
+import { useCallback, useEffect, useState } from 'react';
+import { useColorScheme } from 'react-native';
+import { NavigationContainer, DarkTheme, DefaultTheme } from '@react-navigation/native';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { bootstrap, type BootResult } from './src/bootstrap/bootstrap';
+import { hideSplash, keepSplashVisible } from './src/bootstrap/splash';
+import { AppProviders } from './src/AppProviders';
+import { RootNavigator } from './src/navigation/RootNavigator';
+import { StartupSkeleton } from './src/components/StartupSkeleton';
+import { linking } from './src/navigation/linking';
+
+keepSplashVisible(); // module scope: runs before the first render
+
+const SPLASH_WATCHDOG_MS = 5000;
+
+export default function App() {
+  const scheme = useColorScheme();
+  const [boot, setBoot] = useState<BootResult | null>(null);
+  const [watchdogFired, setWatchdogFired] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const watchdog = setTimeout(() => {
+      setWatchdogFired(true);
+      void hideSplash();
+    }, SPLASH_WATCHDOG_MS);
+
+    bootstrap().then((result) => {
+      if (!cancelled) setBoot(result);
+    });
+
+    return () => {
+      cancelled = true;
+      clearTimeout(watchdog);
+    };
+  }, []);
+
+  const onNavigationReady = useCallback(() => {
+    void hideSplash();
+  }, []);
+
+  if (!boot) {
+    // Native splash still covers the screen; after the watchdog, show a skeleton instead
+    return watchdogFired ? <StartupSkeleton /> : null;
+  }
+
+  return (
+    <SafeAreaProvider>
+      <AppProviders session={boot.session} flags={boot.flags}>
+        <NavigationContainer
+          linking={linking} // resolves a cold-start deep link before onReady
+          theme={scheme === 'dark' ? DarkTheme : DefaultTheme}
+          onReady={onNavigationReady}
+        >
+          <RootNavigator />
+        </NavigationContainer>
+      </AppProviders>
+    </SafeAreaProvider>
+  );
+}
+```
+
+Also call `hideSplash()` from your root error boundary's fallback — an exception during the first render otherwise leaves the splash up forever.
+
+### After the splash: skeletons, not spinners
+
+Once hidden, the first screen should show its **layout** immediately: skeleton rows sized like the real content, cached data from MMKV/SQLite/TanStack Query persistence, and progressive replacement as requests land. A skeleton on the correct background colour makes the splash-to-app transition feel continuous; a centred spinner on white feels like a second splash.
+
+### Animated splash hand-off
+
+The native splash can't animate, but you can make it *look* like it does: render a JS view **pixel-identical** to the native splash, remove the native one underneath it (invisible swap), then animate the JS copy away.
+
+```mermaid
+sequenceDiagram
+    participant N as Native splash
+    participant O as JS overlay
+    participant A as App screen
+    N->>N: Static logo on background
+    O->>O: Mounts identical logo at identical position
+    O->>N: Hide native splash without fade
+    Note over N,O: Pixel-identical frames so the swap is invisible
+    par Overlay animates
+        O->>O: Scale and fade logo, then container
+    and App renders
+        A->>A: First screen renders underneath
+    end
+    O->>A: onAnimationEnd unmounts overlay
+```
+*Figure: Native-to-JS splash hand-off for animated transitions.*
+
+`react-native-bootsplash`'s `useHideAnimation` does the hard part — it reads the generated `manifest.json` for exact logo size, background and positioning, hides the native splash once the JS view is laid out and images are loaded, then calls your `animate`:
+
+```tsx title="src/components/AnimatedBootSplash.tsx"
+import { useState } from 'react';
+import { Animated, AccessibilityInfo } from 'react-native';
+import BootSplash from 'react-native-bootsplash';
+
+type Props = {
+  ready: boolean; // true once bootstrap has finished
+  onAnimationEnd: () => void;
+};
+
+export function AnimatedBootSplash({ ready, onAnimationEnd }: Props) {
+  const [opacity] = useState(() => new Animated.Value(1));
+  const [scale] = useState(() => new Animated.Value(1));
+
+  const { container, logo } = BootSplash.useHideAnimation({
+    ready,
+    manifest: require('../../assets/bootsplash/manifest.json'),
+    logo: require('../../assets/bootsplash/logo.png'),
+    statusBarTranslucent: true, // match your edge-to-edge setup to avoid a vertical jump
+    navigationBarTranslucent: true,
+    animate: () => {
+      AccessibilityInfo.isReduceMotionEnabled().then((reduceMotion) => {
+        const duration = reduceMotion ? 0 : 350;
+        Animated.parallel([
+          Animated.timing(scale, { toValue: 1.15, duration, useNativeDriver: true }),
+          Animated.timing(opacity, { toValue: 0, duration, delay: reduceMotion ? 0 : 100, useNativeDriver: true }),
+        ]).start(() => onAnimationEnd());
+      });
+    },
+  });
+
+  return (
+    <Animated.View {...container} style={[container.style, { opacity }]}>
+      <Animated.Image {...logo} style={[logo.style, { transform: [{ scale }] }]} />
+    </Animated.View>
+  );
+}
+```
+
+Render it as an absolutely positioned overlay above your navigator (`{splashVisible && <AnimatedBootSplash ready={!!boot} onAnimationEnd={() => setSplashVisible(false)} />}`), so the app renders underneath during the animation. The same pattern works with Reanimated or a **Lottie** animation whose first frame is exactly the static logo; unmount on `onAnimationFinish`. Keep it under a second and skip it when Reduce Motion is on.
+
+## Dark mode, system bars and edge-to-edge
+
+- **Splash per colour scheme.** iOS: colour/image sets with *Any/Dark* appearances referenced by the storyboard. Android: `values-night/colors.xml` (and `drawable-night` for a different logo). Expo: the plugin's `dark` object. The OS picks the variant at launch from the **system** setting.
+- **In-app theme overrides mismatch the splash.** If users can force dark mode inside the app while the system is light, the splash follows the system and your app flips colours on hide. On Android 13+ `UiModeManager.setApplicationNightMode()` persists a per-app mode the splash honours; on iOS there's no pre-launch hook, so pick a brand background that works in both or accept the transition.
+- **Status bar during the splash.** iOS takes the launch style from `UIStatusBarStyle` in `Info.plist` (with `UIViewControllerBasedStatusBarAppearance` controlling who owns it afterwards). On Android, `react-native-bootsplash` picks dark/light bar content per scheme; force it with `<item name="darkContentBarsStyle">true</item>` in `BootTheme`.
+- **Edge-to-edge.** Apps targeting API 35+ are edge-to-edge on Android 15+, and the splash already draws behind transparent bars. The shift to watch for is between the splash and your first screen: if your app theme reintroduces opaque bars or your layout doesn't pad for insets, content jumps on hide. Use `react-native-safe-area-context` insets, keep bars transparent in `AppTheme`, and set `statusBarTranslucent`/`navigationBarTranslucent` in `useHideAnimation` to match.
+
+## Edge cases & gotchas
+
+- **Cold start from a deep link or push.** Hide *after* navigating to the target (React Navigation's `linking` resolves the initial URL before `onReady`), or users see home flash before the target screen. See [Deep Linking & Universal Links](deep-linking.html) and [Push Notifications](push-notifications.html).
+- **OTA updates can't touch icons or splash.** They're native resources; changing them requires a store release. Also make sure an update check on launch (e.g. `expo-updates` with a non-zero `fallbackToCacheTimeout`) isn't silently extending your splash — see [OTA Updates](ota-updates.html).
+- **Fast Refresh and reloads.** `preventAutoHideAsync()` rejects if the splash is already gone; catch it. `BootSplash.hide()` is idempotent.
+- **Android 12 icon missing when launched from the IDE.** On some Android versions the splash icon only shows when launched from the launcher, not via Android Studio/`adb am start`. Test from the launcher.
+- **Warm starts on Android** (activity recreated after process death) show the system splash again; your app should restore quickly, not rerun a long bootstrap.
+- **OEM quirks.** Some skins (e.g. early One UI builds) render the Android 12 splash slightly differently; libraries ship workarounds, hand-rolled setups may not. Test on Samsung.
+- **Full-screen splash images.** Stretch or crop across aspect ratios, foldables and tablets, and aren't supported by the Android 12 API at all. Use a centred logo on a solid colour.
+- **Big splash logos cost startup.** Large PNGs decode on the main thread during launch; keep the logo small (vector on Android, reasonably sized @3x on iOS).
+- **Accessibility.** The splash isn't focusable; don't put information there. Respect Reduce Motion in animated hand-offs.
+
+## Testing & debugging
+
+Always judge splash behaviour in a **release build** — debug builds load JS from Metro, which is far slower and changes timing.
+
+```bash
+# Android: measure cold start (force-stop first for a true cold start)
+adb shell am force-stop com.acme.app
+adb shell am start -W -n com.acme.app/.MainActivity   # prints TotalTime / WaitTime
+adb logcat | grep "Displayed com.acme.app"             # system-reported time to first frame
+
+# Toggle dark mode
+adb shell cmd uimode night yes
+xcrun simctl ui booted appearance dark
+
+# Check the App Store icon for an alpha channel (macOS)
+sips -g hasAlpha ios/Acme/Images.xcassets/AppIcon.appiconset/AppIcon-1024.png
+
+# Flatten transparency onto the brand colour (ImageMagick)
+magick icon.png -background "#0B1F3A" -alpha remove -alpha off AppIcon-1024.png
+
+# Reset a stale launch screen on the simulator
+xcrun simctl uninstall booted com.acme.app && xcrun simctl shutdown booted && xcrun simctl boot <udid>
+```
+
+- **iOS launch metrics:** Instruments' *App Launch* template, and Xcode Organizer's launch-time metrics from production devices.
+- **Artificial slowness:** temporarily add a 4 s delay inside `restoreSession()` to verify timeouts, the watchdog and the skeleton path.
+- **Launcher matrix:** Pixel launcher (circle mask, themed icons on), Samsung One UI, iOS Home Screen in light/dark/tinted, iPad.
+- **Track it in production:** log `bootstrap.complete` duration and `degraded` reasons (see [Monitoring](monitoring.html)); regressions usually come from a new SDK initialised eagerly at startup. More on startup in the [Performance guide](performance.html).
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| White flash between splash and app | Splash dismissed on the first native frame; root view / `windowBackground` is white | Hold the splash with bootsplash/expo-splash-screen and hide in JS; set `AppTheme` `windowBackground` and iOS `rootView.backgroundColor` to the splash colour |
+| Black flash on Android | Translucent/transparent window theme, or `postSplashScreenTheme` missing so the window has no background | Opaque `windowBackground` in the post-splash theme; set `postSplashScreenTheme` |
+| Logo stretched, cropped or tiny on Android 12+ | Full-canvas bitmap used as `windowSplashScreenAnimatedIcon`; logo not padded for the circular mask | Export at 288 dp canvas with logo inside the 192 dp circle (240/160 with icon background); with bootsplash keep `--logo-width` around 100 |
+| Android 12 shows launcher icon instead of splash logo | Starting theme not applied to the launcher activity, or icon attribute missing | Put the splash theme on `.MainActivity` in the manifest; set `windowSplashScreenAnimatedIcon` / regenerate |
+| iOS splash not updating | Launch screen snapshot cache | Delete app, restart device/simulator, rename image assets (bootsplash hashes names) |
+| Splash never hides | `hide()` never called: exception in bootstrap, promise never settles, error boundary doesn't hide | Per-task timeouts, a watchdog, and `hideSplash()` in the error fallback |
+| Dark-mode mismatch | Splash follows system, app forces a theme; or no night resources | `values-night` + asset catalog Dark appearance; per-app night mode on Android 13+; align in-app theme with system at launch |
+| Content jumps on hide | Status/navigation bar translucency differs between splash and app (edge-to-edge) | Keep bars transparent in `AppTheme`, pad with safe-area insets, set `statusBarTranslucent`/`navigationBarTranslucent` in `useHideAnimation` |
+| App Store Connect rejects icon | 1024 icon has an alpha channel (even if fully opaque) | Flatten and remove alpha; verify with `sips -g hasAlpha` |
+| Adaptive icon looks tiny | Logo padded twice (safe zone applied to an already-padded export) | Logo should fill the 66 dp safe zone of the 108 dp layer, no more padding |
+| Adaptive icon looks huge / clipped | Logo spans the full 108 dp layer; mask cuts it | Scale into the 66 dp safe zone; preview masks in Image Asset Studio |
+| Old icon after update on Android | Launcher icon cache | Restart the launcher or device; not an app bug |
+| Double splash on Android 12+ | Legacy `SplashActivity` or JS splash after the system splash | Remove SplashActivity; use SplashScreen API and a seamless JS hand-off |
+
+## Production checklist
+
+- [ ] iOS 1024×1024 icon is opaque, square, unrounded; dark and tinted variants supplied (iOS 18+)
+- [ ] iOS 26 layered icon evaluated/created with Icon Composer if targeting the latest design
+- [ ] Android adaptive icon: foreground in the 66 dp safe zone, background layer, monochrome layer for themed icons
+- [ ] Legacy `mipmap-*` PNGs and round icons present for older devices
+- [ ] Play Store 512×512 32-bit PNG uploaded and visually identical to the launcher icon
+- [ ] Per-environment icons/names/IDs for dev and staging builds
+- [ ] Launch storyboard (or `UILaunchScreen`) with named colours and dark variants, no text
+- [ ] Android splash theme on `.MainActivity`, correct icon sizing, `postSplashScreenTheme` with a matching `windowBackground`
+- [ ] No `SplashActivity`; no full-screen splash images
+- [ ] Splash held until JS calls `hide()`; hide after navigation is ready and deep-link targets resolved
+- [ ] Bootstrap is parallel, per-task time-boxed, with a watchdog and error-boundary hide
+- [ ] Network work happens behind skeletons, never behind the splash
+- [ ] Animated hand-off (if any) is pixel-identical, under 1 s, and respects Reduce Motion
+- [ ] Verified in release builds: light/dark, cold/warm start, edge-to-edge, tablets, Samsung + Pixel
+- [ ] Startup duration and degraded reasons logged to monitoring
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [react-native-bootsplash](https://github.com/zoontek/react-native-bootsplash)
+- [Android — Splash screens](https://developer.android.com/develop/ui/views/launch/splash-screen)
+- [Android — Adaptive icons](https://developer.android.com/develop/ui/views/launch/icon_design_adaptive)
+- [Apple HIG — App icons](https://developer.apple.com/design/human-interface-guidelines/app-icons)
+- [Expo — Splash screen and app icon](https://docs.expo.dev/develop/user-interface/splash-screen-and-app-icon/)
+
+## Interview questions
+
+### Where does the white flash at React Native startup come from, and how do you eliminate it?
+
+**Short answer:** The OS launch screen is removed on the app's first native frame, but in RN that frame is an empty root view while JS is still loading, so you see the root/window background — usually white. Fix it by holding the native splash until JS calls `hide()`, and by matching every background colour.
+
+The layers: (1) a library (`react-native-bootsplash`, `expo-splash-screen`) keeps a native overlay on iOS and uses the SplashScreen API's keep-on-screen condition on Android; (2) `AppTheme`'s `windowBackground` and the iOS root view background equal the splash colour per scheme; (3) hide only when navigation is ready and render a skeleton, not a spinner on white.
+
+> [!INTERVIEW]
+> Strong answers name the mechanism (first-frame dismissal), not just the library. Follow-ups: dark mode mismatch, and why a JS "SplashScreen" component doesn't fix it.
+
+### Why can't the iOS launch screen be animated, and how do apps show animated splashes anyway?
+
+**Short answer:** The launch storyboard is rendered by the OS before your process runs and cached as a snapshot, so it can't run code. Animated splashes are a hand-off: a JS view pixel-identical to the native splash replaces it invisibly and then animates.
+
+`useHideAnimation` in bootsplash reads the generated manifest for exact geometry, hides the native splash once the JS view is laid out, then calls `animate`. The same works with Lottie if frame 0 matches the static logo. Keep it under a second and skip it under Reduce Motion.
+
+### How do Android adaptive icons work, and what goes wrong most often?
+
+**Short answer:** Since API 26, launchers compose a 108 dp foreground and background layer and mask them to a device-specific shape; only the central 72 dp shows and content must fit the ~66 dp safe zone. Android 13 adds a monochrome layer for themed icons.
+
+They're declared in `mipmap-anydpi-v26/ic_launcher.xml` with `<background>`, `<foreground>` and `<monochrome>`; legacy PNGs (48–192 px from mdpi to xxxhdpi) remain the fallback. Common failures: logo clipped because it spans the whole layer, logo tiny because it was padded twice, and no monochrome layer so the app stands out in a themed grid.
+
+### What changed with Android 12's SplashScreen API, and why is a SplashActivity now an anti-pattern?
+
+**Short answer:** Android 12 shows a system splash for every app on cold and warm starts — icon on a solid colour, circular mask — so a custom SplashActivity produces a double splash, slower startup and intent-forwarding bugs.
+
+The right approach is `Theme.SplashScreen` on the main activity (`windowSplashScreenBackground`, `windowSplashScreenAnimatedIcon`, `postSplashScreenTheme`), `installSplashScreen()` before `super.onCreate`, and `setKeepOnScreenCondition` until JS is ready. Icon sizing: 288 dp canvas / 192 dp circle, or 240/160 with an icon background.
+
+### When should you hide the splash screen, and what should never block it?
+
+**Short answer:** Hide when the first screen can render truthfully — fonts, local session, cached config ready and navigation mounted — each with a timeout and an overall watchdog. Never block on network calls; show skeletons instead.
+
+Remote config should activate cached values and fetch for the next launch; token refresh should be lazy in the API client; analytics/ads SDKs initialise after first render. Also hide from the error boundary, or an exception leaves users on the splash forever. Cold-start deep links should navigate before hiding.
+
+> [!INTERVIEW]
+> Red flag: "we keep the splash until the home feed loads." Good signal: talking about measuring startup in release builds and logging degraded reasons.
+
+### How would you ship different icons for dev, staging and production builds?
+
+**Short answer:** Separate app IDs and names per environment plus badged icons: Android product flavors with `src/<flavor>/res/mipmap-*` overrides, iOS extra icon sets selected per configuration via `ASSETCATALOG_COMPILER_APPICON_NAME`, and in Expo an `app.config.ts` that switches icon paths on an env var set per EAS profile.
+
+Badges can be generated in CI so designers maintain only the prod icon. Watch for duplicate `app_name` resources when combining `resValue` with `strings.xml`.
+
+### Your new launch screen doesn't appear on iOS test devices. Why, and what do you do?
+
+**Short answer:** iOS caches the launch screen snapshot aggressively. Delete and reinstall, restart the device, and rename the referenced image assets so the cache key changes — bootsplash does this with hashed asset names.
+
+Also check `UILaunchStoryboardName` points to the storyboard you edited and the storyboard is in the app target's Copy Bundle Resources.
+
+### What do you need to supply for themed and tinted icons on Android 13+ and iOS 18+?
+
+**Short answer:** Android: a `<monochrome>` layer in the adaptive icon XML — a single-colour silhouette the launcher tints. iOS 18: Dark and Tinted appearances in the AppIcon set (or `ios.icon` light/dark/tinted in Expo); iOS 26 adds layered Liquid Glass icons built with Icon Composer.
+
+If you don't supply them, both systems derive their own versions, which usually look worse — and on Android your icon simply stays full colour among themed ones.
+
+### How does splash handling differ between Expo and bare React Native?
+
+**Short answer:** In Expo (CNG), the `expo-splash-screen` config plugin generates native assets on prebuild and you call `preventAutoHideAsync()` in module scope then `hideAsync()`/`hide()`. In bare RN you typically generate assets with `react-native-bootsplash`, wire `RNBootSplash.init`/`initWithStoryboard` natively and call `BootSplash.hide()`.
+
+In Expo never hand-edit generated native splash files — change the config and rebuild. Since SDK 52 Expo uses the Android 12 API on all Android versions, so full-screen images are iOS-only, and Expo Go can't reproduce the real splash, so test release builds.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

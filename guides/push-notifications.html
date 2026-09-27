@@ -1,0 +1,1666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Push Notifications · React Native Interview Handbook</title>
+<meta name="description" content="An end-to-end reference for remote and local notifications in React Native: how APNs and FCM actually deliver messages, every message type and platform feature you will be…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Push Notifications · React Native Interview Handbook">
+<meta property="og:description" content="An end-to-end reference for remote and local notifications in React Native: how APNs and FCM actually deliver messages, every message type and platform feature you will be…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/push-notifications.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Push Notifications
+
+An end-to-end reference for remote and local notifications in React Native: how APNs and FCM actually deliver messages, every message type and platform feature you will be asked about, native setup for bare React Native and Expo, production-grade client code, backend sending with FCM HTTP v1 and APNs, and a debugging playbook for when notifications silently don't arrive.
+
+## How it works
+
+A push notification involves three parties, and your app is the least important of them at delivery time:
+
+1. **The platform push service.** On iOS that is **Apple Push Notification service (APNs)**. On Android it is **Firebase Cloud Messaging (FCM)**, delivered through Google Play services. Each device keeps exactly one long-lived, battery-optimised connection to its push service (the `apsd` daemon on iOS, Google Play services on Android). Your app never holds a socket open for pushes.
+2. **Your app.** It asks the user for permission, registers with the OS, receives a **device token** (an opaque address for "this app on this device"), and sends that token to your backend. It also decides what to do when a message arrives or is tapped.
+3. **Your backend (the "provider").** It stores tokens per user and device, decides who should be notified, builds payloads, authenticates to FCM/APNs, sends, and cleans up dead tokens.
+
+| Term | What it is | Notes |
+|---|---|---|
+| APNs device token | 32+ byte opaque value (usually hex-encoded) issued by APNs for one app on one device | Environment-specific: a **sandbox** token only works against `api.sandbox.push.apple.com`, a **production** token against `api.push.apple.com` |
+| FCM registration token | Long string issued by FCM for one app instance | On iOS, the Firebase SDK exchanges the APNs token for an FCM token, so your backend only deals with FCM tokens |
+| Expo push token | `ExponentPushToken[...]` | Only meaningful to Expo's push service, which maps it to the underlying FCM/APNs token |
+| Provider | Your server that sends pushes | Authenticates with an OAuth2 token (FCM) or a JWT signed with your `.p8` key (APNs) |
+| Topic | Pub/sub channel in FCM (`news-en`) | FCM fans out for you; there is no per-user targeting inside a topic |
+| Payload | JSON body of a message | ~4 KB limit on both APNs and FCM for regular messages |
+
+```mermaid
+flowchart TD
+    subgraph backend["Your backend (provider)"]
+        API["Notification service"]
+        DB[("Device tokens DB")]
+        Q["Queue and send workers"]
+    end
+    subgraph google["Google"]
+        FCM["FCM HTTP v1 API"]
+    end
+    subgraph apple["Apple"]
+        APNs["APNs (HTTP/2)"]
+    end
+    subgraph devices["Devices"]
+        Android["Android app<br/>via Google Play services"]
+        IOS["iOS app<br/>via apsd daemon"]
+    end
+    API --> DB
+    API --> Q
+    Q -->|"OAuth2 bearer token"| FCM
+    Q -.->|"JWT, optional direct path"| APNs
+    FCM -->|"persistent connection"| Android
+    FCM -->|"forwards using your .p8 key"| APNs
+    APNs --> IOS
+    Android -->|"register token"| API
+    IOS -->|"register token"| API
+```
+*Figure: End-to-end architecture. FCM can deliver to Android directly and to iOS by relaying through APNs; alternatively your backend talks to APNs directly.*
+
+### Delivery paths
+
+There are three common topologies, and interviewers like to hear that you know all of them:
+
+| Path | Android | iOS | When to choose |
+|---|---|---|---|
+| **FCM for everything** | Backend → FCM → device | Backend → FCM → APNs → device (FCM uses the APNs key you upload to Firebase) | Most apps. One API, one token format, topics, Firebase console tooling |
+| **FCM + direct APNs** | Backend → FCM → device | Backend → APNs over HTTP/2 with a JWT | You don't want the Firebase iOS SDK, you need APNs-only features immediately (Live Activities, new push types), or you already run an APNs sender |
+| **Third-party service** | Expo / OneSignal / Braze → FCM | Expo / OneSignal / Braze → APNs | You want a hosted sender, dashboards, segmentation or campaigns |
+
+Two store-and-forward behaviours matter for product decisions:
+
+- **APNs keeps only the most recent notification per app** for an offline device, and discards it after `apns-expiration`. If you send five messages to a phone in airplane mode, the user gets one.
+- **FCM stores up to 100 non-collapsible messages per device** (default TTL 4 weeks, max 28 days). Above that it drops them all and the Android SDK reports "deleted messages" so your app can do a full sync. Collapsible messages (with a `collapse_key`) replace each other, and FCM keeps at most four distinct collapse keys per device.
+
+### Registration
+
+The token is the only thing linking a user to a device, so registration has to be robust: repeat it on every launch, handle refreshes, and associate it with the signed-in user.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant App as RN App
+    participant OS as iOS
+    participant APNs as APNs
+    participant FCM as FCM
+    participant BE as Backend
+    App->>U: Explain value (permission primer)
+    App->>OS: requestAuthorization
+    OS->>U: System permission prompt
+    U-->>OS: Allow
+    App->>OS: registerForRemoteNotifications
+    OS->>APNs: Register app on this device
+    APNs-->>OS: APNs device token
+    OS-->>App: didRegister with token (Firebase SDK captures it)
+    App->>FCM: getToken, sends APNs token
+    FCM-->>App: FCM registration token
+    App->>BE: PUT /me/devices/installationId
+    BE-->>App: 204 stored
+    Note over App,BE: On Android, Google Play services issues the FCM token directly. Repeat on every launch and on token refresh.
+```
+*Figure: Token registration on iOS with Firebase. Android skips the APNs steps and has a runtime permission only on Android 13+.*
+
+Tokens change when the app is reinstalled, restored onto a new device, when the user clears app data (Android), or when the push service rotates them. FCM also treats tokens from devices that have been offline for about 270 days as expired. Your backend must treat tokens as volatile cache entries, not identities.
+
+## Message types and platform features
+
+### Notification messages vs data messages
+
+This distinction drives almost every "why didn't my handler run?" bug.
+
+| | Notification message | Data-only message |
+|---|---|---|
+| FCM payload | Has a `notification` object (title/body/image), optionally `data` | Only `data` (string key/value pairs) |
+| APNs payload | `aps.alert` present | No `alert`; `aps.content-available: 1` to wake the app |
+| Who displays it when app is backgrounded/killed | **The OS / FCM SDK**, automatically | **Nobody** — your code must display it (e.g. with Notifee) |
+| Wakes your JS | Android (RNFB): yes, background handler also runs. iOS: only if `content-available: 1` is also set | Yes, subject to priority, Doze and iOS throttling |
+| Reliability | High — the OS guarantees display | Lower — depends on OS scheduling, battery state, OEM policies and whether the app was force-quit |
+| Use for | Anything the user must see: messages, order updates, alerts | Background sync, updating badges/state, E2E-encrypted content you decrypt and display locally |
+
+Rule of thumb: **if a human must see it, send a notification message** (optionally with `mutable-content` on iOS so you can still modify it). Use data-only messages as an optimisation, never as the only path for important content.
+
+### Silent / background pushes
+
+A silent push (APNs "background notification") wakes your app for roughly 30 seconds to fetch data, with no UI.
+
+- APNs payload: `{"aps": {"content-available": 1}}` with no `alert`, `sound` or `badge`.
+- Headers: `apns-push-type: background` and `apns-priority: 5`. Priority 10 is invalid for background pushes and may be rejected or dropped.
+- The app needs the **Background Modes → Remote notifications** capability.
+- iOS treats these as low priority and **throttles** them based on battery, Low Power Mode, app usage and how many you send. Apple's guidance is not to send more than a few per hour. They can be delayed or coalesced.
+- If the user **force-quits** the app from the app switcher, iOS will not launch it for background pushes until the user opens it again.
+- On Android, the equivalent is a data-only FCM message. `priority: high` lets it bypass Doze briefly, but FCM may deprioritise high-priority messages that don't result in a user-visible notification.
+
+For guaranteed eventual consistency, pair silent pushes with sync on app foreground and periodic background fetch (see [Background Tasks](background-tasks.html) and [Offline Storage & Sync](offline-storage.html)).
+
+### Local and scheduled notifications
+
+Local notifications are created on-device with no server: reminders, timers, "your download finished", or displaying a data-only push. Key constraints:
+
+- iOS keeps at most **64 pending scheduled local notifications** per app; schedule a rolling window and top it up on launch.
+- Android scheduling uses AlarmManager or WorkManager. Exact alarms need `SCHEDULE_EXACT_ALARM` (user-grantable, denied by default for most new installs on recent Android versions) or `USE_EXACT_ALARM` (restricted by Play policy to alarm/calendar apps). Prefer inexact triggers unless the product truly needs to-the-minute delivery.
+- Device reboot clears Android alarms; libraries re-register them with a boot receiver, but test it.
+
+### Rich notifications (images, media)
+
+| | iOS | Android |
+|---|---|---|
+| Mechanism | **Notification Service Extension** (separate app extension target) downloads the media and attaches it | FCM SDK downloads `notification.image` itself for notification messages; for local display, Notifee/expo-notifications support big-picture style |
+| Payload flag | `aps.mutable-content: 1` (and an `alert` — the extension never runs for silent pushes) | none |
+| FCM field | `apns.fcm_options.image` | `android.notification.image` or `notification.image` |
+| Time budget | About 30 seconds, then `serviceExtensionTimeWillExpire` must deliver a fallback | Download happens before display |
+| Other uses | Decrypt end-to-end encrypted content, localise, add delivery receipts | — |
+
+A **Notification Content Extension** is a different thing: a custom UI shown when the user long-presses/expands the notification. Most apps don't need one.
+
+### Actions and categories
+
+Action buttons ("Reply", "Mark as read", "Accept") work differently per platform:
+
+- **iOS**: you register `UNNotificationCategory` objects with actions at launch, and the payload references them via `aps.category`. Text-input actions are supported. Actions can open the app (foreground) or run in the background.
+- **Android**: actions are attached per notification when it is built. FCM notification messages can't define buttons, so if you need actions on Android you send **data-only** messages and display them yourself (Notifee or expo-notifications), or build them natively.
+
+### iOS interruption levels, Focus and provisional authorization
+
+Since iOS 15, `aps.interruption-level` controls how intrusive a notification is:
+
+| Level | Behaviour | Requirement |
+|---|---|---|
+| `passive` | Added to Notification Center silently, no sound or wake | none |
+| `active` (default) | Normal banner/sound, respects Focus | none |
+| `time-sensitive` | Can break through Focus and scheduled summary | **Time Sensitive Notifications** capability (`com.apple.developer.usernotifications.time-sensitive`); users can turn it off per app |
+| `critical` | Plays sound even when muted / Do Not Disturb | **Critical Alerts entitlement granted by Apple** after an application (health, safety, security use cases) plus requesting the `criticalAlert` authorization option |
+
+`relevance-score` (0–1) influences ordering in notification summaries. Abuse of time-sensitive for marketing gets apps reported and users will disable it.
+
+**Provisional authorization** (iOS 12+) lets you skip the prompt entirely: notifications are delivered quietly to Notification Center with "Keep" / "Turn Off" buttons. It is a good fit for content apps that want to demonstrate value before asking. You can later upgrade to a full prompt.
+
+### Badges
+
+- **iOS**: `aps.badge` sets an **absolute** number (not an increment), so the server should know the real unread count. Clear it from the app when the user reads content (`notifee.setBadgeCount(0)` or `Notifications.setBadgeCountAsync(0)`).
+- **Android**: badges are launcher-dependent. Most launchers show a dot; some show counts based on the notification's `number`. Channels can disable badges (`setShowBadge(false)`). Don't design features around exact Android badge counts.
+
+### Android channels, importance and grouping
+
+Since Android 8, every notification must be posted to a **channel**. The user controls each channel's sound, vibration and visibility, and **you cannot change a channel's importance after creating it** — only its name and description. To change behaviour you create a new channel ID and delete the old one.
+
+| Importance | Behaviour | Typical use |
+|---|---|---|
+| `HIGH` | Sound + heads-up banner | Chat messages, calls, OTP, delivery arriving |
+| `DEFAULT` | Sound, no heads-up | Order updates, social activity |
+| `LOW` | No sound, shown in shade | Marketing, digests |
+| `MIN` | No sound, collapsed, no status bar icon | Background status |
+
+If an FCM notification message references a channel that doesn't exist and you haven't configured a default, FCM falls back to a "Miscellaneous" channel it creates for you — a sign of a missed setup step.
+
+**Grouping**: iOS groups by `aps.thread-id` (and by app otherwise). Android groups by a group key plus a summary notification, and the system auto-groups when an app posts several notifications. Use one thread/group per conversation or order, and use `tag` (Android) / `apns-collapse-id` (iOS) to **replace** an outdated notification instead of stacking ("Driver is 5 min away" → "Driver arrived").
+
+## Requirements & prerequisites
+
+| Requirement | Platform | Details |
+|---|---|---|
+| Apple Developer Program membership | iOS | Paid membership (about $99/year). Free personal teams cannot use the Push Notifications capability |
+| **APNs Auth Key** (`.p8`) + **Key ID** + **Team ID** | iOS | Create in Certificates, Identifiers & Profiles → Keys, enable APNs, download once (it can't be re-downloaded). A token-based key does not expire, covers all apps in the team, and can be used for sandbox and production. If you restrict a key to an environment or topic when creating it, make sure it matches what you send to. **Preferred over `.p12` certificates**, which are per app and expire yearly |
+| App ID with Push Notifications capability | iOS | Enabled automatically when you add the capability in Xcode with automatic signing, or by EAS capability syncing |
+| `aps-environment` entitlement | iOS | `development` or `production` in `ios/<AppName>/<AppName>.entitlements`. Development-signed builds get sandbox tokens; App Store / TestFlight / Ad Hoc builds get production tokens. Xcode rewrites the value to match the distribution profile on export |
+| Background Modes → Remote notifications | iOS | Adds `UIBackgroundModes` → `remote-notification` to `Info.plist`. Needed for silent pushes and background handlers |
+| Time Sensitive / Critical Alerts | iOS | Separate capability (time-sensitive) or Apple-approved entitlement (critical) |
+| Firebase project | Both (if using FCM) | Register the iOS app (bundle ID) and Android app (package name). Download `GoogleService-Info.plist` and `google-services.json`. Upload the APNs key in Project settings → Cloud Messaging → Apple app configuration |
+| Service account for FCM HTTP v1 | Backend | JSON key or workload identity with permission to send (e.g. the Firebase Cloud Messaging API Admin role). The FCM API (V1) must be enabled in Google Cloud. The legacy server-key API is shut down |
+| `POST_NOTIFICATIONS` runtime permission | Android 13+ | Declare in the manifest and request at runtime. New installs on Android 13+ have notifications off until granted |
+| Google Play services | Android | FCM requires it. Devices without it (Huawei after 2019, most phones sold in mainland China) need vendor push (HMS Push, Xiaomi, OPPO, vivo) or an aggregator |
+| Test devices | Both | Android emulators need a system image with Google APIs or Google Play to get FCM tokens. iOS: `xcrun simctl push` delivers simulated pushes to any simulator (no APNs involved), and simulators running iOS 16+ on macOS 13+ on Apple silicon or T2 Macs can register with the APNs **sandbox** and receive real remote pushes. Still verify on physical devices: background delivery, throttling, Focus, extensions and battery policies differ |
+| Cost | — | APNs and FCM are free. Expo's push service is free with rate limits. OneSignal, Braze, Airship etc. are tiered/paid |
+
+> [!NOTE]
+> Store and OS requirements move every year (Xcode minimums, target SDK levels, permission changes). Verify current requirements in Apple's and Google's documentation before a release.
+
+## Choosing a library / approach
+
+| | `@react-native-firebase/messaging` (+ Notifee) | `expo-notifications` | OneSignal / Braze / Airship |
+|---|---|---|---|
+| Transport | FCM on both platforms (FCM relays to APNs) | Expo push service, **or** native tokens you send to yourself | Vendor's service |
+| Token you get | FCM token on both platforms | Expo push token, or native device token: **FCM on Android, raw APNs token on iOS** | Vendor subscription ID |
+| Displaying notifications in foreground / from data messages | Needs a display library: Notifee (or expo-notifications) | Built in | Built in |
+| Local & scheduled | Via Notifee | Built in | Limited / not the focus |
+| Actions, categories, channels | Notifee | Built in | Built in, dashboard-driven |
+| Background handler | `setBackgroundMessageHandler` (headless JS on Android) | `registerTaskAsync` with expo-task-manager | Vendor callbacks |
+| Expo support | Yes, with config plugins (dev build, static frameworks) | First-class | Yes (config plugin) |
+| Backend work | You build the sender (firebase-admin / HTTP v1) | None with Expo push; or your own sender | None; segmentation and campaigns in dashboard |
+| Best for | Bare apps, apps already on Firebase, full control | Expo apps, quick start, one API for local and remote | Marketing-led teams that want journeys, A/B tests, analytics |
+
+**Recommendation**
+
+- **Expo app**: use `expo-notifications`. Start with the Expo push service (no backend push code), and move to sending natively when you need FCM features or want fewer moving parts in the delivery chain — remembering that on iOS the native token is an **APNs** token, so you either send via APNs directly or add the Firebase SDK.
+- **Bare app or already on Firebase** (Analytics, Crashlytics): `@react-native-firebase/messaging` for transport and tokens, plus a display library. Notifee has the richest API for channels, actions, grouping and trigger notifications; it is open source, but check its recent release activity and New Architecture compatibility before committing. `expo-notifications` also works in bare apps (via Expo Modules) as the display layer.
+- **Marketing-heavy product**: a customer-engagement platform saves months of campaign tooling, at the cost of SDK weight, per-MAU pricing, and sending user data to another processor (update your privacy disclosures).
+
+> [!WARNING]
+> Only one component can be the `UNUserNotificationCenter` delegate on iOS. Mixing libraries that each try to own it (for example RNFB + Notifee + expo-notifications + a vendor SDK) leads to missing foreground banners or lost tap events. Pick one owner for presentation and taps, and read each library's docs on coexistence.
+
+## Setup — iOS
+
+These steps assume a bare React Native app using `@react-native-firebase/app` and `@react-native-firebase/messaging`. Expo differences are covered in the Setup — Expo section further down.
+
+### Step 1 — Create the APNs key and upload it to Firebase
+
+1. Apple Developer → Certificates, Identifiers & Profiles → **Keys** → "+" → enable **Apple Push Notifications service (APNs)** → download `AuthKey_ABC123XYZ.p8`. Note the **Key ID** and your **Team ID** (top right of the developer portal).
+2. Firebase console → Project settings → **Cloud Messaging** → Apple app configuration → **APNs Authentication Key** → upload the `.p8`, Key ID and Team ID.
+3. Store the `.p8` in your secrets manager. If your backend sends via APNs directly, it needs the same three values.
+
+### Step 2 — Add the Firebase config file
+
+Download `GoogleService-Info.plist` for your bundle ID and add it to the app target in Xcode (drag into the project, "Copy items if needed", target checked). It ends up at `ios/<AppName>/GoogleService-Info.plist`. Use separate Firebase projects (and plists) per environment and select them with build configurations or schemes.
+
+### Step 3 — Capabilities
+
+In Xcode → target → **Signing & Capabilities**:
+
+1. **+ Capability → Push Notifications.** This creates/updates the entitlements file.
+2. **+ Capability → Background Modes → Remote notifications** (needed for silent pushes and background handlers).
+3. Optional: **Time Sensitive Notifications**.
+
+```xml title="ios/MyApp/MyApp.entitlements"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>aps-environment</key>
+  <string>development</string>
+  <key>com.apple.developer.usernotifications.time-sensitive</key>
+  <true/>
+</dict>
+</plist>
+```
+
+```xml title="ios/MyApp/Info.plist (excerpt)"
+<key>UIBackgroundModes</key>
+<array>
+  <string>remote-notification</string>
+</array>
+```
+
+### Step 4 — Podfile
+
+React Native Firebase requires static frameworks on iOS:
+
+```ruby title="ios/Podfile (excerpt)"
+use_frameworks! :linkage => :static
+$RNFirebaseAsStaticFramework = true
+
+target 'MyApp' do
+  config = use_native_modules!
+  use_react_native!(
+    :path => config[:reactNativePath],
+    :app_path => "#{Pod::Config.instance.installation_root}/.."
+  )
+end
+```
+
+Then run `cd ios && pod install`.
+
+### Step 5 — AppDelegate
+
+Recent React Native templates generate a Swift `AppDelegate` built around `RCTReactNativeFactory`. The only required change for Firebase is to configure it before React Native starts. RNFB and the Firebase SDK use method swizzling to capture the APNs token and route notification callbacks, so you don't implement `didRegisterForRemoteNotificationsWithDeviceToken` yourself.
+
+```swift title="ios/MyApp/AppDelegate.swift"
+import UIKit
+import React
+import React_RCTAppDelegate
+import ReactAppDependencyProvider
+import FirebaseCore
+
+@main
+class AppDelegate: UIResponder, UIApplicationDelegate {
+  var window: UIWindow?
+
+  var reactNativeDelegate: ReactNativeDelegate?
+  var reactNativeFactory: RCTReactNativeFactory?
+
+  func application(
+    _ application: UIApplication,
+    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+  ) -> Bool {
+    // Must run before React Native starts so JS can call Firebase immediately
+    // and so the APNs token is captured as soon as iOS delivers it.
+    FirebaseApp.configure()
+
+    let delegate = ReactNativeDelegate()
+    let factory = RCTReactNativeFactory(delegate: delegate)
+    delegate.dependencyProvider = RCTAppDependencyProvider()
+
+    reactNativeDelegate = delegate
+    reactNativeFactory = factory
+
+    window = UIWindow(frame: UIScreen.main.bounds)
+    factory.startReactNative(
+      withModuleName: "MyApp",
+      in: window,
+      launchOptions: launchOptions
+    )
+    return true
+  }
+}
+
+// ReactNativeDelegate (bundleURL etc.) stays exactly as generated by the template.
+```
+
+Older projects with an Objective-C `AppDelegate.mm` make the equivalent change:
+
+```objectivec title="ios/MyApp/AppDelegate.mm (excerpt)"
+#import <Firebase.h>
+
+- (BOOL)application:(UIApplication *)application
+    didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
+{
+  [FIRApp configure];
+  // ... existing React Native setup
+  return [super application:application didFinishLaunchingWithOptions:launchOptions];
+}
+```
+
+> [!WARNING]
+> If you set `FirebaseAppDelegateProxyEnabled` to `NO` in `Info.plist` (to disable swizzling), you must forward the APNs token yourself (`Messaging.messaging().apnsToken = deviceToken`) and forward notification callbacks. Otherwise `getToken()` fails with an "unregistered" / no APNs token error.
+
+### Step 6 — Notification Service Extension (rich media)
+
+1. Xcode → File → New → Target → **Notification Service Extension**, name it `NotificationService`. Choose "Don't activate" when asked about the scheme.
+2. Set the extension's **deployment target** to the same (or lower) iOS version as your app. Xcode defaults it to the newest iOS; on older devices the extension then silently never runs.
+3. Make sure its bundle ID is a child of the app's (`com.example.app.NotificationService`) and that it is signed with the same team.
+4. Send pushes with `mutable-content: 1` and an `alert`.
+
+```swift title="ios/NotificationService/NotificationService.swift"
+import UserNotifications
+
+final class NotificationService: UNNotificationServiceExtension {
+  private var contentHandler: ((UNNotificationContent) -> Void)?
+  private var bestAttempt: UNMutableNotificationContent?
+
+  override func didReceive(
+    _ request: UNNotificationRequest,
+    withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
+  ) {
+    self.contentHandler = contentHandler
+    guard let content = request.content.mutableCopy() as? UNMutableNotificationContent else {
+      contentHandler(request.content)
+      return
+    }
+    bestAttempt = content
+
+    // FCM puts the image in fcm_options.image; direct APNs senders can use their own key.
+    let fcmOptions = content.userInfo["fcm_options"] as? [String: Any]
+    guard
+      let urlString = (fcmOptions?["image"] as? String) ?? (content.userInfo["image_url"] as? String),
+      let url = URL(string: urlString)
+    else {
+      finish(content)
+      return
+    }
+
+    URLSession.shared.downloadTask(with: url) { [weak self] tempURL, _, _ in
+      guard let self else { return }
+      if let tempURL {
+        let ext = url.pathExtension.isEmpty ? "jpg" : url.pathExtension
+        let fileURL = URL(fileURLWithPath: NSTemporaryDirectory())
+          .appendingPathComponent(UUID().uuidString)
+          .appendingPathExtension(ext)
+        if (try? FileManager.default.moveItem(at: tempURL, to: fileURL)) != nil,
+           let attachment = try? UNNotificationAttachment(identifier: "image", url: fileURL) {
+          content.attachments = [attachment]
+        }
+      }
+      self.finish(content)
+    }.resume()
+  }
+
+  override func serviceExtensionTimeWillExpire() {
+    // Called shortly before the ~30 s budget ends: deliver whatever we have.
+    if let bestAttempt { finish(bestAttempt) }
+  }
+
+  private func finish(_ content: UNNotificationContent) {
+    contentHandler?(content)
+    contentHandler = nil
+  }
+}
+```
+
+> [!TIP] Firebase shortcut
+> If you already use Firebase, add `pod 'FirebaseMessaging'` to a `target 'NotificationService' do ... end` block in the Podfile and call `Messaging.serviceExtension().populateNotificationContent(content, withContentHandler: contentHandler)`, which downloads `fcm_options.image` for you. Notifee ships a similar helper for its own payloads.
+
+The extension is also the right place to decrypt end-to-end encrypted payloads, and to fire a lightweight "delivered" analytics beacon — it is one of the few ways to measure iOS delivery, not just opens. Share data with the app through an **App Group**.
+
+## Setup — Android
+
+### Step 1 — Firebase config and Gradle plugin
+
+Register the Android app in Firebase with your exact `applicationId` and download `google-services.json` to `android/app/google-services.json` (one per environment/flavor if you use flavors: `android/app/src/<flavor>/google-services.json`).
+
+```gradle title="android/build.gradle"
+buildscript {
+    dependencies {
+        classpath("com.android.tools.build:gradle")
+        classpath("com.facebook.react:react-native-gradle-plugin")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+        // Use the version listed in the React Native Firebase docs
+        classpath("com.google.gms:google-services:4.4.2")
+    }
+}
+```
+
+```gradle title="android/app/build.gradle"
+apply plugin: "com.android.application"
+apply plugin: "org.jetbrains.kotlin.android"
+apply plugin: "com.facebook.react"
+apply plugin: "com.google.gms.google-services"
+```
+
+### Step 2 — Manifest
+
+```xml title="android/app/src/main/AndroidManifest.xml"
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Android 13+: runtime permission; harmless on older versions -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:name=".MainApplication"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name">
+
+        <!-- Small icon used by FCM for notification messages shown while the app is backgrounded -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@drawable/ic_notification" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+```
+
+`launchMode="singleTask"` (the template default) matters: tapping a notification or link while the app is running should reuse the existing activity rather than stack a second React instance.
+
+### Step 3 — Default channel and colour via `firebase.json`
+
+React Native Firebase reads options from `firebase.json` at the project root and injects the corresponding manifest meta-data:
+
+```json title="firebase.json"
+{
+  "react-native": {
+    "messaging_android_notification_channel_id": "default",
+    "messaging_android_notification_color": "@color/notification_accent",
+    "messaging_android_headless_task_timeout": 30000,
+    "messaging_ios_auto_register_for_remote_messages": true,
+    "messaging_ios_foreground_presentation_options": ["badge", "sound", "list", "banner"]
+  }
+}
+```
+
+```xml title="android/app/src/main/res/values/colors.xml"
+<resources>
+    <color name="notification_accent">#4F46E5</color>
+</resources>
+```
+
+> [!WARNING]
+> If you also declare `com.google.firebase.messaging.default_notification_color` or `default_notification_channel_id` directly in your manifest, the build fails with "Manifest merger failed". Either configure them only in `firebase.json`, or add `tools:replace="android:resource"` (colour) / `tools:replace="android:value"` (channel) to your `meta-data` element.
+
+The channel named here must actually be **created** at runtime (see "Channels, actions, badges and topics" under Implementation), otherwise FCM falls back to its own "Miscellaneous" channel.
+
+### Step 4 — The small icon
+
+The status-bar icon must be a **white silhouette on a transparent background** — Android uses only the alpha channel. A full-colour launcher icon renders as a white square or circle. Generate one in Android Studio → New → Image Asset → **Notification Icons**, which writes `res/drawable-*/ic_notification.png` (or use a vector drawable at `android/app/src/main/res/drawable/ic_notification.xml`). The accent colour tints it in the expanded view.
+
+## Setup — Expo
+
+With Continuous Native Generation you don't edit `ios/` and `android/` by hand; config plugins do it during `npx expo prebuild` / EAS Build. Remote push requires a **development build** — push is not available in Expo Go on Android in recent SDKs, and Expo Go can't test your own credentials anyway.
+
+### Option A — expo-notifications (with or without Expo's push service)
+
+```ts title="app.config.ts"
+import type { ExpoConfig } from 'expo/config';
+
+const config: ExpoConfig = {
+  name: 'MyApp',
+  slug: 'my-app',
+  scheme: 'myapp',
+  ios: {
+    bundleIdentifier: 'com.example.app',
+  },
+  android: {
+    package: 'com.example.app',
+    // Required for push on Android, even when sending through Expo's service
+    googleServicesFile: './google-services.json',
+  },
+  plugins: [
+    [
+      'expo-notifications',
+      {
+        icon: './assets/notification-icon.png', // white-on-transparent PNG
+        color: '#4F46E5',
+        defaultChannel: 'default',
+        enableBackgroundRemoteNotifications: true, // adds remote-notification background mode
+      },
+    ],
+  ],
+  extra: {
+    eas: { projectId: process.env.EAS_PROJECT_ID },
+  },
+};
+
+export default config;
+```
+
+Credentials for Expo's push service:
+
+- **iOS**: run `eas credentials` → iOS → Push Notifications. EAS can create and store an APNs key for your team, or you upload an existing `.p8`. EAS capability syncing enables Push Notifications on the App ID.
+- **Android**: upload a Google service account JSON key with FCM permissions via `eas credentials` → Android → FCM V1 service account key. Expo uses it to call FCM HTTP v1 on your behalf.
+
+**Expo push token vs native device token**
+
+| | `getExpoPushTokenAsync({ projectId })` | `getDevicePushTokenAsync()` |
+|---|---|---|
+| Value | `ExponentPushToken[xxxxxxxx]` | Android: FCM registration token. iOS: **raw APNs token** (hex) |
+| Send with | Expo push API (`https://exp.host/--/api/v2/push/send`) or `expo-server-sdk` | FCM HTTP v1 (Android) and **APNs directly** (iOS) |
+| Pros | One API and token format, receipts, no Firebase on iOS | No extra hop, no dependency on Expo's service, full FCM/APNs feature set |
+| Cons | Extra intermediary, Expo rate limits, features limited to what Expo exposes | Two senders to build, handle APNs sandbox vs production yourself |
+
+### Option B — React Native Firebase in Expo
+
+```json title="app.json (excerpt)"
+{
+  "expo": {
+    "ios": {
+      "bundleIdentifier": "com.example.app",
+      "googleServicesFile": "./GoogleService-Info.plist",
+      "infoPlist": { "UIBackgroundModes": ["remote-notification"] },
+      "entitlements": { "aps-environment": "development" }
+    },
+    "android": {
+      "package": "com.example.app",
+      "googleServicesFile": "./google-services.json"
+    },
+    "plugins": [
+      "@react-native-firebase/app",
+      "@react-native-firebase/messaging",
+      ["expo-build-properties", { "ios": { "useFrameworks": "static" } }]
+    ]
+  }
+}
+```
+
+A Notification Service Extension in an Expo project needs a config plugin that adds the extension target (community plugins exist, or write your own with `withXcodeProject`). Never add it by editing the generated `ios/` folder — it will be wiped on the next prebuild.
+
+## Implementation
+
+The code below uses the **modular** React Native Firebase API (the namespaced `messaging()` API is deprecated in recent versions) and Notifee for display. Structure it as a small `notifications/` module that the rest of the app talks to, so you can swap libraries without touching screens:
+
+| File | Responsibility |
+|---|---|
+| `permissions.ts` | Check/request permission, primer logic, open settings |
+| `tokens.ts` | Get token, register with backend, refresh, delete on logout |
+| `display.ts` | Turn a remote message into a local notification (channels, actions, dedupe) |
+| `handlers.ts` | Foreground, background and press/action handlers |
+| `linkBus.ts` | Hand deep links from notification taps to navigation |
+| `index.js` | Registers background handlers **outside React** |
+
+### Permission with a primer
+
+Asking on first launch wastes your one iOS prompt: once denied, the only way back is the Settings app. Show an in-app **primer** at a moment of obvious value ("Get notified when your order ships?") and trigger the system prompt only if the user accepts. The general pattern is covered in the [Permissions guide](permissions.html).
+
+```ts title="src/notifications/permissions.ts"
+import { Linking, PermissionsAndroid, Platform } from 'react-native';
+import {
+  AuthorizationStatus,
+  getMessaging,
+  hasPermission,
+  requestPermission,
+} from '@react-native-firebase/messaging';
+
+export type PushPermission = 'granted' | 'provisional' | 'denied' | 'blocked' | 'undetermined';
+
+const messaging = getMessaging();
+
+function fromIos(status: number): PushPermission {
+  switch (status) {
+    case AuthorizationStatus.AUTHORIZED:
+      return 'granted';
+    case AuthorizationStatus.PROVISIONAL:
+    case AuthorizationStatus.EPHEMERAL:
+      return 'provisional';
+    case AuthorizationStatus.DENIED:
+      return 'blocked'; // iOS never re-prompts: Settings only
+    default:
+      return 'undetermined';
+  }
+}
+
+export async function getPushPermission(): Promise<PushPermission> {
+  if (Platform.OS === 'ios') return fromIos(await hasPermission(messaging));
+  if (Platform.Version < 33) return 'granted'; // no runtime permission (user may still disable in Settings)
+  const granted = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+  return granted ? 'granted' : 'undetermined'; // Android can't tell 'never asked' from 'denied' here
+}
+
+/** Call only after the user accepted your in-app primer. */
+export async function requestPushPermission(opts?: { provisional?: boolean }): Promise<PushPermission> {
+  if (Platform.OS === 'ios') {
+    const status = await requestPermission(messaging, {
+      alert: true,
+      badge: true,
+      sound: true,
+      provisional: opts?.provisional ?? false,
+    });
+    return fromIos(status);
+  }
+  if (Platform.Version < 33) return 'granted';
+  const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+  if (result === PermissionsAndroid.RESULTS.GRANTED) return 'granted';
+  return result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN ? 'blocked' : 'denied';
+}
+
+export function openNotificationSettings(): Promise<void> {
+  return Linking.openSettings();
+}
+```
+
+Track your own "primer shown / declined" state and re-check permission on every foreground (`AppState` → `active`), because users change it in Settings. On Android, check `areNotificationsEnabled` (e.g. `notifee.getNotificationSettings()`) as well: users can disable notifications on any version, and can disable individual channels.
+
+### Token registration, refresh and logout
+
+Register on **every** app start after permission is granted (it is cheap and self-heals missed updates), on token refresh, and whenever the signed-in user changes. Key the device record by an app-generated **installation ID** so a refreshed token replaces the old one instead of creating a duplicate.
+
+```ts title="src/notifications/tokens.ts"
+import { Platform } from 'react-native';
+import DeviceInfo from 'react-native-device-info';
+import { deleteToken, getMessaging, getToken, onTokenRefresh } from '@react-native-firebase/messaging';
+import { api } from '../api/client';
+import { getInstallationId } from '../storage/installationId';
+import { logger } from '../monitoring/logger';
+
+const messaging = getMessaging();
+
+async function upsertDevice(token: string): Promise<void> {
+  const installationId = await getInstallationId();
+  await api.put(`/me/devices/${installationId}`, {
+    provider: 'fcm',
+    token,
+    platform: Platform.OS,
+    appVersion: DeviceInfo.getVersion(),
+    buildNumber: DeviceInfo.getBuildNumber(),
+    osVersion: String(Platform.Version),
+    locale: Intl.DateTimeFormat().resolvedOptions().locale,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  });
+}
+
+/** Returns an unsubscribe function for the refresh listener. */
+export async function registerDeviceForPush(): Promise<() => void> {
+  try {
+    // On iOS this waits for the APNs token (auto-registration is on by default).
+    const token = await getToken(messaging);
+    await upsertDevice(token);
+  } catch (error) {
+    // Typical causes: no network, missing aps-environment, no Play services.
+    logger.warn('push.register_failed', { error });
+  }
+  return onTokenRefresh(messaging, (token) => {
+    upsertDevice(token).catch((error) => logger.warn('push.refresh_failed', { error }));
+  });
+}
+
+/** Call during logout BEFORE clearing the auth session. */
+export async function unregisterDeviceForPush(): Promise<void> {
+  const installationId = await getInstallationId();
+  // 1. Tell the backend while we still have a valid access token.
+  await api.delete(`/me/devices/${installationId}`).catch(() => undefined);
+  // 2. Invalidate the token so a stale server record can't reach this device.
+  await deleteToken(messaging).catch(() => undefined);
+}
+```
+
+> [!CAUTION]
+> Forgetting logout handling is a privacy bug: on a shared or resold device, the previous user keeps receiving notifications (possibly with message previews). Delete the device server-side, delete the token client-side, and on login re-register so the backend **reassigns** the token to the new user.
+
+### Displaying notifications
+
+One function turns a remote message into a local notification. Using the FCM `messageId` (or your own `notificationId`) as the Notifee `id` makes duplicate deliveries replace each other instead of stacking.
+
+```ts title="src/notifications/display.ts"
+import notifee, { AndroidStyle } from '@notifee/react-native';
+import type { FirebaseMessagingTypes } from '@react-native-firebase/messaging';
+
+type RemoteMessage = FirebaseMessagingTypes.RemoteMessage;
+
+function str(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+export async function displayRemoteMessage(message: RemoteMessage): Promise<void> {
+  const data = message.data ?? {};
+  const title = message.notification?.title ?? str(data.title);
+  const body = message.notification?.body ?? str(data.body);
+  if (!title && !body) return; // pure sync message: nothing to show
+
+  const imageUrl = message.notification?.android?.imageUrl ?? str(data.imageUrl);
+  const channelId = message.notification?.android?.channelId ?? str(data.channelId) ?? 'default';
+
+  await notifee.displayNotification({
+    id: str(data.notificationId) ?? message.messageId,
+    title,
+    body,
+    data,
+    android: {
+      channelId,
+      smallIcon: 'ic_notification',
+      color: '#4F46E5',
+      pressAction: { id: 'default' },
+      groupId: str(data.threadId),
+      ...(imageUrl ? { style: { type: AndroidStyle.BIGPICTURE, picture: imageUrl } } : {}),
+    },
+    ios: {
+      threadId: str(data.threadId),
+      categoryId: str(data.category),
+      foregroundPresentationOptions: { banner: true, list: true, sound: true, badge: true },
+    },
+  });
+}
+```
+
+### Foreground messages
+
+When the app is in the foreground, **neither platform shows the notification for you** by default. You get `onMessage` and decide: show a banner, show an in-app toast, silently update state, or suppress it because the user is already looking at that conversation.
+
+```ts title="src/notifications/useForegroundMessages.ts"
+import { useEffect } from 'react';
+import { getMessaging, onMessage } from '@react-native-firebase/messaging';
+import { displayRemoteMessage } from './display';
+import { queryClient } from '../api/queryClient';
+import { useActiveConversation } from '../chat/activeConversation';
+
+export function useForegroundMessages(): void {
+  useEffect(() => {
+    return onMessage(getMessaging(), async (message) => {
+      const data = message.data ?? {};
+
+      if (data.type === 'sync') {
+        await queryClient.invalidateQueries({ queryKey: [data.resource] });
+        return;
+      }
+      // Don't show a banner for the chat the user is currently reading.
+      if (data.conversationId && data.conversationId === useActiveConversation.getState().id) {
+        await queryClient.invalidateQueries({ queryKey: ['messages', data.conversationId] });
+        return;
+      }
+      await displayRemoteMessage(message);
+    });
+  }, []);
+}
+```
+
+On iOS there are two ways to show foreground banners: let RNFB present notification messages via `messaging_ios_foreground_presentation_options` in `firebase.json` (shown earlier), or display them yourself as above. **Pick one**, or you'll get two banners for the same message.
+
+### Background and quit state
+
+Background handlers must be registered at module scope in `index.js`, **before** `AppRegistry.registerComponent`. On Android, React Native Firebase runs them as a Headless JS task — no component tree is mounted, so hooks, context and navigation are unavailable. On iOS, the app is launched in the background and gets roughly 30 seconds.
+
+```js title="index.js"
+import { AppRegistry } from 'react-native';
+import { getMessaging, setBackgroundMessageHandler } from '@react-native-firebase/messaging';
+import notifee from '@notifee/react-native';
+import App from './App';
+import { name as appName } from './app.json';
+import { handleBackgroundMessage, handleNotificationEvent } from './src/notifications/handlers';
+
+// Data-only messages (and, on Android, notification messages too) while backgrounded or killed.
+setBackgroundMessageHandler(getMessaging(), handleBackgroundMessage);
+
+// Presses and action buttons on notifications displayed by Notifee while not in the foreground.
+notifee.onBackgroundEvent(handleNotificationEvent);
+
+AppRegistry.registerComponent(appName, () => App);
+```
+
+```ts title="src/notifications/handlers.ts"
+import notifee, { EventType, type Event } from '@notifee/react-native';
+import type { FirebaseMessagingTypes } from '@react-native-firebase/messaging';
+import { displayRemoteMessage } from './display';
+import { linkBus } from './linkBus';
+import { runIncrementalSync } from '../sync/runIncrementalSync';
+import { api } from '../api/client';
+
+export async function handleBackgroundMessage(
+  message: FirebaseMessagingTypes.RemoteMessage,
+): Promise<void> {
+  const data = message.data ?? {};
+  if (data.type === 'sync') {
+    await runIncrementalSync({ budgetMs: 20_000 }); // stay well inside the OS time budget
+    return;
+  }
+  // Notification messages are already displayed by the OS; only render data-only ones.
+  if (!message.notification) {
+    await displayRemoteMessage(message);
+  }
+}
+
+export async function handleNotificationEvent({ type, detail }: Event): Promise<void> {
+  const data = detail.notification?.data ?? {};
+
+  if (type === EventType.PRESS && typeof data.url === 'string') {
+    linkBus.emit(data.url);
+    return;
+  }
+
+  if (type === EventType.ACTION_PRESS) {
+    if (detail.pressAction?.id === 'reply' && detail.input && typeof data.conversationId === 'string') {
+      await api.post(`/conversations/${data.conversationId}/messages`, { text: detail.input });
+    }
+    if (detail.pressAction?.id === 'mark-read' && typeof data.conversationId === 'string') {
+      await api.post(`/conversations/${data.conversationId}/read`);
+    }
+    if (detail.notification?.id) await notifee.cancelNotification(detail.notification.id);
+  }
+}
+```
+
+> [!WARNING]
+> On iOS, a background message launches the whole app process, and React Native may mount your root component in the background. React Native Firebase exposes `getIsHeadless()` (and an `isHeadless` launch prop) so you can render `null` and skip startup work such as analytics "app open" events or network-heavy bootstrapping when the app was woken only to process a message.
+
+### Handling taps and routing with deep links
+
+Treat a notification tap exactly like an incoming deep link: the payload carries a `url` (e.g. `myapp://orders/1234`), and your navigation's linking config decides where it goes. This gives you one routing table for links, pushes, QR codes and emails — see the [Deep Linking guide](deep-linking.html) for the linking config itself.
+
+Taps arrive from different sources depending on who displayed the notification and the app state:
+
+| Source | App was in background | App was killed |
+|---|---|---|
+| Notification displayed by the OS/FCM (notification message) | `onNotificationOpenedApp` | `getInitialNotification()` |
+| Notification displayed by Notifee | `onForegroundEvent` / `onBackgroundEvent` with `EventType.PRESS` | `notifee.getInitialNotification()` or the press event, depending on platform and version |
+
+A tiny "link bus" decouples those sources from navigation readiness:
+
+```ts title="src/notifications/linkBus.ts"
+type Listener = (url: string) => void;
+
+let listener: Listener | null = null;
+let pending: string | null = null;
+
+export const linkBus = {
+  emit(url: string) {
+    if (listener) listener(url);
+    else pending = url; // navigation not mounted yet (cold start, headless press)
+  },
+  takePending(): string | null {
+    const url = pending;
+    pending = null;
+    return url;
+  },
+  setListener(next: Listener | null) {
+    listener = next;
+  },
+};
+```
+
+```ts title="src/navigation/linking.ts"
+import { Linking } from 'react-native';
+import type { LinkingOptions } from '@react-navigation/native';
+import notifee, { EventType } from '@notifee/react-native';
+import {
+  getInitialNotification,
+  getMessaging,
+  onNotificationOpenedApp,
+} from '@react-native-firebase/messaging';
+import { linkBus } from '../notifications/linkBus';
+import { isAllowedDeepLink } from '../linking/isAllowedDeepLink';
+import { linkingConfig } from './linkingConfig';
+import type { RootStackParamList } from './types';
+
+function urlFrom(data: Record<string, unknown> | undefined): string | null {
+  const url = data?.url;
+  return typeof url === 'string' && isAllowedDeepLink(url) ? url : null;
+}
+
+export const linking: LinkingOptions<RootStackParamList> = {
+  prefixes: ['myapp://', 'https://example.com'],
+  config: linkingConfig,
+
+  async getInitialURL() {
+    // 1. Universal link / custom scheme that launched the app
+    const url = await Linking.getInitialURL();
+    if (url) return url;
+    // 2. Tap on an FCM-displayed notification that launched the app
+    const remote = await getInitialNotification(getMessaging());
+    const fromRemote = urlFrom(remote?.data);
+    if (fromRemote) return fromRemote;
+    // 3. Tap on a Notifee-displayed notification, or a press captured before navigation mounted
+    const local = await notifee.getInitialNotification();
+    return urlFrom(local?.notification.data) ?? linkBus.takePending();
+  },
+
+  subscribe(listener) {
+    linkBus.setListener(listener);
+    const linkSub = Linking.addEventListener('url', ({ url }) => listener(url));
+    const unsubRemote = onNotificationOpenedApp(getMessaging(), (message) => {
+      const url = urlFrom(message.data);
+      if (url) listener(url);
+    });
+    const unsubLocal = notifee.onForegroundEvent(({ type, detail }) => {
+      if (type !== EventType.PRESS) return;
+      const url = urlFrom(detail.notification?.data);
+      if (url) listener(url);
+    });
+    return () => {
+      linkBus.setListener(null);
+      linkSub.remove();
+      unsubRemote();
+      unsubLocal();
+    };
+  },
+};
+```
+
+Validate the URL (`isAllowedDeepLink`) even though it came from "your" push: payloads can be crafted if a token or sender credential leaks, and marketing tools let non-engineers type arbitrary links.
+
+### Channels, actions, badges and topics
+
+Create channels and iOS categories once at startup (idempotent), before any notification can be displayed:
+
+```ts title="src/notifications/setup.ts"
+import { Platform } from 'react-native';
+import notifee, { AndroidImportance } from '@notifee/react-native';
+import { getMessaging, subscribeToTopic, unsubscribeFromTopic } from '@react-native-firebase/messaging';
+
+export async function setupNotificationChannels(): Promise<void> {
+  if (Platform.OS === 'android') {
+    await notifee.createChannels([
+      { id: 'default', name: 'General', importance: AndroidImportance.DEFAULT },
+      { id: 'messages', name: 'Messages', importance: AndroidImportance.HIGH, sound: 'default' },
+      { id: 'orders', name: 'Order updates', importance: AndroidImportance.HIGH },
+      { id: 'marketing', name: 'Offers and news', importance: AndroidImportance.LOW },
+    ]);
+  }
+  // iOS categories are referenced by aps.category in the payload.
+  await notifee.setCategories([
+    {
+      id: 'message',
+      actions: [
+        { id: 'reply', title: 'Reply', input: { placeholderText: 'Write a reply' } },
+        { id: 'mark-read', title: 'Mark as read' },
+      ],
+    },
+  ]);
+}
+
+export async function clearBadge(): Promise<void> {
+  await notifee.setBadgeCount(0);
+}
+
+export async function setMarketingOptIn(optIn: boolean, locale: string): Promise<void> {
+  const topic = `marketing-${locale}`; // topic names: letters, digits and -_.~%
+  const messaging = getMessaging();
+  if (optIn) await subscribeToTopic(messaging, topic);
+  else await unsubscribeFromTopic(messaging, topic);
+}
+```
+
+On Android, action buttons are attached per notification (`android.actions` with a `pressAction` and optional `input`) inside `displayRemoteMessage`. Name channels after what the user controls ("Order updates"), not implementation details — users see these names in Settings.
+
+Topics are subscribed **per app instance**, not per user, so they suit broadcast content (news by locale, marketing). They are a poor fit for per-user or permission-sensitive content: a logged-out device stays subscribed until you unsubscribe it.
+
+### Local and scheduled notifications
+
+```ts title="src/notifications/reminders.ts"
+import notifee, { TriggerType } from '@notifee/react-native';
+
+export async function scheduleCartReminder(cartId: string, at: Date): Promise<string> {
+  return notifee.createTriggerNotification(
+    {
+      id: `cart-${cartId}`, // re-scheduling with the same id replaces the old reminder
+      title: 'Still thinking it over?',
+      body: 'Items in your cart are selling fast.',
+      data: { url: 'myapp://cart' },
+      android: { channelId: 'marketing', smallIcon: 'ic_notification', pressAction: { id: 'default' } },
+    },
+    // Without the alarmManager option Notifee uses inexact scheduling (no exact-alarm permission needed).
+    { type: TriggerType.TIMESTAMP, timestamp: at.getTime() },
+  );
+}
+```
+
+### Expo: the same flows with expo-notifications
+
+```ts title="src/notifications/expoPush.ts"
+import { Platform } from 'react-native';
+import * as Device from 'expo-device';
+import Constants from 'expo-constants';
+import * as Notifications from 'expo-notifications';
+
+// Foreground presentation: decide per notification.
+Notifications.setNotificationHandler({
+  handleNotification: async (notification) => {
+    const silent = notification.request.content.data?.type === 'sync';
+    return {
+      shouldShowBanner: !silent,
+      shouldShowList: !silent,
+      shouldPlaySound: !silent,
+      shouldSetBadge: false,
+    };
+  },
+});
+
+export async function registerForPushAsync(): Promise<{ expoToken: string; deviceToken: string } | null> {
+  if (Platform.OS === 'android') {
+    await Notifications.setNotificationChannelAsync('default', {
+      name: 'General',
+      importance: Notifications.AndroidImportance.DEFAULT,
+    });
+  }
+  if (!Device.isDevice && Platform.OS === 'android') return null; // emulators without Play services
+
+  let { status } = await Notifications.getPermissionsAsync();
+  if (status !== 'granted') {
+    ({ status } = await Notifications.requestPermissionsAsync());
+  }
+  if (status !== 'granted') return null;
+
+  const projectId = Constants.expoConfig?.extra?.eas?.projectId ?? Constants.easConfig?.projectId;
+  if (!projectId) throw new Error('Missing EAS projectId');
+
+  const expoToken = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+  const deviceToken = String((await Notifications.getDevicePushTokenAsync()).data);
+  return { expoToken, deviceToken };
+}
+```
+
+| React Native Firebase | expo-notifications |
+|---|---|
+| `onMessage` | `addNotificationReceivedListener` (+ `setNotificationHandler` for presentation) |
+| `setBackgroundMessageHandler` | `TaskManager.defineTask(name, ...)` + `Notifications.registerTaskAsync(name)` |
+| `onNotificationOpenedApp` / `getInitialNotification` | `addNotificationResponseReceivedListener` / `getLastNotificationResponseAsync()` (or `useLastNotificationResponse`) |
+| `onTokenRefresh` | `addPushTokenListener` |
+| Notifee channels, categories, triggers | `setNotificationChannelAsync`, `setNotificationCategoryAsync`, `scheduleNotificationAsync` |
+
+## Behaviour matrix
+
+What happens for each combination, using React Native Firebase (expo-notifications maps onto the same OS behaviour with the listeners from the table above). "Killed" means swiped away from recents / app switcher; Android's **Force stop** in Settings is a different, stricter state.
+
+| App state | Message type | Android | iOS |
+|---|---|---|---|
+| Foreground | Notification (+ data) | `onMessage` fires. **Nothing is shown** unless you display it | `onMessage` fires. Not shown unless foreground presentation options are set or you display it locally |
+| Foreground | Data-only | `onMessage` fires | `onMessage` fires (send with `content-available: 1` for consistent delivery) |
+| Background | Notification (+ data) | FCM SDK shows it in the tray using the payload/default channel. RNFB also invokes `setBackgroundMessageHandler`. Tap → `onNotificationOpenedApp` | iOS shows it. JS handler runs **only** if `content-available: 1` is also set. Tap → `onNotificationOpenedApp` |
+| Background | Data-only | `setBackgroundMessageHandler` in a headless task. Timing depends on priority, Doze and App Standby bucket. Nothing shown unless you display | Requires `content-available: 1`, `apns-push-type: background`, `apns-priority: 5`. Handler gets about 30 s. Throttled; may be delayed or dropped |
+| Killed | Notification (+ data) | Shown by the system; headless handler also runs. Tap launches app → `getInitialNotification()` | Shown by iOS. Tap launches app → `getInitialNotification()` |
+| Killed | Data-only | Process started for a headless task → handler (some OEMs block this for "swiped" apps) | **Not delivered** if the user force-quit the app. If the system terminated it, iOS may relaunch it in the background |
+| Force-stopped (Settings) | Any | **Nothing is delivered** until the user opens the app again | — |
+
+> [!IMPORTANT]
+> Notification messages are the only type with an OS-level display guarantee in every state. Everything that depends on your JS running in the background is best-effort.
+
+## Runtime flows
+
+### Foreground
+
+```mermaid
+sequenceDiagram
+    participant BE as Backend
+    participant PS as FCM or APNs
+    participant OS as OS
+    participant JS as onMessage handler
+    participant N as Notifee
+    participant U as User
+    BE->>PS: send notification plus data
+    PS->>OS: deliver
+    OS->>JS: app is foreground, hand message to app
+    Note over OS,JS: No banner is shown by default
+    alt user is viewing this conversation
+        JS->>JS: refresh data in place, no banner
+    else otherwise
+        JS->>N: displayNotification with presentation options
+        N->>OS: post local notification
+        OS->>U: banner
+        U->>OS: tap
+        OS->>N: PRESS event
+        N->>JS: onForegroundEvent, route url via linking
+    end
+```
+*Figure: Foreground delivery. The app owns the decision to show, suppress or merge the notification.*
+
+### Background (data-only / silent)
+
+```mermaid
+sequenceDiagram
+    participant BE as Backend
+    participant FCM as FCM
+    participant APNs as APNs
+    participant OS as OS
+    participant H as Background handler
+    participant API as Your API
+    BE->>FCM: data-only, android high, apns background priority 5
+    alt Android
+        FCM->>OS: deliver via Google Play services
+        OS->>H: start headless JS task
+    else iOS
+        FCM->>APNs: forward with content-available 1
+        APNs->>OS: deliver when the system budget allows
+        OS->>H: wake app for about 30 seconds
+    end
+    H->>API: fetch changes since last sync
+    API-->>H: delta
+    H->>H: persist to local database
+    opt needs user attention
+        H->>OS: display local notification
+    end
+    H-->>OS: resolve promise, task ends
+```
+*Figure: Background processing. Keep the work small, idempotent and inside the time budget.*
+
+### Killed → tap → open
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant OS as OS
+    participant Native as Native launch
+    participant JS as JS runtime
+    participant Nav as NavigationContainer
+    participant Screen as Order screen
+    Note over OS: Notification is in the tray, app is not running
+    U->>OS: tap notification
+    OS->>Native: launch app with notification payload
+    Native->>JS: load bundle, mount App
+    JS->>JS: restore session from secure storage
+    Nav->>JS: linking.getInitialURL
+    JS->>JS: getInitialNotification returns the message
+    JS-->>Nav: myapp://orders/1234
+    Nav->>Nav: getStateFromPath builds Home then Order
+    Nav->>Screen: render with orderId 1234
+    Screen->>JS: track notification_opened with notificationId
+```
+*Figure: Cold start from a notification tap. The URL flows through the same linking config as any deep link.*
+
+## Backend
+
+### Sending with firebase-admin (FCM HTTP v1)
+
+```ts title="server/push/fcm.ts"
+import { cert, initializeApp } from 'firebase-admin/app';
+import { getMessaging, type Message } from 'firebase-admin/messaging';
+
+// In GCP, prefer applicationDefault() with workload identity over a JSON key file.
+initializeApp({ credential: cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT!)) });
+
+export interface OrderShippedInput {
+  token: string;
+  orderId: string;
+  notificationId: string;
+  unreadCount: number;
+  imageUrl?: string;
+}
+
+export function buildOrderShipped(input: OrderShippedInput): Message {
+  const collapseId = `order-${input.orderId}`;
+  return {
+    token: input.token,
+    notification: {
+      title: 'Your order has shipped',
+      body: `Order ${input.orderId} is on its way.`,
+    },
+    // FCM data values must be strings.
+    data: {
+      type: 'order_shipped',
+      orderId: input.orderId,
+      notificationId: input.notificationId,
+      url: `myapp://orders/${input.orderId}`,
+    },
+    android: {
+      priority: 'high',
+      ttl: 6 * 60 * 60 * 1000, // ms; stale after 6 hours
+      collapseKey: collapseId,
+      notification: {
+        channelId: 'orders',
+        tag: collapseId, // replaces an earlier notification with the same tag
+        icon: 'ic_notification',
+        color: '#4F46E5',
+        imageUrl: input.imageUrl,
+      },
+    },
+    apns: {
+      headers: {
+        'apns-push-type': 'alert',
+        'apns-priority': '10',
+        'apns-collapse-id': collapseId,
+        'apns-expiration': String(Math.floor(Date.now() / 1000) + 6 * 60 * 60),
+      },
+      payload: {
+        aps: {
+          sound: 'default',
+          badge: input.unreadCount,
+          mutableContent: true, // lets the Notification Service Extension attach the image
+          threadId: 'orders',
+          'interruption-level': 'active',
+        },
+      },
+      fcmOptions: input.imageUrl ? { imageUrl: input.imageUrl } : undefined,
+    },
+  };
+}
+
+export async function sendOne(message: Message): Promise<string> {
+  return getMessaging().send(message); // resolves to the FCM message ID
+}
+```
+
+For many devices, use `sendEach` (array of up to 500 messages) or `sendEachForMulticast` (same message to up to 500 tokens). The older `sendAll` / `sendMulticast` relied on the retired batch endpoint and are deprecated.
+
+### Raw HTTP v1 request
+
+Under the hood each message is one HTTPS call authenticated with a short-lived OAuth2 access token minted from a service account (scope `https://www.googleapis.com/auth/firebase.messaging`). Any language can do this:
+
+```ts title="server/push/accessToken.ts"
+import { GoogleAuth } from 'google-auth-library';
+
+const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/firebase.messaging'] });
+
+export async function getFcmAccessToken(): Promise<string> {
+  const client = await auth.getClient(); // caches and refreshes the ~1 h token
+  const { token } = await client.getAccessToken();
+  if (!token) throw new Error('Could not mint FCM access token');
+  return token;
+}
+```
+
+```http
+POST https://fcm.googleapis.com/v1/projects/my-project-id/messages:send
+Authorization: Bearer ya29.a0AfB_byC...
+Content-Type: application/json
+
+{
+  "message": {
+    "token": "fcm-registration-token",
+    "notification": { "title": "Your order has shipped", "body": "Order 1234 is on its way." },
+    "data": { "type": "order_shipped", "orderId": "1234", "url": "myapp://orders/1234" },
+    "android": {
+      "priority": "high",
+      "ttl": "21600s",
+      "collapse_key": "order-1234",
+      "notification": { "channel_id": "orders", "tag": "order-1234", "image": "https://cdn.example.com/p/1234.jpg" }
+    },
+    "apns": {
+      "headers": { "apns-push-type": "alert", "apns-priority": "10", "apns-collapse-id": "order-1234" },
+      "payload": { "aps": { "sound": "default", "mutable-content": 1, "thread-id": "orders" } },
+      "fcm_options": { "image": "https://cdn.example.com/p/1234.jpg" }
+    }
+  }
+}
+```
+
+Note the JSON wire format uses snake_case (`collapse_key`, `channel_id`) and TTL as a duration string, while the Admin SDK uses camelCase and milliseconds.
+
+**Silent / data-only payload** (background sync):
+
+```json
+{
+  "message": {
+    "token": "fcm-registration-token",
+    "data": { "type": "sync", "resource": "inbox" },
+    "android": { "priority": "normal" },
+    "apns": {
+      "headers": { "apns-push-type": "background", "apns-priority": "5" },
+      "payload": { "aps": { "content-available": 1 } }
+    }
+  }
+}
+```
+
+Use Android `high` priority for a data message only when it will result in a user-visible notification (e.g. an E2E-encrypted chat message you decrypt and display); FCM can deprioritise apps that abuse it.
+
+**Error format** — a dead token returns HTTP 404 with `UNREGISTERED`:
+
+```json
+{
+  "error": {
+    "code": 404,
+    "message": "Requested entity was not found.",
+    "status": "NOT_FOUND",
+    "details": [
+      { "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError", "errorCode": "UNREGISTERED" }
+    ]
+  }
+}
+```
+
+| FCM error | HTTP | Meaning | Action |
+|---|---|---|---|
+| `UNREGISTERED` | 404 | App uninstalled, token expired or deleted | Disable token immediately |
+| `INVALID_ARGUMENT` | 400 | Malformed token **or** invalid payload | Check the message; prune only if the token itself is invalid (Admin SDK: `messaging/invalid-registration-token`) |
+| `SENDER_ID_MISMATCH` | 403 | Token belongs to a different Firebase project | Wrong credentials/environment; disable token for this project |
+| `QUOTA_EXCEEDED` | 429 | Project or per-device rate exceeded | Back off (honour `Retry-After`), slow down |
+| `UNAVAILABLE` / `INTERNAL` | 503 / 500 | Transient FCM issue | Retry with exponential backoff and jitter |
+| `THIRD_PARTY_AUTH_ERROR` | 401 | APNs rejected FCM's credentials (bad/missing `.p8`, wrong Team ID) | Fix the APNs key in Firebase settings |
+
+### Direct APNs (HTTP/2 + JWT)
+
+If you send to iOS without FCM, you call APNs yourself: HTTP/2 to `api.push.apple.com` (production) or `api.sandbox.push.apple.com` (development tokens), authenticated with an ES256 JWT signed by your `.p8` key.
+
+```ts title="server/push/apns.ts"
+import http2 from 'node:http2';
+import jwt from 'jsonwebtoken';
+
+const { APNS_KEY_ID, APPLE_TEAM_ID, APNS_P8, IOS_BUNDLE_ID } = process.env as Record<string, string>;
+
+let cached: { token: string; issuedAt: number } | null = null;
+
+function providerToken(): string {
+  const now = Math.floor(Date.now() / 1000);
+  // Apple rejects tokens older than 1 hour and throttles refreshing more often than every 20 minutes.
+  if (!cached || now - cached.issuedAt > 50 * 60) {
+    const token = jwt.sign({ iss: APPLE_TEAM_ID, iat: now }, APNS_P8, {
+      algorithm: 'ES256',
+      header: { alg: 'ES256', kid: APNS_KEY_ID },
+    });
+    cached = { token, issuedAt: now };
+  }
+  return cached.token;
+}
+
+// Reuse one long-lived HTTP/2 session; opening a connection per push gets you throttled.
+const session = http2.connect('https://api.push.apple.com');
+
+export function sendApns(deviceToken: string, payload: object, collapseId?: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = session.request({
+      ':method': 'POST',
+      ':path': `/3/device/${deviceToken}`,
+      authorization: `bearer ${providerToken()}`,
+      'apns-topic': IOS_BUNDLE_ID,
+      'apns-push-type': 'alert',
+      'apns-priority': '10',
+      ...(collapseId ? { 'apns-collapse-id': collapseId } : {}),
+      'content-type': 'application/json',
+    });
+    let status = 0;
+    req.on('response', (headers) => { status = Number(headers[':status']); });
+    req.on('error', reject);
+    req.on('end', () => resolve(status)); // 200 ok, 410 Unregistered, 400 BadDeviceToken...
+    req.resume();
+    req.end(JSON.stringify(payload));
+  });
+}
+```
+
+In production use a maintained client (for example `@parse/node-apn` or `apns2`) that handles reconnects, GOAWAY frames and response bodies. APNs returns `410 Unregistered` for dead tokens (prune) and `400 BadDeviceToken` for malformed tokens or tokens sent to the **wrong environment** — log the environment before pruning on that error.
+
+### Token storage schema
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid, PK | |
+| `installation_id` | text, **unique** | App-generated per install; upsert key so refreshes replace tokens |
+| `user_id` | uuid, nullable, indexed | Null for pre-login installs; reassigned on login |
+| `provider` | enum `fcm` / `apns` / `expo` | Which sender to use |
+| `token` | text, **unique** | If a token shows up under another user, move it (shared devices) |
+| `platform` | enum `ios` / `android` | |
+| `apns_environment` | enum `sandbox` / `production`, nullable | Only for direct APNs tokens |
+| `app_version`, `build_number`, `os_version` | text | Target payload features, debug per-version issues |
+| `locale`, `timezone` | text | Localised copy, quiet hours |
+| `last_registered_at` | timestamptz | Updated on every app open; drives staleness pruning |
+| `disabled_at`, `disabled_reason` | timestamptz, text | Soft-disable on `UNREGISTERED` / 410 for auditability |
+
+Firebase's token-management guidance boils down to: refresh the token and its timestamp on app open, treat tokens that haven't been refreshed for about two months as stale and stop sending to them, and delete on explicit errors. Stale tokens waste quota and skew delivery metrics.
+
+### Fan-out at scale
+
+```mermaid
+flowchart TD
+    Trigger["Domain event or campaign"] --> Plan["Resolve audience<br/>prefs, quiet hours, frequency caps"]
+    Plan --> Outbox[("Notification outbox<br/>idempotency key")]
+    Outbox --> Queue["Queue: jobs of up to 500 tokens"]
+    Queue --> Workers["Send workers<br/>bounded concurrency"]
+    Workers -->|"sendEach, HTTP v1"| FCM["FCM"]
+    Workers -.->|"direct iOS path"| APNs["APNs"]
+    FCM --> Result{"Per-token result"}
+    APNs --> Result
+    Result -->|"success"| Log[("Delivery log and metrics")]
+    Result -->|"404 UNREGISTERED or 410"| Prune["Disable token"]
+    Result -->|"429 or 5xx"| Retry["Retry with backoff and jitter"]
+    Retry --> Queue
+```
+*Figure: A scalable sending pipeline. The outbox makes sends idempotent; the queue absorbs bursts and rate limits.*
+
+- **Don't send from the request path.** Write a row to an outbox in the same transaction as the domain change, and let workers send. This survives crashes and makes retries safe.
+- **Batch and bound concurrency.** `sendEach` in chunks of 500, a fixed number of concurrent batches per worker, and a global rate limiter. FCM enforces a per-project sending quota (visible in the Google Cloud console) and per-device limits; bursts to a single device get throttled.
+- **Use topics for true broadcasts** (breaking news to everyone in a locale). FCM does the fan-out, but you lose per-user personalisation, per-token error feedback and exact targeting.
+- **Respect the user**: quiet hours by device timezone, frequency caps, per-category preferences stored server-side (mirroring Android channels), and localisation using the device locale.
+- **Retry only what's retryable**: 429/5xx with exponential backoff and jitter honouring `Retry-After`; never retry 400/404.
+
+### Idempotency and analytics
+
+FCM and APNs sends are **not idempotent** — a timeout after the request left your server can still result in delivery, and a retry means a duplicate. Defend in layers:
+
+1. **Outbox key** such as `(event_id, user_id, template)` with a unique constraint, so the same event never enqueues twice.
+2. **Collapse identifiers** (`apns-collapse-id`, Android `tag` / `collapse_key`) so a duplicate replaces rather than stacks.
+3. **Client dedupe**: put a `notificationId` in `data` and use it as the local notification ID.
+
+For analytics, include `notificationId`, `campaign` and `type` in every payload. Log `notification_opened` on tap (from the handlers above), `notification_received` from foreground/background handlers where they run, and on iOS optionally a delivery beacon from the Notification Service Extension. FCM also provides aggregated delivery data for Android (console reports and BigQuery export). Report on **open rate per category** and **opt-out rate after sends** — the latter tells you when you're over-notifying. See [Monitoring, Crash Reporting & Analytics](monitoring.html).
+
+## Edge cases & gotchas
+
+- **Double notifications on Android.** A notification message is displayed by the FCM SDK while backgrounded, and RNFB also runs your background handler. If that handler calls `displayNotification` unconditionally, users see two. Only display data-only messages in the background handler.
+- **Taps handled twice or not at all.** Notifications displayed by the OS report taps via RNFB; notifications displayed by Notifee report taps via Notifee. Know which path displayed each notification and wire both into the same router.
+- **Cold-start race.** Calling `navigation.navigate` from a tap handler before the `NavigationContainer` is ready silently does nothing. Route through `linking.getInitialURL` / `subscribe` (or a pending-link buffer) instead of navigating imperatively.
+- **Environment mix-ups.** Dev builds get sandbox APNs tokens; TestFlight/App Store builds get production tokens. With FCM this is handled for you (as long as the APNs key covers both environments); with direct APNs, store the environment per token. Use separate Firebase projects per environment so a staging backend can never notify production users.
+- **Payload size.** About 4 KB total. Send IDs and fetch details, rather than embedding content. Custom data keys add up quickly in the `apns` and `android` overrides.
+- **Localisation.** Push copy is rendered by the OS, not your JS bundle. Localise on the server using the stored device locale, or use APNs `loc-key` / Android `title_loc_key` with strings bundled in the app.
+- **Custom sounds.** iOS sounds must be bundled in the app (`.caf`, `.aiff` or `.wav`, 30 seconds max). On Android the sound belongs to the **channel** (`res/raw`), so changing it means a new channel.
+- **Android 14 full-screen intents** are restricted to calling and alarm apps; other apps lose the permission by default.
+- **Sensitive content on the lock screen.** Previews may be visible to anyone holding the phone. For banking/health, send generic text ("You have a new message") and fetch details after unlock, or decrypt in the NSE. Set Android `visibility` to private/secret where appropriate.
+- **iOS notification summaries.** Recent iOS versions can batch non-time-sensitive notifications into scheduled summaries and, on supported devices, summarise their text. Write titles that still make sense when summarised.
+- **Devices without Google Play services.** FCM doesn't work there. If those markets matter, add vendor push (HMS Push Kit etc.) behind the same backend abstraction.
+
+## Testing & debugging
+
+**Firebase console**: Messaging → create a notification campaign → "Send test message" → paste an FCM token. Quick for checking display, but it can only send notification messages with limited options.
+
+**curl to FCM HTTP v1** (for testing, a token minted with `gcloud` using a service account works; the `cloud-platform` scope is accepted):
+
+```bash
+ACCESS_TOKEN=$(gcloud auth print-access-token)
+curl -sS -X POST \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://fcm.googleapis.com/v1/projects/my-project-id/messages:send" \
+  -d '{
+    "message": {
+      "token": "PASTE_FCM_TOKEN",
+      "notification": { "title": "Test", "body": "Hello from curl" },
+      "data": { "url": "myapp://orders/1234" },
+      "apns": { "payload": { "aps": { "sound": "default" } } }
+    }
+  }'
+```
+
+**Direct APNs with curl** (you need a JWT generated from the `.p8`):
+
+```bash
+curl -v --http2 \
+  -H "authorization: bearer $APNS_JWT" \
+  -H "apns-topic: com.example.app" \
+  -H "apns-push-type: alert" \
+  -H "apns-priority: 10" \
+  -d '{"aps":{"alert":{"title":"Test","body":"Direct APNs"},"sound":"default"}}' \
+  "https://api.sandbox.push.apple.com/3/device/$DEVICE_TOKEN"
+```
+
+**iOS Simulator**: `xcrun simctl push` injects a payload locally — no APNs, no token, no server. It is ideal for iterating on presentation, categories and tap routing. Put the payload in a `.apns` file (you can also drag the file onto the simulator window):
+
+```json title="payload.apns"
+{
+  "Simulator Target Bundle": "com.example.app",
+  "aps": {
+    "alert": { "title": "Order shipped", "body": "Order 1234 is on its way" },
+    "sound": "default",
+    "badge": 1,
+    "thread-id": "orders"
+  },
+  "url": "myapp://orders/1234"
+}
+```
+
+```bash
+xcrun simctl push booted com.example.app payload.apns
+```
+
+Because simulated pushes bypass APNs and FCM, they don't prove that your tokens, credentials or backend work, and they may not flow through the Firebase SDK exactly like a real FCM message. For an end-to-end test on a simulator, use one running iOS 16+ on macOS 13+ with Apple silicon or a T2 chip, which registers with the APNs sandbox and receives real pushes. Apple's **Push Notifications Console** in the developer account can also send test pushes and look up delivery logs for a push by its ID.
+
+**Android**:
+
+```bash
+# FCM, notification and JS logs
+adb logcat | grep -iE "FirebaseMessaging|FCM|ReactNativeJS|Notifee"
+
+# What the system thinks is posted, including channel and importance
+adb shell dumpsys notification --noredact | grep -A 20 com.example.app
+
+# Simulate Doze (screen off), then send a normal- vs high-priority data message
+adb shell dumpsys deviceidle force-idle
+adb shell dumpsys deviceidle unforce
+
+# Push the app into a restrictive App Standby bucket
+adb shell am set-standby-bucket com.example.app rare
+
+# Reproduce "force stopped" (no messages delivered until next launch)
+adb shell am force-stop com.example.app
+
+# Reset the Android 13+ notification permission to test the prompt again
+adb shell pm revoke com.example.app android.permission.POST_NOTIFICATIONS
+```
+
+**iOS device logs**: in macOS Console.app, select the device and filter by your process plus `apsd` (push daemon) and `dasd` (background scheduling) to see whether a silent push arrived and whether it was deferred.
+
+Add a hidden **debug screen** in internal builds that shows the current token, permission status, channel states and the last received payload, with a copy button. It pays for itself the first time QA reports "no notifications".
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| iOS: `getToken()` fails or never resolves | No APNs token: missing Push Notifications capability, swizzling disabled without manual forwarding, no network, or an old simulator | Add the capability, keep `FirebaseAppDelegateProxyEnabled` default or forward tokens manually, test on device or a supported simulator |
+| iOS: "no valid aps-environment entitlement string found" | Entitlement missing or provisioning profile generated before push was enabled | Add the capability, regenerate profiles (or let automatic signing / EAS sync capabilities), clean build |
+| FCM send returns `THIRD_PARTY_AUTH_ERROR` for iOS tokens | APNs key not uploaded to Firebase, wrong Key ID/Team ID, or key restricted to another environment/topic | Re-upload the `.p8` with the correct IDs in Firebase Cloud Messaging settings |
+| Notification not shown while app is open | Expected: foreground messages aren't displayed by default | Display locally in `onMessage`, or configure iOS foreground presentation options |
+| Android 13+: nothing ever appears | `POST_NOTIFICATIONS` not declared or not granted | Declare it, request it after a primer, check `areNotificationsEnabled` |
+| Android: white square icon | Coloured small icon | Use a white-on-transparent notification icon and set `default_notification_icon` |
+| Android: notifications land in "Miscellaneous" | Referenced channel not created, or no default channel configured | Create channels at startup; set the default channel in `firebase.json` / manifest |
+| Data-only messages arrive late or never on some Android phones | Doze, App Standby buckets, OEM battery optimisation (aggressive on some Xiaomi, Huawei, OPPO, vivo, Samsung builds), app force-stopped, normal priority | Use notification messages for user-visible content; `priority: high` only for user-visible data messages; guide users to exempt the app from battery optimisation if critical; sync on app open |
+| iOS silent pushes arrive sporadically | System throttling (budget, Low Power Mode, low usage), wrong headers | `apns-push-type: background`, `apns-priority: 5`, no alert keys; send sparingly; don't rely on them for correctness |
+| iOS silent pushes never arrive after user swipes app away | Force-quit apps aren't launched for background pushes | Expected behaviour; the next app open must sync |
+| Works in debug, fails in TestFlight (direct APNs) | Sandbox vs production mismatch: production tokens sent to sandbox or vice versa (`BadDeviceToken`) | Store environment per token and route to the matching APNs host |
+| Image not shown in iOS notification | No NSE, missing `mutable-content: 1`, NSE deployment target too high, non-HTTPS or slow image URL, file without a recognisable extension | Add/fix the extension, set the flag, lower the target, serve small HTTPS images quickly |
+| Tap opens the app but not the right screen on cold start | Navigating before the navigator is ready, or `getInitialNotification` not consulted | Resolve the tap in `linking.getInitialURL` and `subscribe` |
+| `SENDER_ID_MISMATCH` errors | Tokens from a different Firebase project (e.g. staging app, prod backend) | Separate token tables or tag tokens with their project |
+| Manifest merger failed on `default_notification_color` | Declared in both manifest and RNFB's `firebase.json` | Use one place, or `tools:replace` |
+
+## Production checklist
+
+- [ ] APNs `.p8` key created, uploaded to Firebase (or configured in your APNs sender), stored in a secrets manager with an owner
+- [ ] Push Notifications and Background Modes → Remote notifications enabled; `aps-environment` verified in the signed archive
+- [ ] Separate Firebase projects / credentials for dev, staging and production
+- [ ] Android small icon (monochrome, transparent) and accent colour configured
+- [ ] Android channels created at startup with user-meaningful names and correct importance
+- [ ] Android 13+ `POST_NOTIFICATIONS` declared and requested after an in-app primer; iOS prompt shown in context (or provisional used deliberately)
+- [ ] Permission re-checked on every foreground; settings deep link offered when blocked
+- [ ] Token registered on every launch, on refresh, and on login; deleted on logout (server first, then `deleteToken`)
+- [ ] Backend upserts by installation ID, reassigns tokens between users, prunes on `UNREGISTERED` / 410, expires stale tokens
+- [ ] Sending goes through an outbox + queue with retries, backoff, rate limiting and idempotency keys
+- [ ] Notification messages used for anything user-critical; data-only used only as an optimisation
+- [ ] Foreground handling decided per message type; no duplicate banners
+- [ ] Background handlers registered in `index.js`, idempotent, within time budgets; headless launches don't run app bootstrap
+- [ ] Taps route through the deep-link system for background and cold start, with URL validation
+- [ ] Collapse IDs / tags used for updating notifications; TTL / expiration set on time-bound messages
+- [ ] Rich notification extension tested on the oldest supported iOS version
+- [ ] Quiet hours, frequency caps and per-category preferences enforced server-side
+- [ ] Sensitive content kept off the lock screen where appropriate
+- [ ] Analytics: `notificationId` in every payload, open tracking, opt-out monitoring, delivery metrics
+- [ ] Tested on physical iOS and Android devices (including at least one aggressive-OEM Android phone) in foreground, background, killed and Doze states
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [Firebase Cloud Messaging documentation](https://firebase.google.com/docs/cloud-messaging)
+- [FCM HTTP v1 API — sending messages](https://firebase.google.com/docs/cloud-messaging/send/v1-api)
+- [React Native Firebase — Cloud Messaging](https://rnfirebase.io/messaging/usage)
+- [Expo push notifications overview](https://docs.expo.dev/push-notifications/overview/)
+- [Apple — User Notifications framework](https://developer.apple.com/documentation/usernotifications)
+- [Android — Notification runtime permission](https://developer.android.com/develop/ui/views/notifications/notification-permission)
+
+## Interview questions
+
+### Walk me through how a push notification gets from your backend to an iPhone when you use FCM.
+
+The app requests permission and calls `registerForRemoteNotifications`; APNs issues a device token to the OS, the Firebase SDK captures it (via swizzling) and exchanges it with FCM for an FCM registration token, which the app sends to our backend along with user, installation ID, platform and app version. To send, the backend mints a short-lived OAuth2 token from a service account and calls FCM HTTP v1 `messages:send` with the token and a payload containing `apns` overrides. FCM authenticates to APNs using the `.p8` key we uploaded to Firebase and forwards the message; APNs delivers it over the device's persistent `apsd` connection, and iOS displays it (notification message) or wakes the app (`content-available`). On Android the same FCM call is delivered by Google Play services directly. A senior answer also mentions the failure modes: sandbox vs production tokens, token rotation, and APNs keeping only the latest message for offline devices.
+
+### What is the difference between notification messages and data messages, and when do you use each?
+
+A notification message contains a `notification`/`aps.alert` block and is displayed by the OS when the app is backgrounded or killed, without running your code; in the foreground it goes to `onMessage` and isn't shown by default. A data-only message carries only key/value data, is never displayed automatically, and relies on your JS running (headless task on Android, background launch on iOS with `content-available: 1`), which is subject to Doze, OEM battery policies, iOS throttling and force-quit rules. Use notification messages for anything the user must see; use data messages for background sync, silent state updates, or content you must transform before display (E2E decryption) — and even then prefer `mutable-content` + NSE on iOS for user-visible content. Knowing the full behaviour matrix per state and platform is what interviewers are probing for.
+
+### Why might data-only pushes not arrive on some Android devices, and what do you do about it?
+
+Causes: the app was **force-stopped** (no delivery until next launch); **Doze** and **App Standby buckets** defer normal-priority messages; some OEM ROMs kill background processes or block headless starts for apps swiped away; `priority: normal` was used for something time-critical, or FCM deprioritised `high` messages that never produced a visible notification; the device lacks Google Play services. Mitigations: send notification messages for user-visible content so the system displays them; reserve `high` priority for data messages that immediately produce a notification; make the app sync on foreground so correctness never depends on a push; for critical use cases, detect aggressive battery optimisation and guide users to exempt the app; test with `adb shell dumpsys deviceidle force-idle` and on real OEM devices.
+
+### How do you make a notification tap open the right screen, including from a cold start?
+
+Put a `url` in the payload and route it through the same linking configuration used for universal links, rather than calling `navigate` imperatively. For the killed state, `linking.getInitialURL` checks `Linking.getInitialURL()`, then `getInitialNotification()` (FCM-displayed) and the display library's initial notification (locally displayed). For the background state, `linking.subscribe` listens to `onNotificationOpenedApp` and the display library's press events and forwards the URL to React Navigation's listener. Taps that happen before navigation mounts are buffered. Validate the URL against an allowlist, and ensure auth-gated destinations resume after login. Track `notification_opened` with the `notificationId`.
+
+### How do you manage device tokens on the backend?
+
+Tokens are volatile: one user has many devices, and a device's token changes on reinstall, restore, data clear or rotation. Store one row per app installation (upsert by an app-generated installation ID) with token, provider, platform, app version, locale, timezone and `last_registered_at`, updated on every launch and `onTokenRefresh`. On login, reassign the token to the new user; on logout, delete the device server-side and call `deleteToken` on the client. Prune on `UNREGISTERED` (404) from FCM and `410 Unregistered` from APNs, be careful with `BadDeviceToken` (could be an environment mismatch), and stop sending to tokens that haven't been refreshed in about two months. Never key tokens only by user, or you'll overwrite other devices.
+
+### How reliable are silent pushes on iOS, and what would you use for data that must be up to date?
+
+They are explicitly best-effort. They require `content-available: 1`, no alert, `apns-push-type: background` and priority 5; iOS budgets them based on battery, Low Power Mode and app usage, may coalesce or delay them, gives the app about 30 seconds, and does not deliver them at all to apps the user force-quit. So they're an optimisation to pre-warm caches. Correctness comes from syncing on app foreground, pull-to-refresh, background app refresh / `BGTaskScheduler` as another best-effort path, and, for user-visible content, sending a normal alert with `mutable-content` so the NSE can enrich or decrypt it with a much stronger delivery guarantee.
+
+### Design a system that sends a campaign notification to ten million users.
+
+Separate audience resolution from sending: a planner queries eligible users (opt-in, category preferences, quiet hours by timezone, frequency caps) and writes send jobs to an outbox keyed by `(campaign_id, device_id)` for idempotency. Workers pull jobs from a queue in batches of 500 tokens and call `sendEach` with bounded concurrency and a global rate limiter sized to the FCM project quota; results are processed per token — prune dead tokens, retry 429/5xx with backoff and jitter, record successes. Stagger delivery by timezone and throttle to protect your own API from the thundering herd of opens. For truly identical broadcasts, FCM topics offload fan-out at the cost of per-token feedback and personalisation. Instrument sent/failed/opened per campaign and monitor opt-out spikes; have a kill switch to stop a bad campaign mid-flight.
+
+### How do rich notifications with images work on each platform?
+
+On iOS you add a Notification Service Extension target; the push includes an `alert` and `mutable-content: 1`, iOS runs the extension with about 30 seconds to download the image and attach it as a `UNNotificationAttachment`, and `serviceExtensionTimeWillExpire` must deliver a fallback. With FCM you set `apns.fcm_options.image` and can use the Firebase helper in the extension. Gotchas: the extension's deployment target, App Group sharing, image size and HTTPS. On Android, FCM notification messages with `android.notification.image` are downloaded and shown as big-picture style by the SDK; for data messages, you display them yourself with a big-picture style. Action buttons are iOS categories referenced by `aps.category`, and per-notification actions on Android (requiring data messages plus local display).
+
+### How do you maximise notification opt-in without annoying users?
+
+Don't prompt at launch. Show an in-app primer tied to a clear benefit at the moment it matters (after placing an order, when following someone), and trigger the system prompt only on acceptance, because iOS allows one prompt and Android 13+ stops asking after repeated denials. Consider iOS provisional authorization to deliver quietly first. Offer granular categories (Android channels plus server-side preferences) so users can reduce noise instead of disabling everything, respect quiet hours, and measure opt-out rates after campaigns. When permission is blocked, explain and deep link to Settings rather than nagging. Details are in the [Permissions guide](permissions.html).
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

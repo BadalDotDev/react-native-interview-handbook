@@ -1,0 +1,1006 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OTA Updates · React Native Interview Handbook</title>
+<meta name="description" content="Over-the-air (OTA) updates let you ship JavaScript and asset changes to installed React Native apps in minutes, without a store review. This guide covers what OTA can and…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="OTA Updates · React Native Interview Handbook">
+<meta property="og:description" content="Over-the-air (OTA) updates let you ship JavaScript and asset changes to installed React Native apps in minutes, without a store review. This guide covers what OTA can and…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/ota-updates.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# OTA Updates
+
+Over-the-air (OTA) updates let you ship JavaScript and asset changes to installed React Native apps in minutes, without a store review. This guide covers what OTA can and cannot change, store policy, the post-CodePush landscape in 2026, a deep dive into EAS Update (including bare React Native), self-hosted architectures, rollout and rollback strategies, forcing native updates, security, testing and troubleshooting.
+
+## How it works
+
+A React Native app is a native shell that loads a JavaScript bundle at startup. In a release build, that bundle (Hermes bytecode) and its assets are **embedded in the binary**. An OTA update client — `expo-updates`, a CodePush-compatible SDK, hot-updater, and so on — sits in the native startup path and decides **which** bundle to hand to the JS runtime: the embedded one, or a newer compatible one it downloaded earlier.
+
+The native layer — native code, native dependencies, the Hermes engine version, permissions, entitlements, `Info.plist`/`AndroidManifest.xml`, the app icon — can only change through a new store build. The OTA layer is everything that lives inside the JS bundle and the assets it references.
+
+```mermaid
+flowchart TD
+    subgraph binary["Native binary: changes only via a store release"]
+        Native["Native code<br/>Swift/Obj-C, Kotlin/Java, C++"]
+        Deps["Native dependencies<br/>pods, AARs, .so, TurboModules"]
+        Config["Info.plist, AndroidManifest,<br/>entitlements, permissions, icon"]
+        Engine["Hermes engine + RN runtime"]
+        Embedded["Embedded JS bundle + assets<br/>(always-available fallback)"]
+    end
+    subgraph ota["OTA layer: changes without review"]
+        Bundle["Downloaded JS bundle<br/>(Hermes bytecode)"]
+        Assets["Images, fonts, JSON<br/>required by the bundle"]
+    end
+    Loader["Update client in native startup<br/>expo-updates / CodePush fork / hot-updater"] --> Pick{"Compatible downloaded<br/>update available?"}
+    Pick -->|"yes"| Bundle
+    Pick -->|"no"| Embedded
+    Bundle -->|"calls native code via JSI"| Native
+```
+*Figure: The binary owns everything native plus a fallback bundle. OTA replaces only the JS bundle and its assets.*
+
+### What OTA can and cannot change
+
+| Change | OTA? | Why |
+|---|---|---|
+| JS/TS logic, components, screens, navigation structure | Yes | Lives in the bundle |
+| Styles, copy, translations bundled as JSON | Yes | Lives in the bundle |
+| Images and other assets referenced via `require()` / `import` | Yes | Bundled assets are shipped with the update |
+| Fonts loaded at runtime (e.g. `expo-font` `useFonts`) | Yes | Loaded as bundle assets |
+| Fonts registered natively (`UIAppFonts`, `android/app/src/main/assets/fonts` linked at build) | No | Native resources |
+| Pure-JS npm packages (date-fns, zod, a JS-only UI kit) | Yes | Compiled into the bundle |
+| Adding or upgrading a package **with native code** | No | Native binary must contain the new code; JS calling a missing native module crashes |
+| Upgrading React Native / Expo SDK / Hermes | No | Different native runtime and Hermes bytecode format |
+| New permission, `Info.plist` / manifest change, entitlements, capabilities | No | Read by the OS from the installed binary |
+| App icon, splash screen (native), app name, bundle ID | No | Native resources and metadata |
+| Push notification categories, widgets, extensions | No | Native targets |
+| Feature toggles already compiled into the binary | Better done via remote config | Doesn't even need OTA |
+
+> [!IMPORTANT]
+> The single rule that prevents OTA incidents: **an update must only ever be delivered to binaries whose native layer it was built against.** Every OTA system encodes this as a compatibility key — a *runtime version* in EAS Update, a *target binary version* in CodePush, an app version or fingerprint in hot-updater. Getting it wrong means JS calling native methods that don't exist, which crashes on launch.
+
+## Store policy
+
+OTA is allowed on both stores within limits. The exact wording and section numbers change, so read the current documents yourself before relying on any paraphrase — including this one.
+
+**Apple.** The Apple Developer Program License Agreement generally prohibits apps from downloading executable code, with an exception for interpreted code (historically worded around scripts run by Apple's built-in WebKit/JavaScriptCore frameworks) **provided it does not change the primary purpose of the app** by adding features inconsistent with the app as submitted and reviewed. App Review Guideline 2.5.2 similarly says apps shouldn't download code that introduces or changes features or functionality. React Native OTA updates (including Hermes bytecode) have been used at scale for years under this understanding: bug fixes, copy and UI tweaks, and incremental improvements are accepted practice; using OTA to ship a substantially different app, to unlock features that would have needed review, or to bypass review decisions is not.
+
+**Google.** Google Play's Device and Network Abuse policy prohibits apps from updating themselves outside Play's update mechanism or downloading executable code such as dex, JAR or `.so` files from outside Play. It carves out code that runs in a virtual machine or interpreter with indirect access to Android APIs (such as JavaScript in a WebView or browser) — JS bundles fall under that exception — but interpreted code loaded at runtime must still not enable policy violations.
+
+Practical rules that keep you on the right side of both:
+
+- Use OTA for **fixes and incremental changes**. Ship significant new features in store builds, where reviewers see them.
+- Never use OTA to enable functionality a reviewer rejected, or to change behaviour by region/user to evade review.
+- Keep OTA content consistent with your store listing, privacy labels and Data safety form (an update that starts collecting new data types needs a metadata update too).
+- Don't download native code, ever. Updates are JS and assets only.
+
+> [!CAUTION]
+> Policy enforcement is discretionary and can change. If OTA is core to your business model (for example, white-label apps configured per customer), get a legal read of the current Apple DPLA and Play policies rather than relying on community consensus.
+
+## Requirements & prerequisites
+
+| Requirement | Details |
+|---|---|
+| React Native / Expo version | EAS Update: `expo-updates` matching your Expo SDK (works in bare RN via Expo Modules). CodePush-compatible SDKs: verify New Architecture support — RN 0.82+ runs only on the New Architecture. |
+| Update service | EAS account (free tier available, usage-based pricing), a hosted provider (Revopush, Stallion), or your own infrastructure (object storage + metadata DB + CDN) |
+| Release builds for testing | Updates are disabled in debug builds, which always load from Metro |
+| Compatibility strategy | A runtime-version policy (e.g. fingerprint) decided **before** the first production build — changing it later strands installed builds |
+| Code signing keys (recommended) | RSA key pair; private key in CI secrets, certificate embedded in the binary |
+| Monitoring | Crash reporting tagged with update ID / channel / runtime version (see [Monitoring](monitoring.html)) |
+| Release process | Who may publish to production, how rollouts are widened, how to roll back (see [Deployment](deployment.html)) |
+
+## Choosing a solution (2026 landscape)
+
+**What happened to CodePush.** Microsoft's hosted CodePush service was part of Visual Studio App Center, which was **retired on March 31, 2025**. The `react-native-code-push` client repository was archived shortly after and never gained New Architecture support. Microsoft open-sourced a self-hostable CodePush server, and several companies built CodePush-compatible hosted services and maintained client forks. Meanwhile, EAS Update has become the default for Expo and a common choice for bare apps.
+
+| Solution | Hosting | Cost model | Rollbacks | Bare RN support | Code signing | Notes |
+|---|---|---|---|---|---|---|
+| **EAS Update** (`expo-updates`) | Expo-hosted, global CDN | Free tier, then usage-based plans | Republish a previous update, roll back to embedded, per-update and branch rollouts, automatic launch-error recovery | Yes, via Expo Modules (`npx install-expo-modules`) | Yes (end-to-end; on EAS Production/Enterprise plans at the time of writing) | Best DX; fingerprint runtime versions; channels/branches; integrates with EAS Build |
+| **Custom Expo Updates server** | Self-hosted, implements the open Expo Updates protocol | Your infra | You implement (the protocol supports roll back to embedded) | Yes (same client) | Yes (protocol supports signed manifests) | Keep the `expo-updates` client, own the backend; Expo publishes a reference server |
+| **Self-hosted CodePush server** (Microsoft open source) | Self-hosted | Your infra and ops time | CLI rollback + client auto-rollback when `notifyAppReady` isn't called | Via a maintained client fork | Yes (CodePush signing scheme) | Familiar to App Center users; original client is archived and legacy-arch only |
+| **hot-updater** | Self-hosted via plugins (Supabase, Cloudflare R2 + D1, AWS S3, Firebase, custom) | Your infra (often very cheap) | Console rollback, force-update flag | Yes (and Expo) | Check current docs | Open source, web console, app-version or fingerprint targeting, New Architecture support |
+| **Revopush** | Hosted SaaS | Subscription tiers | Yes | Yes (CodePush-compatible SDK fork) | Advertised; verify | Designed as a drop-in migration from App Center CodePush |
+| **Stallion** | Hosted SaaS | Free tier + subscriptions | Yes, including crash-triggered auto-rollback | Yes | Advertised; verify | Own SDK and dashboard; promotes from internal testing buckets to production |
+
+> [!NOTE]
+> The third-party landscape moves fast. Before committing, check each option's New Architecture support, pricing at your MAU, data residency, whether rollback is automatic on crash, and what happens if the vendor disappears — which is exactly what happened to App Center users.
+
+**Recommendation.**
+
+- **Expo / CNG apps:** EAS Update. It's integrated with EAS Build channels, has the best runtime-compatibility story (fingerprint), and needs no infrastructure.
+- **Bare RN apps without Expo aversion:** still EAS Update via `expo-updates` — adding Expo Modules to a bare app is low-risk and well supported.
+- **Strict self-hosting / data-residency / cost at very high MAU:** a custom Expo Updates protocol server (keeps a well-maintained client) or hot-updater.
+- **Migrating an App Center CodePush app quickly:** a CodePush-compatible host (Revopush) or the self-hosted CodePush server with a maintained client fork — then evaluate whether to move to one of the above.
+
+## EAS Update deep dive
+
+### Step 1 — Install and configure (Expo / CNG)
+
+```bash
+npx expo install expo-updates
+eas update:configure        # sets updates.url and runtimeVersion, adds channels to eas.json profiles
+```
+
+```ts title="app.config.ts (excerpt)"
+import type { ConfigContext, ExpoConfig } from 'expo/config';
+
+export default ({ config }: ConfigContext): ExpoConfig => ({
+  ...config,
+  name: 'MyApp',
+  slug: 'myapp',
+  version: '1.5.0',
+  runtimeVersion: { policy: 'fingerprint' },
+  updates: {
+    url: 'https://u.expo.dev/5b0c6d1e-7f7a-4c1e-9a55-2f3c8e6d9a10',
+    enabled: true,
+    checkAutomatically: 'ON_LOAD',
+    fallbackToCacheTimeout: 0,
+  },
+  extra: {
+    eas: { projectId: '5b0c6d1e-7f7a-4c1e-9a55-2f3c8e6d9a10' },
+  },
+});
+```
+
+```json title="eas.json (excerpt)"
+{
+  "build": {
+    "preview": { "distribution": "internal", "channel": "preview" },
+    "production": { "channel": "production", "autoIncrement": true }
+  }
+}
+```
+
+The `channel` of the build profile is baked into the binary at build time; every update request from that binary carries it. Rebuild after adding `expo-updates` — existing binaries know nothing about updates.
+
+### Step 2 — Choose a runtime version policy
+
+The **runtime version** is the compatibility key between a binary and an update. EAS only serves an update to a build whose runtime version matches **exactly**.
+
+| Policy | Resolves to | Pros | Cons |
+|---|---|---|---|
+| `appVersion` | `version` from app config, e.g. `1.5.0` | Simple, human-readable | You must bump `version` for every native change; forget once and you ship incompatible updates |
+| `nativeVersion` | `version` + build number, e.g. `1.5.0(10451)` | Every build is its own runtime | Updates must be published separately for each build; poor reuse |
+| `fingerprint` | Hash of everything that affects the native layer (native deps, config plugins, native dirs, relevant app config) | Automatically changes when native code changes and **only** then | Opaque strings; requires discipline about deterministic inputs |
+| Custom string | Whatever you set, e.g. `"2026.09-a"` | Full control, works everywhere | Entirely manual; same risk as `appVersion` |
+
+**Use `fingerprint`** unless you have a reason not to. You can inspect it with `npx @expo/fingerprint .`, compare fingerprints between commits in CI, and even use a fingerprint change to decide automatically whether a merge needs a new store build or can go out as an OTA. Platform-specific overrides (`ios.runtimeVersion`, `android.runtimeVersion`) take precedence over the top-level value.
+
+```mermaid
+flowchart TD
+    Build["Installed build<br/>channel: production<br/>runtime: fp-3f9a"] --> Req["Update request<br/>platform + runtime + channel"]
+    Req --> Chan["Channel 'production'"]
+    Chan -->|"points to"| Branch["Branch 'release-1.5'"]
+    Branch --> U3["Update 3<br/>runtime fp-7c21 (after a native change)"]
+    Branch --> U2["Update 2<br/>runtime fp-3f9a"]
+    Branch --> U1["Update 1<br/>runtime fp-3f9a"]
+    U3 -.->|"runtime mismatch"| Skip["Ignored for this build"]
+    U2 -->|"newest compatible"| Serve["Served: Update 2"]
+```
+*Figure: How EAS Update picks an update — channel to branch, then filter by platform and runtime version, then newest wins.*
+
+Why runtime compatibility matters so much: a JS bundle compiled against a binary that includes `react-native-vision-camera` v4 will call native methods that don't exist in a binary with v3, and a Hermes bytecode bundle from a newer RN version may not even load in an older Hermes. The fingerprint policy makes that class of incident structurally hard to create.
+
+### Step 3 — Channels and branches
+
+- A **branch** is an ordered list of updates (like a git branch of published bundles).
+- A **channel** is the name baked into a build. Each channel **points to** a branch (by default a branch with the same name).
+- Re-pointing a channel is instant and affects all builds on that channel on their next check.
+
+```bash
+eas channel:list
+eas channel:create staging
+eas branch:list
+
+# Publish to a branch
+eas update --branch production --message "Fix checkout total rounding"
+
+# Publish to whatever branch the channel points at
+eas update --channel production --message "Fix checkout total rounding"
+
+# Use the current git branch name and last commit message
+eas update --auto
+
+# Re-point a channel (e.g. promote a tested branch to production)
+eas channel:edit production --branch release-1.5
+```
+
+Two common layouts:
+
+| Layout | How it works | Good for |
+|---|---|---|
+| **Environment branches** | Channels `preview`/`production` point to branches of the same name; publish to `preview`, test, then publish the same commit to `production` | Small teams, simple mental model |
+| **Release branches** | Branch per app release (`release-1.5`); `staging` channel tests it; `production` channel is re-pointed to it when ready | Teams with release trains, clear "what's live" answer, easy promotion |
+
+### Step 4 — Publish, roll out, roll back
+
+```bash
+# Publish for both platforms (or --platform ios|android)
+eas update --branch production --message "Fix crash on empty cart"
+
+# Gradual rollout of a single update to 10% of devices on the branch
+eas update --branch production --message "New onboarding copy" --rollout-percentage=10
+eas update:edit                     # interactively raise the percentage
+eas update:revert-update-rollout    # abandon the rollout
+
+# Branch-based rollout: send a percentage of a channel's traffic to another branch
+eas channel:rollout
+
+# Inspect what's live
+eas update:list --branch production
+eas update:view <update-group-id>
+
+# Roll back: interactively republish a previous update, or tell clients to use the embedded bundle
+eas update:rollback
+eas update:republish --group <previous-update-group-id>
+```
+
+- Each `eas update` creates an **update group** (one update per platform) with a group ID; the per-platform update ID is what devices report as `Updates.updateId`.
+- `eas update` runs `npx expo export` under the hood: Metro bundles JS, Hermes compiles it per platform, assets are content-hashed and uploaded (unchanged assets are not re-uploaded, and clients only download assets they don't already have).
+- A rollback is itself a new "update": clients that already ran the bad update receive the republished (or embedded) one on their next check. Clients that never received the bad one are unaffected.
+
+> [!WARNING]
+> `eas update` bundles **your working directory**, including uncommitted changes and whatever `.env` values are present. Publish from CI on a clean checkout of a tagged commit, with the same environment variables the production build used — not from a laptop.
+
+### Step 5 — The update lifecycle on the device
+
+With the defaults (`checkAutomatically: 'ON_LOAD'`, `fallbackToCacheTimeout: 0`):
+
+1. On **cold start**, `expo-updates` launches the newest compatible update it already has (or the embedded bundle) **immediately**.
+2. In parallel it asks the server for a newer update and downloads it in the background.
+3. The downloaded update is applied on the **next cold start** — not on resume from background.
+4. So a published update typically reaches a user on their **second** launch after publishing, unless you apply it earlier yourself with `reloadAsync()`.
+
+| Option | Values | Effect |
+|---|---|---|
+| `checkAutomatically` | `ON_LOAD` (default), `ON_ERROR_RECOVERY`, `WIFI_ONLY`, `NEVER` | When the library checks by itself. `NEVER` = you drive everything from JS |
+| `fallbackToCacheTimeout` | ms, default `0` | How long startup waits for a new update before launching the cached one. Raising it (e.g. 3000) applies updates on first launch but delays startup on slow networks — usually a bad trade |
+| `enabled` | boolean | Kill switch for the whole module |
+| `requestHeaders` | object, e.g. `{ "expo-channel-name": "production" }` | Sets the channel for builds not made by EAS Build |
+
+**Error recovery.** If a newly launched update throws a fatal JS error very early — before the first view renders — `expo-updates` marks it as failed so it won't launch again on that device, briefly checks for a newer update, and otherwise falls back to the most recent update that launched successfully (or the embedded one). Errors after first render within a short window trigger a check for a fix but **no** automatic rollback, because app data may already have been migrated. It's a thin safety net, not a substitute for staged rollouts.
+
+**Embedded update and emergency launch.** The binary always contains a full bundle, so a fresh install works offline and a build can always fall back to known-good code. If the update database or files are corrupted and nothing else can load, `expo-updates` performs an **emergency launch** of the embedded bundle and sets `Updates.isEmergencyLaunch` (with `Updates.emergencyLaunchReason`) — report that to your crash tool.
+
+### Step 6 — The JS API
+
+Useful constants for diagnostics and monitoring:
+
+```ts title="src/updates/updateInfo.ts"
+import * as Updates from 'expo-updates';
+
+export function getUpdateInfo() {
+  return {
+    enabled: Updates.isEnabled,
+    updateId: Updates.updateId ?? 'embedded',
+    channel: Updates.channel ?? 'none',
+    runtimeVersion: Updates.runtimeVersion ?? 'unknown',
+    createdAt: Updates.createdAt?.toISOString() ?? null,
+    isEmbeddedLaunch: Updates.isEmbeddedLaunch,
+    isEmergencyLaunch: Updates.isEmergencyLaunch,
+    emergencyLaunchReason: Updates.emergencyLaunchReason ?? null,
+  };
+}
+```
+
+A production-quality hook that checks on launch and when the app returns to the foreground (throttled), downloads in the background, and lets the UI decide how to apply:
+
+```tsx title="src/updates/useOtaUpdates.ts"
+import * as Updates from 'expo-updates';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AppState, type AppStateStatus } from 'react-native';
+import { reportError } from '../monitoring/reportError';
+
+const MIN_CHECK_INTERVAL_MS = 15 * 60 * 1000;
+
+type OtaState =
+  | { status: 'idle' }
+  | { status: 'ready'; critical: boolean }
+  | { status: 'error'; error: Error };
+
+/** Reads an optional flag set at publish time: extra.critical in the public app config. */
+function isCritical(manifest: unknown): boolean {
+  const extra = (manifest as { extra?: { expoClient?: { extra?: { critical?: unknown } } } })
+    ?.extra?.expoClient?.extra;
+  return extra?.critical === true;
+}
+
+export function useOtaUpdates() {
+  const [state, setState] = useState<OtaState>({ status: 'idle' });
+  const lastCheck = useRef(0);
+  const inFlight = useRef(false);
+
+  const check = useCallback(async () => {
+    if (__DEV__ || !Updates.isEnabled || inFlight.current) return;
+    const now = Date.now();
+    if (now - lastCheck.current < MIN_CHECK_INTERVAL_MS) return;
+    lastCheck.current = now;
+    inFlight.current = true;
+    try {
+      const result = await Updates.checkForUpdateAsync();
+      // A roll-back-to-embedded directive reports isAvailable: false but must still be fetched
+      if (!result.isAvailable && !result.isRollBackToEmbedded) return;
+      const fetched = await Updates.fetchUpdateAsync();
+      if (fetched.isNew || fetched.isRollBackToEmbedded) {
+        setState({ status: 'ready', critical: isCritical(fetched.manifest) });
+      }
+    } catch (e) {
+      // Network failures are normal on mobile; report but never block the user
+      const error = e instanceof Error ? e : new Error(String(e));
+      reportError(error, { area: 'ota' });
+      setState({ status: 'error', error });
+    } finally {
+      inFlight.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    void check();
+    const sub = AppState.addEventListener('change', (next: AppStateStatus) => {
+      if (next === 'active') void check();
+    });
+    return () => sub.remove();
+  }, [check]);
+
+  const applyNow = useCallback(() => Updates.reloadAsync(), []);
+
+  return { state, applyNow };
+}
+```
+
+Or use the built-in reactive hook for UI state:
+
+```tsx title="src/updates/UpdateBanner.tsx"
+import * as Updates from 'expo-updates';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+
+export function UpdateBanner() {
+  const { isUpdatePending, isDownloading, downloadProgress } = Updates.useUpdates();
+
+  if (isDownloading && downloadProgress !== undefined) {
+    return <Text style={styles.muted}>Downloading update… {Math.round(downloadProgress * 100)}%</Text>;
+  }
+  if (!isUpdatePending) return null;
+
+  return (
+    <View style={styles.banner} accessibilityRole="alert">
+      <Text style={styles.text}>A new version is ready.</Text>
+      <Pressable accessibilityRole="button" onPress={() => Updates.reloadAsync()}>
+        <Text style={styles.action}>Restart</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  banner: { flexDirection: 'row', justifyContent: 'space-between', padding: 12, backgroundColor: '#1f2937' },
+  text: { color: '#f9fafb' },
+  action: { color: '#93c5fd', fontWeight: '600' },
+  muted: { padding: 8, color: '#6b7280' },
+});
+```
+
+`useUpdates()` also exposes `isUpdateAvailable`, `availableUpdate`, `downloadedUpdate`, `currentlyRunning`, `isChecking`, `checkError`, `downloadError` and `lastCheckForUpdateTimeSinceRestart`.
+
+> [!TIP]
+> To mark an update as critical, set `extra.critical` from an environment variable in `app.config.ts` and publish with `UPDATE_CRITICAL=1 eas update ...`; the public app config travels in the update manifest. A sturdier alternative is a server-side list of critical update IDs in your remote config, which you can change after publishing.
+
+### Step 7 — Code signing updates
+
+HTTPS protects updates in transit, but code signing protects against a compromised update server, CDN or publishing credential: the binary embeds a certificate and refuses any update whose manifest isn't signed by the matching private key.
+
+```bash
+npx expo-updates codesigning:generate \
+  --key-output-directory ../keys \
+  --certificate-output-directory certs \
+  --certificate-validity-duration-years 10 \
+  --certificate-common-name "My Company"
+
+npx expo-updates codesigning:configure \
+  --certificate-input-directory certs \
+  --key-input-directory ../keys
+
+eas update --branch production --message "Signed fix" --private-key-path ../keys/private-key.pem
+```
+
+This adds to your app config:
+
+```json title="app.json (excerpt)"
+{
+  "expo": {
+    "updates": {
+      "codeSigningCertificate": "./certs/certificate.pem",
+      "codeSigningMetadata": { "keyid": "main", "alg": "rsa-v1_5-sha256" }
+    }
+  }
+}
+```
+
+- The **certificate** is committed and embedded in builds; the **private key** lives only in CI secrets (never in the repo, never on laptops of people who shouldn't publish).
+- Builds made before signing was enabled accept unsigned updates; builds made after accept only signed ones — plan the transition across a store release.
+- Key rotation requires a new binary with the new certificate, so choose a long validity and guard the key. At the time of writing, EAS Update code signing requires an EAS Production or Enterprise plan.
+
+### Step 8 — Using expo-updates in a bare React Native app
+
+`expo-updates` works in bare RN apps once Expo Modules are installed:
+
+```bash
+npx install-expo-modules@latest     # adds Expo Modules core, patches AppDelegate/MainApplication
+npx expo install expo-updates
+cd ios && bundle exec pod install && cd ..
+eas update:configure                # writes updates.url/runtimeVersion to app.json and native config
+```
+
+The native configuration lives in `Expo.plist` and `AndroidManifest.xml`. Set the channel there, since you're not using EAS Build to inject it:
+
+```xml title="ios/MyApp/Supporting/Expo.plist"
+<key>EXUpdatesEnabled</key>
+<true/>
+<key>EXUpdatesURL</key>
+<string>https://u.expo.dev/5b0c6d1e-7f7a-4c1e-9a55-2f3c8e6d9a10</string>
+<key>EXUpdatesRuntimeVersion</key>
+<string>1.5.0</string>
+<key>EXUpdatesCheckOnLaunch</key>
+<string>ALWAYS</string>
+<key>EXUpdatesLaunchWaitMs</key>
+<integer>0</integer>
+<key>EXUpdatesRequestHeaders</key>
+<dict>
+  <key>expo-channel-name</key>
+  <string>production</string>
+</dict>
+```
+
+```xml title="android/app/src/main/AndroidManifest.xml (inside application)"
+<meta-data android:name="expo.modules.updates.ENABLED" android:value="true"/>
+<meta-data android:name="expo.modules.updates.EXPO_UPDATE_URL" android:value="https://u.expo.dev/5b0c6d1e-7f7a-4c1e-9a55-2f3c8e6d9a10"/>
+<meta-data android:name="expo.modules.updates.EXPO_RUNTIME_VERSION" android:value="1.5.0"/>
+<meta-data android:name="expo.modules.updates.EXPO_UPDATES_CHECK_ON_LAUNCH" android:value="ALWAYS"/>
+<meta-data android:name="expo.modules.updates.EXPO_UPDATES_LAUNCH_WAIT_MS" android:value="0"/>
+<meta-data android:name="expo.modules.updates.UPDATES_CONFIGURATION_REQUEST_HEADERS_KEY" android:value="{&quot;expo-channel-name&quot;:&quot;production&quot;}"/>
+```
+
+Bare-specific notes:
+
+- **Runtime version:** a manually managed string (as above, kept in sync between `app.json` and the native files) is the simplest and always supported. Recent SDKs can also resolve policies such as fingerprint at build time for bare projects — check the runtime version docs for your SDK before relying on it. If you manage it by hand, **bump it in the same PR as any native change** and enforce that in CI (e.g. compare `npx @expo/fingerprint .` output against the last release).
+- **Per-variant channels:** with flavors/schemes, set `expo-channel-name` per flavor (Android `manifestPlaceholders` or flavor source-set manifests) and per configuration (an xcconfig variable referenced in `Expo.plist`).
+- You can keep building with your own Fastlane/GitHub Actions pipeline; EAS Build is not required. Only publishing (`eas update`) talks to EAS.
+
+## Runtime flows
+
+### Check, download and apply
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant Lib as Update client
+    participant DB as Local update store
+    participant Srv as Update server and CDN
+    participant JS as JS runtime
+    User->>Lib: cold start
+    Lib->>DB: find newest launchable update for this runtime
+    Lib->>Srv: request manifest (platform, runtime, channel, current id)
+    alt new update arrives within fallbackToCacheTimeout
+        Srv-->>Lib: manifest and asset list
+        Lib->>Srv: download bundle and missing assets
+        Lib->>DB: verify hashes and signature, mark ready
+        Lib->>JS: launch the new update
+    else no update or timeout (default 0 ms)
+        Lib->>JS: launch cached or embedded bundle
+        Srv-->>Lib: manifest arrives later
+        Lib->>Srv: download in background
+        Lib->>DB: verify and mark ready for next launch
+        Note over Lib,JS: useUpdates now reports isUpdatePending
+    end
+    opt app decides to apply immediately
+        JS->>Lib: reloadAsync()
+        Lib->>JS: restart JS with the new bundle
+    end
+```
+*Figure: The default "launch fast, apply next time" lifecycle. The update is never swapped under a running JS context unless you call reloadAsync.*
+
+### Failed update and rollback
+
+Two families of client behaviour exist:
+
+- **Launch-error recovery (expo-updates):** a fatal error very early in startup marks the update as failed and falls back to the last good update or the embedded bundle.
+- **Explicit confirmation (CodePush model, many self-hosted clients):** a new update starts as *pending*; the app must call `notifyAppReady()` (or equivalent) once it is healthy. If the app restarts before confirming — typically because it crashed — the client reverts to the previous bundle and reports a rollback.
+
+```mermaid
+sequenceDiagram
+    participant App as App process
+    participant Lib as Update client
+    participant DB as Local update store
+    participant Srv as Update server
+    participant Mon as Crash reporting
+    App->>Lib: cold start
+    Lib->>DB: pick newest ready update U2
+    Lib->>App: launch U2 as pending
+    App--xLib: fatal crash before confirming health
+    App->>Lib: next cold start
+    Lib->>DB: U2 never confirmed, mark as failed
+    alt newer update U3 already published
+        Lib->>Srv: check for update
+        Srv-->>Lib: U3 manifest
+        Lib->>App: download and launch U3 as pending
+    else nothing newer
+        Lib->>DB: restore last confirmed update U1 or embedded
+        Lib->>App: launch U1
+    end
+    Lib->>Srv: report rollback of U2
+    App->>Mon: crash events tagged with update id U2
+    Note over Srv,Mon: team halts U2 rollout, then republishes U1 or ships U3
+```
+*Figure: Crash-triggered rollback with explicit health confirmation. The device protects itself, and telemetry tells the team to stop the rollout.*
+
+Where you call the confirmation matters. Calling it on the first line of `App.tsx` defeats the purpose; calling it after the first meaningful screen renders **and** critical startup work (auth restore, storage migrations) succeeds catches most bad updates.
+
+## Self-hosted architecture
+
+If you run your own OTA backend — a custom Expo Updates protocol server, a CodePush server, or hot-updater on your cloud — the moving parts are the same:
+
+```mermaid
+flowchart TD
+    CI["CI publish job<br/>bundle, hash, sign"] --> Store[("Object storage<br/>S3 / R2 / GCS")]
+    CI --> Meta[("Release metadata DB<br/>Postgres / D1 / DynamoDB")]
+    Store --> CDN["CDN<br/>immutable bundle URLs"]
+    Meta --> API["Update API / edge function<br/>resolves the release per device"]
+    Device["App: update client"] -->|"check: platform, runtime,<br/>channel, current id, device id"| API
+    API -->|"manifest: url, hash,<br/>signature, mandatory"| Device
+    Device -->|"download bundle and assets"| CDN
+    Device -->|"events: downloaded,<br/>applied, rolled back"| Events["Telemetry pipeline"]
+    Events --> Guard["Rollout guard<br/>auto-disable on crash spike"]
+    Guard --> Meta
+    Console["Admin console / CLI<br/>rollout percent, disable, promote"] --> Meta
+```
+*Figure: A self-hosted OTA system: immutable artifacts on a CDN, a small resolution API, and a feedback loop that can disable a bad release automatically.*
+
+Design points:
+
+- **Artifacts are immutable and content-addressed** (`/bundles/<sha256>.hbc`, `/assets/<sha256>`), cached forever at the CDN. Only the resolution API is dynamic.
+- **Resolution is cheap and cacheable**: keyed by `(platform, runtimeVersion, channel)` plus a rollout bucket, it can run at the edge.
+- **Rollout bucketing is deterministic**: hash `deviceId + releaseId` into 0–99 so a device doesn't flap in and out of a rollout between checks.
+- **Mandatory semantics**: if *any* release between the device's current one and the newest is mandatory, the update is mandatory (otherwise a device that skipped a critical update could miss it).
+- **Disabling a release is the rollback primitive**: once disabled, the API resolves to the previous enabled release (or "roll back to embedded"), and devices on the bad release move off it on their next check.
+- **Telemetry closes the loop**: update ID on every crash and analytics event, plus explicit `applied`/`rolledBack` events, feed a guard that disables a release when its crash rate exceeds the baseline.
+
+Release metadata for one platform:
+
+```json title="release record (metadata DB)"
+{
+  "id": "rel_01J9Z6M7Q2V8",
+  "platform": "ios",
+  "channel": "production",
+  "runtimeVersion": "fp-3f9a1c",
+  "bundleUrl": "https://ota-cdn.example.com/bundles/8c1f0e.hbc",
+  "bundleSha256": "8c1f0e5b7a9d4c2e1f3a6b8d0c9e7f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e",
+  "signature": "MEUCIQDl3...base64",
+  "assets": [{ "key": "a3f9c2", "url": "https://ota-cdn.example.com/assets/a3f9c2.png", "sha256": "a3f9c2d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2" }],
+  "mandatory": false,
+  "rolloutPercent": 10,
+  "enabled": true,
+  "gitSha": "4e1d9a7",
+  "message": "Fix crash on empty cart",
+  "createdAt": "2026-09-24T09:12:00Z"
+}
+```
+
+The resolution logic, independent of framework:
+
+```ts title="server/ota/resolveUpdate.ts"
+import { createHash } from 'node:crypto';
+
+export type Release = {
+  id: string;
+  platform: 'ios' | 'android';
+  channel: string;
+  runtimeVersion: string;
+  bundleUrl: string;
+  bundleSha256: string;
+  signature: string;
+  mandatory: boolean;
+  rolloutPercent: number;
+  enabled: boolean;
+  createdAt: string;
+};
+
+export type CheckRequest = {
+  platform: 'ios' | 'android';
+  runtimeVersion: string;
+  channel: string;
+  currentReleaseId: string | null; // null = running the embedded bundle
+  deviceId: string;
+};
+
+export type CheckResponse =
+  | { type: 'noUpdate' }
+  | { type: 'rollBackToEmbedded' }
+  | { type: 'update'; release: Pick<Release, 'id' | 'bundleUrl' | 'bundleSha256' | 'signature'>; mandatory: boolean };
+
+export interface ReleaseStore {
+  /** Enabled and disabled releases for the key, newest first. */
+  list(key: { platform: string; runtimeVersion: string; channel: string }): Promise<Release[]>;
+}
+
+function inRollout(deviceId: string, releaseId: string, percent: number): boolean {
+  if (percent >= 100) return true;
+  const digest = createHash('sha256').update(`${deviceId}:${releaseId}`).digest();
+  return digest.readUInt32BE(0) % 100 < percent;
+}
+
+export async function resolveUpdate(req: CheckRequest, store: ReleaseStore): Promise<CheckResponse> {
+  const releases = await store.list(req);
+  const eligible = releases.filter((r) => r.enabled && inRollout(req.deviceId, r.id, r.rolloutPercent));
+  const target = eligible[0];
+
+  if (!target) {
+    // Everything for this runtime was disabled: move devices off any downloaded release
+    return req.currentReleaseId ? { type: 'rollBackToEmbedded' } : { type: 'noUpdate' };
+  }
+  if (target.id === req.currentReleaseId) return { type: 'noUpdate' };
+
+  // Mandatory if any release newer than the device's current one is mandatory
+  const currentIndex = releases.findIndex((r) => r.id === req.currentReleaseId);
+  const newer = currentIndex === -1 ? releases : releases.slice(0, currentIndex);
+  const mandatory = newer.some((r) => r.enabled && r.mandatory);
+
+  return {
+    type: 'update',
+    release: {
+      id: target.id,
+      bundleUrl: target.bundleUrl,
+      bundleSha256: target.bundleSha256,
+      signature: target.signature,
+    },
+    mandatory,
+  };
+}
+```
+
+> [!TIP]
+> If you want self-hosting without writing a client, implement the **Expo Updates protocol** on your server (Expo publishes the spec and a reference `custom-expo-updates-server`). You keep `expo-updates` — error recovery, asset caching, code signing, `useUpdates` — and only own the backend.
+
+## Update strategies
+
+| Strategy | UX | When to use | Implementation |
+|---|---|---|---|
+| **Silent, next launch** (default) | Invisible; new code on the next cold start | Most fixes and tweaks | `checkAutomatically: 'ON_LOAD'`, do nothing else |
+| **Check on resume** | Picks up updates for users who never cold-start (apps live in memory for days) | Apps with long sessions | `AppState` listener + throttle (see `useOtaUpdates`) |
+| **Prompt to restart** | Banner: "A new version is ready — Restart" | Visible fixes users are waiting for | `useUpdates().isUpdatePending` + `reloadAsync()` |
+| **Apply at a safe point** | Reload when the user is on the home screen or after backgrounding for N minutes | Avoid interrupting forms/checkout | Track "safe" navigation state; call `reloadAsync()` there |
+| **Mandatory / critical** | Blocking screen until the update is applied | Security fixes, broken payment flow, data-corruption bug | Critical flag in manifest or remote config; download, then reload immediately |
+| **Immediate reload on download** | Screen flashes and state resets mid-use | Almost never | Avoid — it loses user input and looks like a crash |
+
+> [!WARNING]
+> `reloadAsync()` restarts the JS context: in-memory state, unsaved form input, and in-flight requests are lost. Persist what matters (drafts, navigation state) before reloading, and never reload during payments or uploads.
+
+### Staged rollout and monitoring by update ID
+
+Treat an OTA like a store release: roll out to a small percentage, watch, widen.
+
+1. Publish with `--rollout-percentage=5` (EAS) or `rolloutPercent: 5` (self-hosted).
+2. Tag every crash and analytics event with the update ID, channel and runtime version:
+
+```ts title="src/monitoring/tagUpdate.ts"
+import * as Sentry from '@sentry/react-native';
+import * as Updates from 'expo-updates';
+
+export function tagCurrentUpdate(): void {
+  Sentry.setTag('ota.update_id', Updates.updateId ?? 'embedded');
+  Sentry.setTag('ota.channel', Updates.channel ?? 'none');
+  Sentry.setTag('ota.runtime', Updates.runtimeVersion ?? 'unknown');
+  Sentry.setTag('ota.emergency', String(Updates.isEmergencyLaunch));
+}
+```
+
+3. Compare crash-free sessions and key funnels for the new update ID against the previous one (recent Sentry SDKs also attach expo-updates context automatically; explicit tags make dashboards and alerts easy).
+4. Widen to 25 / 50 / 100 percent, or roll back.
+
+JS source maps are per update — upload them for every OTA publish, not just store builds, or OTA crashes will be unreadable. See [Monitoring](monitoring.html).
+
+### Rollback
+
+- **EAS:** `eas update:rollback` (republish a previous update or roll back to embedded), or `eas update:revert-update-rollout` for an in-progress per-update rollout.
+- **Self-hosted:** disable the release; the resolver serves the previous one.
+- **Roll forward** when the fix is small and ready: publish a new update. It's the same speed as a rollback and keeps history linear.
+- Remember that users who already ran the bad update only move off it on their next check — combine rollback with "check on resume" to shorten the tail.
+
+## Forcing native updates
+
+OTA can't fix native bugs, and eventually you'll need users off old binaries (a native security fix, a breaking API change, an SDK the stores deprecate). You need a **version gate** that works independently of OTA.
+
+### Minimum supported version via remote config
+
+Serve a small config from your API or Firebase Remote Config:
+
+```json title="GET https://api.example.com/app-config"
+{
+  "ios": { "minSupported": "2.3.0", "latest": "2.6.1", "storeUrl": "itms-apps://apps.apple.com/app/id6478123456" },
+  "android": { "minSupported": "2.3.0", "latest": "2.6.1", "storeUrl": "market://details?id=com.mycompany.myapp" }
+}
+```
+
+```ts title="src/updates/versionGate.ts"
+import * as Application from 'expo-application'; // bare RN: react-native-device-info getVersion()
+import { Linking, Platform } from 'react-native';
+
+type PlatformConfig = { minSupported: string; latest: string; storeUrl: string };
+export type GateResult = 'ok' | 'soft' | 'hard';
+
+export function compareVersions(a: string, b: string): number {
+  const pa = a.split('.').map((n) => Number.parseInt(n, 10) || 0);
+  const pb = b.split('.').map((n) => Number.parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+export async function checkVersionGate(): Promise<{ result: GateResult; storeUrl?: string }> {
+  const current = Application.nativeApplicationVersion ?? '0.0.0';
+  try {
+    const res = await fetch('https://api.example.com/app-config', { headers: { Accept: 'application/json' } });
+    if (!res.ok) return { result: 'ok' }; // fail open: never lock users out because config is down
+    const config = (await res.json()) as Record<'ios' | 'android', PlatformConfig>;
+    const platform = config[Platform.OS === 'ios' ? 'ios' : 'android'];
+    if (compareVersions(current, platform.minSupported) < 0) return { result: 'hard', storeUrl: platform.storeUrl };
+    if (compareVersions(current, platform.latest) < 0) return { result: 'soft', storeUrl: platform.storeUrl };
+    return { result: 'ok' };
+  } catch {
+    return { result: 'ok' };
+  }
+}
+
+export function openStore(storeUrl: string): Promise<void> {
+  return Linking.openURL(storeUrl);
+}
+```
+
+- **Hard gate**: a blocking screen with only an "Update" button. Use sparingly — it's the mobile equivalent of downtime.
+- **Soft gate**: a dismissible prompt, rate-limited.
+- **Fail open** when the config can't be fetched, and keep the gate logic itself in the binary (not only in an OTA bundle) so it works even on builds that never received an update.
+- Compare the **native** version (`nativeApplicationVersion`), not a JS constant that OTA could change.
+
+### Android: Play In-App Updates
+
+Google Play's In-App Updates API shows a Play-managed update flow inside your app:
+
+- **Immediate**: full-screen, blocking; Play downloads and installs, then restarts the app. For critical updates.
+- **Flexible**: downloads in the background while the user keeps working; you prompt to restart when it's downloaded.
+
+Wrap it with a library (for example `sp-react-native-in-app-updates`) or a small native module:
+
+```gradle title="android/app/build.gradle"
+dependencies {
+    implementation "com.google.android.play:app-update:2.1.0"
+}
+```
+
+```kotlin title="android/app/src/main/java/com/mycompany/myapp/InAppUpdates.kt"
+package com.mycompany.myapp
+
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import com.google.android.play.core.appupdate.AppUpdateManagerFactory
+import com.google.android.play.core.appupdate.AppUpdateOptions
+import com.google.android.play.core.install.model.AppUpdateType
+import com.google.android.play.core.install.model.UpdateAvailability
+
+// Create in MainActivity.onCreate: registerForActivityResult must run before the activity starts
+class InAppUpdates(private val activity: ComponentActivity) {
+    private val manager = AppUpdateManagerFactory.create(activity)
+    private val launcher = activity.registerForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { /* RESULT_OK, RESULT_CANCELED, or in-app update failure */ }
+
+    fun startImmediateIfAvailable() {
+        manager.appUpdateInfo.addOnSuccessListener { info ->
+            val available = info.updateAvailability() == UpdateAvailability.UPDATE_AVAILABLE
+            val resuming = info.updateAvailability() ==
+                UpdateAvailability.DEVELOPER_TRIGGERED_UPDATE_IN_PROGRESS
+            if ((available && info.isUpdateTypeAllowed(AppUpdateType.IMMEDIATE)) || resuming) {
+                manager.startUpdateFlowForResult(
+                    info,
+                    launcher,
+                    AppUpdateOptions.newBuilder(AppUpdateType.IMMEDIATE).build()
+                )
+            }
+        }
+    }
+}
+```
+
+Notes: it only works for apps installed from Google Play (test with internal app sharing or an internal track), it tells you an update exists but not whether it's *required* — combine it with your `minSupported` config or Play's update priority (set per release via the Play Developer API) and `clientVersionStalenessDays()`.
+
+### iOS: App Store link
+
+iOS has no in-app update API. Detect the need with your own config (the iTunes Lookup endpoint `https://itunes.apple.com/lookup?bundleId=...` works but is cached and lags behind releases), then open the product page with `itms-apps://apps.apple.com/app/id<APP_ID>` or `https://apps.apple.com/app/id<APP_ID>`. Remember phased release: a user may see "Update" in your prompt before the App Store offers them the new version automatically — manual updates are always available, so the link still works.
+
+### OTA or store release?
+
+```mermaid
+flowchart TD
+    Change["Change ready to ship"] --> NativeQ{"Touches native code, native deps,<br/>permissions, plist/manifest or icon?"}
+    NativeQ -->|"yes"| Store["Store release<br/>new runtime version"]
+    NativeQ -->|"no"| Purpose{"Major new feature or changes<br/>the app's purpose?"}
+    Purpose -->|"yes"| Store
+    Purpose -->|"no"| Urgent{"Users on the current runtime<br/>need it now?"}
+    Urgent -->|"yes"| OTA["OTA to that runtime<br/>staged rollout"]
+    Urgent -->|"no"| Train{"Store release due soon?"}
+    Train -->|"yes"| Next["Ship in the next binary"]
+    Train -->|"no"| OTA
+    Store --> Old{"Old binaries broken or insecure?"}
+    Old -->|"yes"| Gate["Raise minSupported<br/>+ in-app update prompt"]
+    Old -->|"no"| Normal["Normal staged rollout"]
+```
+*Figure: Deciding between OTA and a store release, and when to force users onto the new binary.*
+
+If you still support several runtimes (users on 1.4.x and 1.5.x), a JS fix may need to be published **once per runtime** — cherry-pick onto the release branch for each supported runtime and publish from there. The fewer runtimes in the wild, the cheaper this is — another reason to use version gates.
+
+## Security
+
+- **Transport**: HTTPS only for manifests, bundles and assets; no cleartext exceptions for the update domain.
+- **Integrity**: verify bundle and asset hashes before marking an update launchable (expo-updates does this). Hashes in the manifest only help if the manifest itself is trustworthy.
+- **Code signing**: sign manifests with a private key held only by CI; embed the certificate in the binary so a compromised server, CDN or dashboard account can't push code. This is the difference between "someone stole our Expo token" being an incident and being a catastrophe.
+- **Publishing access control**: only CI can publish to production channels, from protected branches/tags, with required approvals. Use scoped robot tokens (e.g. an EAS access token for CI), rotate them, and remove personal publish rights for production. Keep an audit log of who published what.
+- **Never ship secrets**: the JS bundle is downloadable and Hermes bytecode can be decompiled. API secrets, signing keys and privileged tokens don't belong in the bundle, the manifest's public config, or `EXPO_PUBLIC_*` variables. See [Security](security.html).
+- **Don't let OTA weaken the binary**: certificate pinning configuration, jailbreak/root checks and security-sensitive flows should not be disableable by an update alone.
+- **Supply chain**: an OTA publish runs `npm` dependencies into production within minutes — lockfiles, dependency review and CI-only publishing matter even more than for store builds.
+
+## Edge cases & gotchas
+
+- **Updates apply on the second launch by default.** Product managers expecting "live in 5 minutes" need to hear "live on the next cold start after download, for users who open the app".
+- **Long-lived app sessions**: iOS and Android keep apps in memory for days; without a resume check, some users won't get an update for a long time.
+- **Native module added in JS only**: installing a library with native code and publishing an OTA crashes every user who gets it. The fingerprint policy prevents this; with manual runtime versions, enforce it in CI.
+- **Different JS per platform**: publish for both platforms from the same commit; a stale platform is a classic source of "fixed on iOS, not Android".
+- **Env drift**: `eas update` inlines environment variables at publish time. Publishing without the production `.env` points production users at the staging API.
+- **Data migrations**: an update that migrates local storage (MMKV/SQLite schema) can't be cleanly rolled back — the old bundle may not understand the new data. Make migrations backward-compatible or version-gated.
+- **Assets not in the bundle**: images referenced by dynamic strings, files placed directly in native asset folders, or fonts registered natively are not part of an update.
+- **Store review of the binary vs later OTA**: reviewers see the embedded bundle. Keep OTA changes within the scope of what was reviewed.
+- **Expo Go** doesn't run your `expo-updates` configuration; use development or release builds.
+- **Multiple runtimes live**: every fix may need publishing per runtime; track which runtimes still have meaningful traffic and retire them with version gates.
+
+## Testing & debugging
+
+Updates are **disabled in debug builds** — they always load from Metro, and `Updates.isEnabled` is `false`. Test with release-configured builds:
+
+```bash
+# Local release builds (CNG or bare with expo-updates)
+npx expo run:ios --configuration Release
+npx expo run:android --variant release
+
+# Internal preview builds bound to the preview channel
+eas build --profile preview --platform all
+eas update --branch preview --message "QA: new onboarding copy"
+```
+
+- **Preview channels**: QA installs a `preview` build once; every merged PR (or every publish) lands as an update on the `preview` branch without new binaries.
+- **PR previews**: `expo/expo-github-action` has a preview action that runs `eas update` for a PR branch and comments a QR code/link; development builds (`expo-dev-client`) can open published updates directly, so reviewers test the PR's JS on a real device.
+- **Channel switching in QA builds**: recent `expo-updates` versions support runtime overrides of the update URL/request headers for internal builds — see the docs, and never enable it in production builds.
+- **Scenario matrix** before trusting a setup: first launch offline, update published while app is backgrounded, kill during download, runtime mismatch (update must be ignored), rollback to previous and to embedded, critical-update flow, low disk space.
+- **Logs**: `Updates.readLogEntriesAsync()` returns expo-updates' recent native log entries (surface them in a hidden debug screen with the update info from `getUpdateInfo()`); `adb logcat | grep -i expo-updates` on Android; filter the Xcode/Console.app device log for `expo-updates` on iOS.
+- **Fingerprint drift in CI**: run `npx @expo/fingerprint .` on the release branch and on the candidate commit; if they differ, the change needs a store build, not an OTA.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Update published but never appears | Testing a debug build; wrong channel; update is applied only on the next cold start | Use a release/preview build; check `Updates.channel`; fully kill and relaunch twice |
+| Some devices get it, others don't | Per-update rollout percentage; devices on a different runtime version | `eas update:view` to check rollout and runtime; compare `Updates.runtimeVersion` on devices |
+| "No compatible update" / runtime mismatch | Update published from a commit whose fingerprint or version differs from the installed build | Publish from the release branch matching the build; with `appVersion`, check `version` wasn't bumped |
+| App crashes on launch after an update | JS calls a native module missing in the binary; bad migration; unhandled error in startup | Roll back (`eas update:rollback` / disable release); use fingerprint policy; add health confirmation and startup error boundaries |
+| Crash loop that persists across restarts | Error occurs after first render, so early-launch recovery doesn't roll back | Roll back server-side immediately; add "check on resume" and consider an explicit confirmation step |
+| Images/fonts missing after update | Asset not referenced via static `require`, or it lives in native resources | Use static requires; move assets into JS; ship native assets via a store build |
+| Update works on iOS, not Android | Published with `--platform ios` only, or platform-specific code path | Publish both platforms from the same commit; check `eas update:list` per platform |
+| Production users hit the staging API after an OTA | Publish ran with the wrong environment variables | Publish only from CI with production env; set env explicitly per channel |
+| Signed-update builds reject updates | Published without `--private-key-path`, or key/certificate mismatch | Sign every publish in CI; verify `codeSigningMetadata.keyid` matches |
+| `Updates.isEmergencyLaunch` is true | Update store corrupted or no launchable update; fell back to embedded | Report `emergencyLaunchReason`; check disk space and recent publishes |
+| Crash stack traces unreadable for OTA code | Source maps uploaded for the store build but not for the update | Upload source maps in the OTA publish job, keyed by update ID / release |
+
+## Production checklist
+
+- [ ] Update solution chosen with New Architecture support confirmed; vendor exit strategy considered
+- [ ] Runtime version policy decided before the first production build (fingerprint recommended)
+- [ ] Channels mapped to build profiles/variants; production builds verified to report the right channel
+- [ ] Publishing to production only from CI, on tagged commits, with production environment variables
+- [ ] Code signing enabled; private key stored only in CI secrets; certificate validity documented
+- [ ] Update ID, channel and runtime version tagged on every crash and analytics event; source maps uploaded per update
+- [ ] Staged rollout procedure (percentages, gates, owner) and rollback procedure documented and rehearsed
+- [ ] Update UX chosen: silent next launch plus resume check; prompt or mandatory flow for critical fixes; no reload during sensitive flows
+- [ ] Health confirmation / early-launch recovery understood; startup path has error boundaries
+- [ ] Local data migrations are backward compatible with the previous bundle
+- [ ] Version gate (`minSupported`) in the binary, failing open; Play In-App Updates and App Store link wired up
+- [ ] OTA changes stay within store policy: fixes and incremental changes, metadata and privacy labels still accurate
+- [ ] Release builds tested for: offline launch, runtime mismatch, rollback to previous and to embedded
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [EAS Update introduction](https://docs.expo.dev/eas-update/introduction/)
+- [EAS Update — Runtime versions](https://docs.expo.dev/eas-update/runtime-versions/)
+- [Microsoft code-push-server (self-hosted)](https://github.com/microsoft/code-push-server)
+- [hot-updater](https://github.com/gronxb/hot-updater)
+- [Android — In-app updates](https://developer.android.com/guide/playcore/in-app-updates)
+
+## Interview questions
+
+### What can and can't you change with an OTA update?
+
+**Short answer:** Only the JS bundle and the assets it references — logic, UI, styles, copy, bundled images, pure-JS dependencies. Anything native needs a store release: native code or native dependencies, RN/Hermes upgrades, permissions, `Info.plist`/manifest entries, entitlements, icons and splash.
+
+The reason is that the OS loads native code and reads configuration from the signed, installed binary; the update client can only choose which JS bundle to hand the runtime. A senior answer adds the compatibility consequence: an update built against different native code crashes when it calls missing native methods, which is why runtime versions exist.
+
+### Are OTA updates allowed by Apple and Google?
+
+**Short answer:** Yes, within limits. Apple's developer agreement and Guideline 2.5.2 allow interpreted code as long as it doesn't change the app's primary purpose or add features that bypass review; Google Play forbids downloading executable native code but exempts code run in a VM or interpreter, such as JavaScript.
+
+In practice: use OTA for fixes and incremental changes, ship big features through review, never use OTA to re-enable something a reviewer rejected, and keep privacy disclosures accurate. Policy text changes, so check the current documents.
+
+> [!INTERVIEW]
+> Red flag: "OTA lets us skip App Review entirely." Good answers show you know where the line is and would involve legal for edge cases.
+
+### What is a runtime version, and what happens if you get it wrong?
+
+**Short answer:** It's the compatibility key between a binary's native layer and a JS update; the server only serves updates whose runtime version exactly matches the build. Get it wrong and a bundle expecting native code the binary doesn't have is delivered — typically a crash on launch for everyone who receives it.
+
+Policies: `appVersion` (bump `version` on every native change — easy to forget), `nativeVersion` (every build is its own runtime), custom strings, and `fingerprint`, which hashes the native-affecting inputs so the runtime changes exactly when native code does. Fingerprint is the safest default, and the same fingerprint can drive CI decisions ("this merge needs a store build").
+
+### CodePush is gone. What would you use in 2026, and why?
+
+**Short answer:** EAS Update for Expo and most bare apps (via Expo Modules); a custom Expo Updates protocol server or hot-updater if self-hosting is a hard requirement; a CodePush-compatible host or the open-source CodePush server with a maintained client fork only as a migration path.
+
+Reasoning: App Center (and hosted CodePush) retired on March 31, 2025, and the original client was archived without New Architecture support — a non-starter on RN 0.82+. Evaluate on New Architecture support, runtime compatibility model, rollback (manual and crash-triggered), code signing, rollout controls, pricing at your MAU, data residency and vendor risk.
+
+### Walk me through how an update reaches a user's screen with EAS Update.
+
+**Short answer:** CI runs `eas update --branch production`; EAS bundles and uploads JS/assets as an update group. On the next cold start, `expo-updates` in a build on the `production` channel (mapped to that branch) with a matching runtime version launches its current bundle immediately, downloads the new update in the background, and applies it on the following cold start — or sooner if the app calls `reloadAsync()`.
+
+Mention `fallbackToCacheTimeout` (default 0, trading first-launch freshness for startup speed), `checkAutomatically`, resume checks for long-lived sessions, early-launch error recovery, and emergency launch of the embedded bundle.
+
+### How would you design a self-hosted OTA system?
+
+**Short answer:** Immutable, content-addressed bundles and assets in object storage behind a CDN; a metadata database of releases keyed by platform, runtime version and channel; a small resolution API (edge-deployable) that picks the newest enabled release for a device's deterministic rollout bucket; CI-only publishing with signed manifests; and telemetry that tags events with the release ID and can auto-disable a release.
+
+Details worth raising: mandatory flag semantics across skipped releases, disabling as the rollback primitive (resolve to the previous release or roll back to embedded), health confirmation on the client (`notifyAppReady`-style) for crash-triggered rollback, and implementing the Expo Updates protocol so you can keep a mature client.
+
+### An OTA update is crashing users. What happens and what do you do?
+
+**Short answer:** Depending on the client, devices may self-heal (early-launch error recovery or an unconfirmed pending update reverting), but you can't rely on it. Immediately roll back server-side (`eas update:rollback` or disable the release), confirm with crash rates filtered by update ID, then roll forward with a fix through a staged rollout.
+
+Explain the limits: errors after first render don't auto-rollback with expo-updates; users who already ran the bad update only move off on their next check; a bad local-data migration may not be reversible. Prevention: fingerprint runtimes, staged rollouts with gates, health confirmation after critical startup work, and source maps per update so the crash is diagnosable.
+
+### How do you force users onto a new native version?
+
+**Short answer:** A version gate in the binary: fetch `minSupported`/`latest` from remote config, compare with the native app version, and show a blocking or dismissible prompt. On Android, use Play In-App Updates (immediate or flexible); on iOS, open the App Store page.
+
+Fail open if the config can't be fetched, compare the native version rather than a JS constant, use hard gates sparingly, and remember that phased releases and slow store rollouts mean the new version may not be offered to everyone automatically yet.
+
+### How do you secure OTA updates?
+
+**Short answer:** HTTPS plus hash verification for integrity in transit, code signing so only holders of a CI-held private key can produce updates the binary accepts, strict access control on who and what can publish to production, and no secrets in the bundle.
+
+OTA is effectively remote code execution on every device you ship to — treat publishing credentials like production deploy keys: scoped CI tokens, protected branches, approvals, audit logs, and certificates embedded in the binary so a compromised server or account can't push code.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

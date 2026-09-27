@@ -1,0 +1,1172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Offline Storage &amp; Sync · React Native Interview Handbook</title>
+<meta name="description" content="How to pick the right on-device storage for each kind of data (MMKV, SQLite, WatermelonDB, Keychain, files, persisted query caches), and how to build an offline-first app on…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Offline Storage &amp; Sync · React Native Interview Handbook">
+<meta property="og:description" content="How to pick the right on-device storage for each kind of data (MMKV, SQLite, WatermelonDB, Keychain, files, persisted query caches), and how to build an offline-first app on…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/offline-storage.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Offline Storage & Sync
+
+How to pick the right on-device storage for each kind of data (MMKV, SQLite, WatermelonDB, Keychain, files, persisted query caches), and how to build an offline-first app on top of it: a local source of truth, an outbox of pending mutations, incremental sync, conflict resolution, and the connectivity, caching, security and testing details that decide whether it works in the real world.
+
+## How it works
+
+Most apps don't need "a storage library"; they need **one storage layer per data shape**. Secrets, small preferences, structured domain data, binary media and cached server responses have different requirements for synchronous access, encryption, querying, size and lifetime. Mixing them (JWTs in AsyncStorage, 20,000 rows as one JSON blob in MMKV, images base64-encoded in SQLite) is the most common source of offline bugs and slow startups.
+
+```mermaid
+flowchart TD
+    UI["Screens and hooks"] --> TQ["Server-state cache<br/>TanStack Query"]
+    UI --> ZS["Client state<br/>Zustand or Redux"]
+    UI --> Repo["Repositories<br/>domain data access"]
+    TQ -.->|"persist"| KV[("MMKV instances")]
+    ZS -.->|"persist"| KV
+    Repo --> DB[("SQLite<br/>local source of truth")]
+    Repo --> Files[("File system<br/>media blobs")]
+    KV -.->|"encryption key"| Sec[("Keychain / Keystore")]
+    DB -.->|"encryption key"| Sec
+    SyncEng["Sync engine"] --> DB
+    SyncEng -->|"push outbox, pull changes"| API["Backend API"]
+```
+*Figure: One layer per data shape. The UI never talks to the network directly for domain data; it reads local storage, and a sync engine reconciles local and remote.*
+
+There is a spectrum between two architectures, and a senior answer names where the app sits on it:
+
+| | Online-first with cache | Offline-first (local-first) |
+|---|---|---|
+| Source of truth | Server; device holds a cache | Local database; server is the sync hub |
+| Reads | Network, fall back to cache | Always local (instant) |
+| Writes | Network request; fail or queue when offline | Local write + outbox, synced later |
+| Typical stack | TanStack Query/RTK Query + persister | SQLite/WatermelonDB + sync protocol |
+| Hard parts | Cache invalidation, paused mutations | Conflicts, deletes, schema migrations, backfills |
+| Good for | Feeds, catalogs, dashboards | Field service, notes, CRM, POS, messaging |
+
+Offline-first costs real engineering time on both client and backend (change feeds, tombstones, idempotency). Don't adopt it because it sounds modern; adopt it when users genuinely create or edit data without connectivity.
+
+## Requirements & prerequisites
+
+| Item | Details |
+|---|---|
+| React Native | New Architecture (default since 0.76, mandatory since 0.82). MMKV v4 and op-sqlite are JSI/Nitro-based and need it. |
+| Expo | expo-sqlite, expo-secure-store, expo-file-system and AsyncStorage work in Expo Go. MMKV, op-sqlite and WatermelonDB need a **development build** (`expo-dev-client`) and `npx expo prebuild`. |
+| Crypto | A CSPRNG for keys and idempotency IDs: `expo-crypto` (`getRandomBytes`, `randomUUID`) or `react-native-get-random-values` / `react-native-quick-crypto`. |
+| Backend (sync) | Stable client-generatable IDs (UUID/ULID), a server-assigned `version` or monotonic sequence per row, a changes endpoint with a cursor, soft deletes (tombstones), idempotency-key support on mutation endpoints. |
+| iOS behaviour | `Documents/` and `Library/Application Support/` are backed up to iCloud; `Library/Caches/` and `tmp/` can be purged under storage pressure. Keychain items survive app uninstall. |
+| Android behaviour | `filesDir` persists; `cacheDir` can be cleared by the system. Auto Backup may restore app files to a new device, but Keystore keys never migrate. |
+| Tooling | Flipper is gone; inspect databases by pulling the file (`adb exec-out run-as`, simulator container path) and opening it in DB Browser for SQLite or TablePlus. |
+
+## Choosing a storage layer
+
+### Comparison
+
+| Option | API | Encryption | Practical size | Querying | Reactivity | Performance | Use it for |
+|---|---|---|---|---|---|---|---|
+| **AsyncStorage** (`@react-native-async-storage/async-storage`) | Async, string values | None | Android default cap ~6 MB total (configurable), ~2 MB per entry | Key lookup only | None built in | Slow for many keys; bridge-era design | Legacy code, tiny prefs when you can't add native deps |
+| **react-native-mmkv** (v4, Nitro) | **Sync** via JSI | AES-128 or AES-256 with your key | Memory-mapped; keep to a few MB | Key lookup only | Value-change listeners, `useMMKV*` hooks | Microseconds per read/write | Preferences, feature flags, session metadata, persisted Zustand/Query caches |
+| **expo-sqlite** | Async and sync APIs | SQLCipher via config plugin | Effectively disk-bound (GBs) | Full SQL | `addDatabaseChangeListener`, Drizzle `useLiveQuery` | Good; queries run natively | Structured domain data in Expo/bare apps |
+| **op-sqlite** | Async (off JS thread) + sync | SQLCipher build flag | Disk-bound | Full SQL, batch, FTS5, extensions | Reactive queries, update hooks | Among the fastest RN SQLite bindings | Large datasets, heavy queries, bulk sync writes |
+| **WatermelonDB** | Async, lazy, observable models | Not built in (community SQLCipher forks) | Tens of thousands of records comfortably | Query builder (`Q.where`) + raw SQL | RxJS observables, `withObservables` | Lazy loading keeps startup fast | Large offline-first apps that want a ready-made sync protocol |
+| **Realm** (`realm`) | Sync object API | Built-in 64-byte key | Disk-bound | Object queries | Live objects/collections | Fast | Existing Realm apps; avoid for new projects (see below) |
+| **Keychain / Keystore** (`react-native-keychain`, `expo-secure-store`) | Async (SecureStore also has sync getters) | Hardware-backed | Small secrets only (SecureStore warns above ~2 KB) | Key lookup | None | Slow (IPC to security daemon) | Tokens, DB/MMKV encryption keys, credentials |
+| **File system** (`expo-file-system`, `react-native-blob-util`, `@dr.pogodin/react-native-fs`) | Async (new Expo API has sync reads) | OS data protection; encrypt yourself if needed | Disk-bound | None; keep an index in SQLite | None | Streaming, native downloads | Images, video, audio, PDFs, exports |
+| **TanStack Query persistence** | Layer on top of a KV store | Inherits from storage | Whole cache serialized; keep it small | Query keys | Query observers | Throttled writes of the whole cache | Offline reads of server state, resuming paused mutations |
+| **redux-persist / zustand persist** | Layer on top of a KV store | Inherits from storage | Serialized slice; keep it small | None | Store subscriptions | Serializes on change | UI and client state that must survive restarts |
+
+> [!WARNING] Realm status
+> MongoDB deprecated **Atlas Device Sync and the Atlas Device SDKs in September 2024** (end-of-life September 2025). The Realm database itself remains open source, but it no longer has MongoDB's active product investment. For new projects prefer a SQLite-based stack; if you need managed sync, evaluate SQLite-backed sync engines (PowerSync, ElectricSQL and similar) or build the protocol described below. Existing Realm apps should plan a migration path rather than panic-rewrite.
+
+### Decision flowchart
+
+```mermaid
+flowchart TD
+    Begin(["What are you storing?"]) --> secret{"A secret?<br/>token, key, password"}
+    secret -->|"yes"| kc["Keychain / Keystore"]
+    secret -->|"no"| blob{"Binary or large blob?"}
+    blob -->|"yes"| fs["File system<br/>+ metadata row in SQLite"]
+    blob -->|"no"| cache{"Pure cache of<br/>server responses?"}
+    cache -->|"yes"| tq["TanStack Query or RTK Query<br/>+ persister on MMKV"]
+    cache -->|"no"| rel{"Relational, large,<br/>queried or synced?"}
+    rel -->|"no"| startup{"Needed synchronously<br/>at startup?"}
+    startup -->|"yes"| mmkv["MMKV<br/>+ Zustand persist"]
+    startup -->|"no"| kvany["MMKV or AsyncStorage"]
+    rel -->|"yes"| scale{"Tens of thousands of rows,<br/>heavy queries or bulk sync?"}
+    scale -->|"yes"| big["op-sqlite or WatermelonDB<br/>or a managed sync engine"]
+    scale -->|"no"| sqlite["expo-sqlite<br/>optionally with Drizzle"]
+```
+*Figure: Pick storage by data shape, not by habit.*
+
+**Default recommendation for a new app in 2026:** Keychain/SecureStore for secrets, MMKV for small synchronous state (including the persisted TanStack Query cache and Zustand stores), SQLite (expo-sqlite, or op-sqlite when you need raw throughput) for domain data, and the file system for media. Reach for WatermelonDB or a managed sync engine only when the sync problem is big enough to justify the dependency.
+
+> [!TIP]
+> MMKV's synchronous reads are what make it special: you can read the theme, locale and "has onboarded" flag during the first render with no loading flash. Anything that forces an `await` before first paint is a startup-time cost.
+
+## Setup — iOS
+
+1. **Install pods** after adding any native storage library: `cd ios && pod install` (or `npx pod-install`). MMKV v4 also needs `react-native-nitro-modules`.
+2. **Choose the file protection level deliberately.** New files default to `NSFileProtectionCompleteUntilFirstUserAuthentication`: readable after the first unlock since boot, including in the background. If you enable the Data Protection capability with `NSFileProtectionComplete` in `ios/<AppName>/<AppName>.entitlements`, your database becomes unreadable while the device is locked, which breaks background sync and silent-push handlers.
+
+```xml title="ios/MyApp/MyApp.entitlements"
+<key>com.apple.developer.default-data-protection</key>
+<string>NSFileProtectionCompleteUntilFirstUserAuthentication</string>
+```
+
+3. **Keychain accessibility must match background use.** Store DB/MMKV keys with `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY`, not `WHEN_UNLOCKED`, if any background task needs to open the encrypted store. `THIS_DEVICE_ONLY` also keeps the key out of iCloud Keychain and encrypted backups.
+4. **Handle Keychain survival across reinstall.** Keychain entries persist after uninstall, while app files do not. On first launch, check an MMKV/UserDefaults flag; if it's missing, wipe stale Keychain items (old tokens, keys for databases that no longer exist).
+5. **SQLCipher (op-sqlite)**: enable it in `package.json` and reinstall pods.
+
+```json title="package.json"
+{
+  "op-sqlite": {
+    "sqlcipher": true
+  }
+}
+```
+
+## Setup — Android
+
+1. **AsyncStorage size cap** (only if you still use it): raise it in `android/gradle.properties`.
+
+```properties title="android/gradle.properties"
+AsyncStorage_db_size_in_MB=20
+```
+
+2. **Exclude encrypted stores from Auto Backup.** Auto Backup can restore MMKV and SQLite files to a new device, but the Android Keystore key that encrypted them does not migrate, so the restored files are undecryptable garbage and your app may crash on launch. Either set `android:allowBackup="false"` (the React Native template default) or exclude those paths:
+
+```xml title="android/app/src/main/res/xml/data_extraction_rules.xml"
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="mmkv/" />
+        <exclude domain="database" path="app.db" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="mmkv/" />
+        <exclude domain="database" path="app.db" />
+    </device-transfer>
+</data-extraction-rules>
+```
+
+```xml title="android/app/src/main/AndroidManifest.xml"
+<application
+    android:allowBackup="true"
+    android:dataExtractionRules="@xml/data_extraction_rules"
+    android:fullBackupContent="@xml/backup_rules">
+```
+
+`dataExtractionRules` applies on Android 12+; `fullBackupContent` (same exclusions, older format) covers earlier versions. The exact domain paths depend on where each library writes (op-sqlite and expo-sqlite use different directories), so verify with `adb shell run-as <package> ls -R`.
+
+3. **SQLCipher** for op-sqlite uses the same `package.json` flag; rebuild with `cd android && ./gradlew clean`.
+
+### Expo (CNG) equivalents
+
+```json title="app.json"
+{
+  "expo": {
+    "android": { "allowBackup": false },
+    "plugins": [
+      ["expo-sqlite", { "useSQLCipher": true }],
+      "expo-secure-store"
+    ]
+  }
+}
+```
+
+Install native storage libraries with `npx expo install react-native-mmkv react-native-nitro-modules` (or `@op-engineering/op-sqlite`), then `npx expo prebuild --clean` and build a development client. Backup exclusion rules for Expo need a small config plugin (or `allowBackup: false`).
+
+## Implementation — key-value storage with MMKV
+
+### Step 1 — Generate the encryption key and keep it in the Keychain
+
+MMKV encryption is only as good as the key's hiding place. Hard-coding the key in JS is pointless (the bundle is trivially extractable). Generate a random key on first launch, store it in the Keychain/Keystore, and read it before creating the encrypted instance.
+
+```ts title="src/storage/encryptionKey.ts"
+import * as Keychain from 'react-native-keychain';
+import { getRandomBytes } from 'expo-crypto';
+
+const SERVICE = 'com.example.app.storage-key';
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = '';
+  bytes.forEach((b) => (binary += String.fromCharCode(b)));
+  return btoa(binary); // Hermes ships btoa/atob
+}
+
+/** Returns a 32-character key (192 bits of entropy), creating it on first run. */
+export async function getOrCreateStorageKey(): Promise<string> {
+  const existing = await Keychain.getGenericPassword({ service: SERVICE });
+  if (existing) return existing.password;
+
+  const key = toBase64(getRandomBytes(24)); // 24 bytes -> 32 base64 chars
+  await Keychain.setGenericPassword('storage', key, {
+    service: SERVICE,
+    // readable by background tasks after first unlock, never synced to other devices
+    accessible: Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+  });
+  return key;
+}
+```
+
+> [!NOTE]
+> `react-native-keychain` is async, so an encrypted MMKV instance can't exist at module-evaluation time. Either gate rendering on a short bootstrap (below), or use `expo-secure-store`'s synchronous `getItem`/`setItem` to create the instance synchronously. Keep a separate **unencrypted** instance for the few values you need before the key is available (theme, locale).
+
+### Step 2 — Instances and a typed wrapper
+
+Use separate instances for separate lifetimes: a device-wide instance that survives logout, a per-user instance you can wipe in one call, and a cache instance you can drop on version bumps.
+
+```ts title="src/storage/mmkv.ts"
+import { createMMKV, type MMKV } from 'react-native-mmkv';
+import { getOrCreateStorageKey } from './encryptionKey';
+
+/** Device-wide, unencrypted, safe to read during the first render. */
+export const deviceStore = createMMKV({ id: 'device' });
+
+let userStore: MMKV | null = null;
+let cacheStore: MMKV | null = null;
+
+export async function initUserStorage(userId: string): Promise<void> {
+  const encryptionKey = await getOrCreateStorageKey();
+  userStore = createMMKV({ id: `user-${userId}`, encryptionKey, encryptionType: 'AES-256' });
+  cacheStore = createMMKV({ id: `cache-${userId}`, encryptionKey, encryptionType: 'AES-256' });
+}
+
+export function requireUserStore(): MMKV {
+  if (!userStore) throw new Error('User storage not initialised');
+  return userStore;
+}
+
+export function requireCacheStore(): MMKV {
+  if (!cacheStore) throw new Error('Cache storage not initialised');
+  return cacheStore;
+}
+
+export function wipeUserStorage(): void {
+  userStore?.clearAll();
+  cacheStore?.clearAll();
+  userStore = null;
+  cacheStore = null;
+}
+```
+
+A typed wrapper stops the "stringly-typed key soup" and centralises JSON parsing with validation, so a corrupted or old-shaped value degrades to a default instead of crashing:
+
+```ts title="src/storage/typedStorage.ts"
+import type { MMKV } from 'react-native-mmkv';
+import { z } from 'zod';
+
+export function createTypedStorage<S extends Record<string, z.ZodTypeAny>>(store: MMKV, schema: S) {
+  type Key = keyof S & string;
+  type Value<K extends Key> = z.infer<S[K]>;
+
+  return {
+    get<K extends Key>(key: K): Value<K> | undefined {
+      const raw = store.getString(key);
+      if (raw === undefined) return undefined;
+      try {
+        const parsed = schema[key].safeParse(JSON.parse(raw));
+        return parsed.success ? parsed.data : undefined;
+      } catch {
+        return undefined; // corrupted JSON
+      }
+    },
+    set<K extends Key>(key: K, value: Value<K>): void {
+      store.set(key, JSON.stringify(schema[key].parse(value)));
+    },
+    remove(key: Key): void {
+      store.remove(key);
+    },
+  };
+}
+
+export const deviceSchema = {
+  theme: z.enum(['light', 'dark', 'system']),
+  onboardingDone: z.boolean(),
+  lastSeenVersion: z.string(),
+};
+```
+
+In v4 the API is `createMMKV()`, `remove()` (formerly `delete()`), and `encrypt()`/`decrypt()` for re-keying; v3 used `new MMKV()`. Hooks (`useMMKVString`, `useMMKVBoolean`, `useMMKVObject`) and `addOnValueChangedListener` give you reactivity when a value changes elsewhere.
+
+### Step 3 — Zustand `persist` adapter
+
+```ts title="src/storage/zustandStorage.ts"
+import type { StateStorage } from 'zustand/middleware';
+import type { MMKV } from 'react-native-mmkv';
+
+export const mmkvStateStorage = (store: MMKV): StateStorage => ({
+  getItem: (name) => store.getString(name) ?? null,
+  setItem: (name, value) => store.set(name, value),
+  removeItem: (name) => store.remove(name),
+});
+```
+
+```ts title="src/state/settingsStore.ts"
+import { create } from 'zustand';
+import { createJSONStorage, persist } from 'zustand/middleware';
+import { deviceStore } from '../storage/mmkv';
+import { mmkvStateStorage } from '../storage/zustandStorage';
+
+type Units = 'metric' | 'imperial';
+interface SettingsState {
+  theme: 'light' | 'dark' | 'system';
+  units: Units;
+  setTheme: (theme: SettingsState['theme']) => void;
+  setUnits: (units: Units) => void;
+}
+
+export const useSettings = create<SettingsState>()(
+  persist(
+    (set) => ({
+      theme: 'system',
+      units: 'metric',
+      setTheme: (theme) => set({ theme }),
+      setUnits: (units) => set({ units }),
+    }),
+    {
+      name: 'settings',
+      storage: createJSONStorage(() => mmkvStateStorage(deviceStore)),
+      version: 2,
+      partialize: (s) => ({ theme: s.theme, units: s.units }), // never persist functions
+      migrate: (persisted, version) => {
+        const state = persisted as Record<string, unknown>;
+        if (version < 2) {
+          // v1 stored { darkMode: boolean }
+          state.theme = state.darkMode ? 'dark' : 'system';
+          delete state.darkMode;
+        }
+        return state as unknown as SettingsState;
+      },
+    },
+  ),
+);
+```
+
+Because MMKV is synchronous, Zustand rehydrates **before the first render**: no `hasHydrated()` gate and no theme flash. With an async storage (AsyncStorage) you must wait for `useSettings.persist.onFinishHydration` before trusting the state.
+
+## Implementation — SQLite
+
+### Step 1 — Schema and migrations with `PRAGMA user_version`
+
+SQLite stores a free integer in the database header, `user_version`, which is ideal for tracking schema version. Run migrations once at startup, each step in its own transaction, before any repository touches the database.
+
+```ts title="src/db/migrations.ts"
+import type { SQLiteDatabase } from 'expo-sqlite';
+
+type Migration = (db: SQLiteDatabase) => Promise<void>;
+
+const migrations: Migration[] = [
+  // v1: initial schema
+  async (db) => {
+    await db.execAsync(`
+      CREATE TABLE tasks (
+        id          TEXT PRIMARY KEY NOT NULL,   -- client-generated UUID
+        project_id  TEXT NOT NULL,
+        title       TEXT NOT NULL,
+        done        INTEGER NOT NULL DEFAULT 0,
+        version     INTEGER NOT NULL DEFAULT 0,  -- server version the row is based on
+        updated_at  INTEGER NOT NULL,
+        deleted_at  INTEGER                      -- tombstone
+      );
+      CREATE INDEX idx_tasks_project ON tasks(project_id, deleted_at, updated_at DESC);
+      CREATE TABLE sync_state (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+    `);
+  },
+  // v2: outbox for offline mutations
+  async (db) => {
+    await db.execAsync(`
+      CREATE TABLE outbox (
+        id              TEXT PRIMARY KEY NOT NULL,  -- doubles as the idempotency key
+        entity          TEXT NOT NULL,
+        entity_id       TEXT NOT NULL,
+        op              TEXT NOT NULL CHECK (op IN ('create','update','delete')),
+        payload         TEXT NOT NULL,
+        base_version    INTEGER,
+        status          TEXT NOT NULL DEFAULT 'pending',
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        last_error      TEXT,
+        created_at      INTEGER NOT NULL
+      );
+      CREATE INDEX idx_outbox_ready ON outbox(status, next_attempt_at, created_at);
+    `);
+  },
+];
+
+export async function migrate(db: SQLiteDatabase): Promise<void> {
+  await db.execAsync('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+  const row = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version');
+  let current = row?.user_version ?? 0;
+
+  while (current < migrations.length) {
+    const next = current + 1;
+    await db.withExclusiveTransactionAsync(async (tx) => {
+      await migrations[current](tx);
+      await tx.execAsync(`PRAGMA user_version = ${next}`); // header write is transactional
+    });
+    current = next;
+  }
+}
+```
+
+```tsx title="src/db/DatabaseProvider.tsx"
+import { SQLiteProvider } from 'expo-sqlite';
+import type { PropsWithChildren } from 'react';
+import { migrate } from './migrations';
+
+export function DatabaseProvider({ children }: PropsWithChildren) {
+  return (
+    <SQLiteProvider databaseName="app.db" onInit={migrate} options={{ enableChangeListener: true }}>
+      {children}
+    </SQLiteProvider>
+  );
+}
+```
+
+Migration rules that save you in production:
+
+- **Append-only.** Never edit a shipped migration; add a new one. Users can jump from v1 to v7 in one update.
+- **SQLite's `ALTER TABLE` is limited.** Adding a column is easy; dropping or changing type often means create-new-table, copy, drop, rename, inside one transaction.
+- **Test upgrades from real old databases**, not just fresh installs. Keep fixture DB files from each released version and run migrations against them in CI.
+- **Never let the app run on a half-migrated DB.** If a migration throws, report it and show a recovery screen; don't swallow the error.
+
+### Step 2 — Transactions and batching
+
+Every write that must be atomic (local row + outbox item, or a whole sync page) goes in one transaction. Transactions are also the biggest performance lever: 1,000 inserts in one transaction are orders of magnitude faster than 1,000 autocommitted inserts, because each commit is an fsync.
+
+```ts title="src/db/tasksRepo.ts"
+import type { SQLiteDatabase } from 'expo-sqlite';
+import { randomUUID } from 'expo-crypto';
+
+export async function renameTask(db: SQLiteDatabase, taskId: string, title: string) {
+  const now = Date.now();
+  await db.withExclusiveTransactionAsync(async (tx) => {
+    const task = await tx.getFirstAsync<{ version: number }>(
+      'SELECT version FROM tasks WHERE id = ? AND deleted_at IS NULL',
+      taskId,
+    );
+    if (!task) throw new Error(`Task ${taskId} not found`);
+    await tx.runAsync('UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?', title, now, taskId);
+    await tx.runAsync(
+      `INSERT INTO outbox (id, entity, entity_id, op, payload, base_version, created_at)
+       VALUES (?, 'task', ?, 'update', ?, ?, ?)`,
+      randomUUID(), taskId, JSON.stringify({ title }), task.version, now,
+    );
+  });
+}
+```
+
+`withExclusiveTransactionAsync` guarantees that only queries issued through `tx` run inside the transaction; with plain `withTransactionAsync`, other async queries on the same connection can interleave. Always use bound parameters (`?`), never string interpolation, for values.
+
+### Step 3 — Indexes and query plans
+
+Index for the queries your screens actually run, in column order `equality filters -> range/sort`. Verify with `EXPLAIN QUERY PLAN`: you want `SEARCH ... USING INDEX`, not `SCAN tasks`.
+
+```ts
+const plan = await db.getAllAsync(
+  'EXPLAIN QUERY PLAN SELECT * FROM tasks WHERE project_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 50',
+  projectId,
+);
+```
+
+Also: paginate with keyset pagination (`WHERE updated_at < ?`) rather than large `OFFSET`s, select only the columns a list needs, and use FTS5 virtual tables for search instead of `LIKE '%term%'`.
+
+### Step 4 — An ORM option: Drizzle with expo-sqlite
+
+Drizzle gives typed schemas, a typed query builder and generated SQL migrations, and works with expo-sqlite (and op-sqlite). It's a reasonable choice if the team likes SQL but wants types; it adds build configuration, so adopt it deliberately.
+
+```ts title="src/db/schema.ts"
+import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+
+export const tasks = sqliteTable('tasks', {
+  id: text('id').primaryKey(),
+  projectId: text('project_id').notNull(),
+  title: text('title').notNull(),
+  done: integer('done', { mode: 'boolean' }).notNull().default(false),
+  version: integer('version').notNull().default(0),
+  updatedAt: integer('updated_at').notNull(),
+  deletedAt: integer('deleted_at'),
+});
+```
+
+```tsx title="src/features/tasks/useProjectTasks.ts"
+import { and, desc, eq, isNull } from 'drizzle-orm';
+import { drizzle, useLiveQuery } from 'drizzle-orm/expo-sqlite';
+import { openDatabaseSync } from 'expo-sqlite';
+import { tasks } from '../../db/schema';
+
+const sqlite = openDatabaseSync('app.db', { enableChangeListener: true });
+export const db = drizzle(sqlite);
+
+export function useProjectTasks(projectId: string) {
+  return useLiveQuery(
+    db.select().from(tasks)
+      .where(and(eq(tasks.projectId, projectId), isNull(tasks.deletedAt)))
+      .orderBy(desc(tasks.updatedAt)),
+    [projectId],
+  );
+}
+```
+
+Migrations come from `drizzle-kit generate` (`dialect: 'sqlite'`, `driver: 'expo'`) and run with `useMigrations(db, migrations)` from `drizzle-orm/expo-sqlite/migrator`; bundling the `.sql` files requires adding `sql` to Metro's `sourceExts` and an inline-import Babel plugin. Pick **one** migration system: don't mix Drizzle migrations with hand-rolled `user_version` steps.
+
+### Step 5 — Keeping heavy queries off the JS thread (op-sqlite)
+
+Every millisecond the JS thread spends marshalling 10,000 rows is a dropped frame. op-sqlite's async `execute` runs the query on a separate native thread and only hands the result to JS, and `executeBatch` applies thousands of statements in a single native transaction, ideal for applying a sync page.
+
+```ts title="src/db/opsqlite.ts"
+import { open } from '@op-engineering/op-sqlite';
+import { getOrCreateStorageKey } from '../storage/encryptionKey';
+
+export async function openAppDb() {
+  const encryptionKey = await getOrCreateStorageKey(); // requires the sqlcipher build flag
+  return open({ name: 'app.db', encryptionKey });
+}
+
+type AppDb = Awaited<ReturnType<typeof openAppDb>>;
+
+export async function applyServerTasks(db: AppDb, rows: ServerTask[]) {
+  await db.executeBatch(
+    rows.map((r) => [
+      `INSERT INTO tasks (id, project_id, title, done, version, updated_at, deleted_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         title = excluded.title, done = excluded.done, version = excluded.version,
+         updated_at = excluded.updated_at, deleted_at = excluded.deleted_at
+       WHERE excluded.version > tasks.version`,
+      [r.id, r.projectId, r.title, r.done ? 1 : 0, r.version, r.updatedAt, r.deletedAt ?? null],
+    ]),
+  );
+}
+
+interface ServerTask {
+  id: string; projectId: string; title: string; done: boolean;
+  version: number; updatedAt: number; deletedAt?: number | null;
+}
+```
+
+The `WHERE excluded.version > tasks.version` guard makes applying a page **idempotent and order-safe**: re-applying the same page, or an older one, is a no-op. Remember that the JS thread still pays for *using* the result, so page large reads and render them with FlashList.
+
+## Implementation — WatermelonDB
+
+WatermelonDB is an observable, lazily loaded database on top of SQLite, with a documented sync protocol. It fits apps with large local datasets (tens of thousands of records) that want reactive lists and don't want to design sync from scratch. Before adopting, check its release cadence and New Architecture compatibility for your React Native version.
+
+### Lazy loading and observables
+
+Nothing is loaded until a component observes it. A query returns an observable; `withObservables` subscribes the component, and only records that actually change trigger re-renders.
+
+```tsx title="src/features/tasks/TaskList.tsx"
+import { Q } from '@nozbe/watermelondb';
+import { withObservables } from '@nozbe/watermelondb/react';
+import { FlashList } from '@shopify/flash-list';
+import { database } from '../../db/watermelon';
+import type Task from '../../db/models/Task';
+import { TaskRow } from './TaskRow';
+
+function TaskList({ tasks }: { tasks: Task[] }) {
+  return <FlashList data={tasks} renderItem={({ item }) => <TaskRow task={item} />} />;
+}
+
+const enhance = withObservables(['projectId'], ({ projectId }: { projectId: string }) => ({
+  tasks: database.get<Task>('tasks')
+    .query(Q.where('project_id', projectId), Q.sortBy('updated_at', Q.desc))
+    .observe(),
+}));
+
+export default enhance(TaskList);
+```
+
+Writes happen inside `database.write(async () => { ... })`; WatermelonDB tracks local changes itself (per-record `_status` and `_changed` columns), which is what makes its sync possible.
+
+### The sync protocol
+
+`synchronize()` runs a pull then a push. Your backend implements two endpoints; WatermelonDB does the bookkeeping.
+
+```ts title="src/sync/watermelonSync.ts"
+import { synchronize } from '@nozbe/watermelondb/sync';
+import { database } from '../db/watermelon';
+import { api } from '../api/client';
+
+export async function syncWatermelon(): Promise<void> {
+  await synchronize({
+    database,
+    pullChanges: async ({ lastPulledAt, schemaVersion, migration }) => {
+      const res = await api.get('/sync', {
+        params: { last_pulled_at: lastPulledAt ?? 0, schema_version: schemaVersion, migration: JSON.stringify(migration) },
+      });
+      // { changes: { tasks: { created: [], updated: [], deleted: ['id1'] } }, timestamp: 1758800000000 }
+      return { changes: res.data.changes, timestamp: res.data.timestamp };
+    },
+    pushChanges: async ({ changes, lastPulledAt }) => {
+      await api.post('/sync', { changes }, { params: { last_pulled_at: lastPulledAt } });
+    },
+    migrationsEnabledAtVersion: 1,
+  });
+}
+```
+
+Backend contract, which is where most WatermelonDB sync bugs actually live:
+
+- `timestamp` must be the **server time at which the pull snapshot was taken** (inside the same DB transaction as the change query), never "now" after the query finished, or concurrent writes fall into the gap.
+- `deleted` returns IDs of rows deleted since `last_pulled_at`, so the server must keep tombstones.
+- Push must be applied **transactionally**; if any record conflicts (it changed on the server after `last_pulled_at`), reject the whole push so the client pulls, resolves, and retries.
+- Server-side, the `created`/`updated` distinction is advisory; upsert both.
+
+## Offline-first architecture
+
+### Principles
+
+1. **The local database is the source of truth for the UI.** Screens subscribe to local queries; they never await the network to render domain data.
+2. **Writes are local first.** A user action writes the row *and* an outbox item in one transaction, so the UI updates instantly and the intent survives crashes and restarts.
+3. **A sync engine reconciles in the background**: push the outbox, then pull changes since a cursor, then apply them transactionally.
+4. **The server stays authoritative for validation and conflicts.** The client proposes; the server's canonical record wins the final word unless you've designed a merge.
+
+```mermaid
+flowchart TD
+    User(["User action"]) --> Repo["Repository write"]
+    Repo -->|"same transaction"| Local[("Local tables")]
+    Repo -->|"same transaction"| Outbox[("Outbox table")]
+    Local -->|"change listener"| Screen["UI re-renders from local"]
+    Trig{"Trigger: launch, foreground,<br/>reconnect, push, timer"} --> Engine["Sync engine"]
+    Outbox --> Engine
+    Engine -->|"push with Idempotency-Key"| API["Backend API"]
+    API -->|"ack + canonical record"| Engine
+    Engine -->|"pull since cursor"| API
+    Engine -->|"apply upserts + tombstones"| Local
+    Engine -->|"save cursor"| Meta[("sync_state")]
+```
+*Figure: Offline-first architecture. The UI only reads local data; the sync engine is the only component that talks to the backend about domain data.*
+
+### The outbox (mutation queue)
+
+The outbox is a durable, ordered queue of intents. Storing it in the same database as the data is what makes "write + enqueue" atomic; storing it in MMKV or memory breaks that guarantee.
+
+Design rules:
+
+- **Per-entity FIFO.** Operations on the same record must reach the server in order (create before update before delete). Operations on different records can be parallel or reordered.
+- **Coalesce** before sending: `create + update` becomes one `create` with the merged payload; `update + update` merges fields; `create + delete` of a never-synced row cancels out entirely.
+- **Crash recovery.** Items left `inflight` when the app died are reset to `pending` on launch; idempotency keys make the resend safe.
+- **Send intents where possible** (`completeTask`, `incrementStock(by: 2)`) rather than full snapshots; intents merge far better than state.
+
+```ts title="src/sync/outbox.ts"
+import type { SQLiteDatabase } from 'expo-sqlite';
+import { ApiError, pushMutation } from '../api/mutations';
+
+interface OutboxRow {
+  id: string; entity: string; entity_id: string; op: 'create' | 'update' | 'delete';
+  payload: string; base_version: number | null; attempts: number;
+}
+
+const MAX_ATTEMPTS = 8;
+const backoffMs = (attempt: number) =>
+  Math.min(5 * 60_000, 1_000 * 2 ** attempt) * (0.5 + Math.random() / 2); // capped, jittered
+
+export async function resetInflight(db: SQLiteDatabase) {
+  await db.runAsync(`UPDATE outbox SET status = 'pending' WHERE status = 'inflight'`);
+}
+
+export async function drainOutbox(db: SQLiteDatabase, deadline: number): Promise<void> {
+  while (Date.now() < deadline) {
+    // Oldest ready item whose entity has no older item still queued (per-entity FIFO).
+    const item = await db.getFirstAsync<OutboxRow>(
+      `SELECT * FROM outbox o
+       WHERE o.status = 'pending' AND o.next_attempt_at <= ?
+         AND NOT EXISTS (SELECT 1 FROM outbox p WHERE p.entity_id = o.entity_id AND p.created_at < o.created_at)
+       ORDER BY o.created_at LIMIT 1`,
+      Date.now(),
+    );
+    if (!item) return;
+
+    await db.runAsync(`UPDATE outbox SET status = 'inflight' WHERE id = ?`, item.id);
+    try {
+      const canonical = await pushMutation(item); // sends Idempotency-Key: item.id
+      await db.withExclusiveTransactionAsync(async (tx) => {
+        await tx.runAsync('DELETE FROM outbox WHERE id = ?', item.id);
+        await tx.runAsync(
+          'UPDATE tasks SET version = ?, updated_at = ? WHERE id = ? AND version <= ?',
+          canonical.version, canonical.updatedAt, item.entity_id, canonical.version,
+        );
+      });
+    } catch (e) {
+      const err = e instanceof ApiError ? e : new ApiError(0, String(e));
+      const permanent = err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 429;
+      const attempts = item.attempts + 1;
+      if (err.status === 409) {
+        await db.runAsync(`UPDATE outbox SET status = 'conflict', last_error = ? WHERE id = ?`, err.message, item.id);
+      } else if (permanent || attempts >= MAX_ATTEMPTS) {
+        await db.runAsync(`UPDATE outbox SET status = 'dead', attempts = ?, last_error = ? WHERE id = ?`, attempts, err.message, item.id);
+      } else {
+        await db.runAsync(
+          `UPDATE outbox SET status = 'pending', attempts = ?, next_attempt_at = ?, last_error = ? WHERE id = ?`,
+          attempts, Date.now() + backoffMs(attempts), err.message, item.id,
+        );
+      }
+    }
+  }
+}
+```
+
+The `deadline` parameter matters: the same function runs from a foreground trigger, a reconnect event and a 30-second background task (see [Background Tasks](background-tasks.html)), so it must stop cleanly when its budget ends.
+
+```mermaid
+stateDiagram-v2
+    state "Waiting (backoff)" as Waiting
+    state "Dead letter" as Dead
+    [*] --> Pending : enqueued with local write
+    Pending --> InFlight : processor picks item
+    InFlight --> [*] : 2xx ack, item deleted
+    InFlight --> Waiting : network error, 5xx, 429
+    Waiting --> Pending : backoff elapsed or reconnect
+    InFlight --> Conflict : 409 version mismatch
+    Conflict --> Pending : merged and rebased on server version
+    Conflict --> [*] : server wins, local change reverted
+    InFlight --> Dead : 4xx validation or max attempts
+    Dead --> Pending : user taps retry
+    Dead --> [*] : user discards, local row reverted
+    InFlight --> Pending : app killed mid-request, reset on launch
+```
+*Figure: Lifecycle of an outbox item. Dead and Conflict items must be surfaced to the user, never silently dropped.*
+
+### Optimistic UI
+
+With a local-first write path, optimistic UI is free: the row is already in the database, so every observer re-renders. What you add is **status visibility**: join the outbox to show "pending", "failed, tap to retry" or "conflict" badges, and on permanent failure revert the local row to the last server-confirmed values (keep them in a `server_snapshot` column or re-pull the record).
+
+### Idempotency keys
+
+Networks lose responses, not just requests: the server may have committed the write while the client saw a timeout. Every mutation carries a client-generated key (the outbox item ID) in an `Idempotency-Key` header; the server stores `key -> response` for a retention window (e.g. 24–72 hours) and replays the stored response on a duplicate. Client-generated primary keys (UUIDv4/v7, ULID) complement this: a retried `create` can never produce a second row, and you can reference a record offline before the server has ever seen it.
+
+### Incremental sync with cursors
+
+```mermaid
+sequenceDiagram
+    participant UI as UI
+    participant DB as Local SQLite
+    participant SE as Sync engine
+    participant API as Backend
+    UI->>DB: write row + outbox item (1 txn)
+    DB-->>UI: change event, optimistic render
+    Note over SE: trigger - reconnect, foreground, push
+    loop each ready outbox item
+        SE->>API: POST mutation with Idempotency-Key
+        alt 2xx or replayed duplicate
+            API-->>SE: canonical record + version
+            SE->>DB: delete outbox item, update version
+        else 409 conflict
+            API-->>SE: current server record
+            SE->>DB: merge or mark conflict
+        else network error or 5xx
+            SE->>DB: attempts + 1, schedule retry
+        end
+    end
+    SE->>API: GET /changes?cursor=c41
+    API-->>SE: upserts, tombstones, next cursor c57
+    SE->>DB: apply page + save cursor (1 txn)
+    DB-->>UI: change event, re-render
+```
+*Figure: One sync cycle. Push first so the pull already reflects the client's own writes; page until the server says has_more is false.*
+
+Cursor design is where subtle data loss hides:
+
+- **`updated_at > lastPulledAt` alone is unsafe.** A transaction that started earlier can commit later with an older timestamp, and the client never sees it. Prefer a server-assigned, monotonically increasing **change sequence** set at commit time (a sequence column, Postgres logical replication LSN, or a changes table), or pull with an overlap window and dedupe by `version`.
+- Use **composite cursors** (`updated_at`, `id`) when timestamps collide, and make the cursor opaque to the client.
+- Apply each page and save its cursor **in the same local transaction**, so a crash can't advance the cursor past unapplied data.
+- Provide a **full resync** path (schema change, cursor too old, corrupted DB) and let the server answer "cursor expired, resync".
+- Scope pulls to what the user needs (e.g. last 90 days, assigned projects) and backfill older data lazily.
+
+### Deletes and tombstones
+
+If a row simply disappears on the server, an incremental pull has nothing to return, so the client keeps the ghost forever. Deletes must be **soft**: set `deleted_at` (a tombstone), return it in change feeds, and hard-delete after a retention period longer than the maximum time a client can stay offline. Clients that come back after tombstones were purged need a full resync. Locally, filter `deleted_at IS NULL` in every query (a view or repository helper keeps that consistent), and purge local tombstones once the delete has been acknowledged.
+
+### Conflict resolution
+
+A conflict exists when two replicas changed the same data since their common base version. Detect it with **versions**, not timestamps: the client sends `base_version`; if the server's current version differs, it's a conflict.
+
+| Strategy | How it works | Pros | Cons / when to avoid |
+|---|---|---|---|
+| Last-write-wins (LWW) | Latest timestamp overwrites | Trivial | Silent data loss; device clock skew (use server or hybrid logical clocks) |
+| Server-wins | Server rejects stale writes; client discards or re-applies | Simple, safe for money/inventory | Offline edits can be lost; needs UX |
+| Client-wins | Client overwrites regardless | Good for single-user, single-device data | Dangerous with sharing or multiple devices |
+| Field-level (three-way) merge | Compare base, local, remote per field; merge non-overlapping edits | Few user-visible conflicts | Needs base snapshot; overlapping edits still need a rule |
+| Version vectors | Per-replica counters detect true concurrency vs causal succession | Correct detection in multi-master setups | More metadata; still needs a resolution rule |
+| CRDTs (Yjs, Automerge) | Data types that merge deterministically without coordination | Automatic convergence; great for text and collaboration | Metadata growth, harder querying, heavier to adopt |
+| Domain rules / manual | Business logic, or ask the user | Correct semantics | Engineering and UX cost |
+
+A pragmatic default: server-authoritative versions, field-level merge for independent fields, operation-based updates for counters, and a conflict UI only for true overlapping edits.
+
+```ts title="src/sync/merge.ts"
+export function threeWayMerge<T extends Record<string, unknown>>(base: T, local: T, remote: T) {
+  const merged = { ...remote };
+  const conflicts: (keyof T)[] = [];
+  for (const key of Object.keys(local) as (keyof T)[]) {
+    const localChanged = !Object.is(local[key], base[key]);
+    const remoteChanged = !Object.is(remote[key], base[key]);
+    if (localChanged && !remoteChanged) merged[key] = local[key];
+    else if (localChanged && remoteChanged && !Object.is(local[key], remote[key])) conflicts.push(key);
+  }
+  return { merged, conflicts }; // conflicts empty -> re-enqueue merged update on remote.version
+}
+```
+
+> [!TIP] Buy vs build
+> Building sync is a backend project as much as a mobile one. Managed engines such as PowerSync or ElectricSQL (Postgres to on-device SQLite), or Legend-State's sync plugins, can remove months of work. Evaluate them on self-hosting, auth integration, partial replication rules and pricing before committing.
+
+## Connectivity
+
+### NetInfo: `isConnected` vs `isInternetReachable`
+
+| Field | Meaning | Caveat |
+|---|---|---|
+| `isConnected` | The device has an active network interface (Wi-Fi, cellular) | True on captive portals, dead Wi-Fi, VPN blackholes |
+| `isInternetReachable` | NetInfo probed a reachability URL and got the expected response | `null` until the first probe finishes; probes cost battery and can be blocked by corporate networks |
+| `type` / `details` | wifi, cellular, `isConnectionExpensive`, cellular generation | Use to defer large downloads on metered networks |
+
+Treat NetInfo as a **hint**, not a gate. It's good for UI ("You're offline" banner), for resuming queues on reconnect, and for deferring big downloads on cellular. It's bad as a precondition for requests: it can say "online" when requests will fail and lag behind reality when the network returns.
+
+### Just try the request
+
+The only reliable connectivity test is the request itself. Send it with a timeout, classify the failure, and retry with capped exponential backoff plus jitter (jitter prevents every client hammering the server at the same instant after an outage). Retry only idempotent requests, or requests carrying an idempotency key.
+
+```ts title="src/api/withRetry.ts"
+export async function fetchWithRetry(url: string, init: RequestInit = {}, retries = 3, timeoutMs = 15_000) {
+  for (let attempt = 0; ; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...init, signal: controller.signal });
+      if (res.status < 500 && res.status !== 429) return res; // success or non-retryable 4xx
+      if (attempt >= retries) return res;
+    } catch (e) {
+      if (attempt >= retries) throw e; // network error or timeout
+    } finally {
+      clearTimeout(timer);
+    }
+    const delay = Math.min(30_000, 500 * 2 ** attempt) * (0.5 + Math.random() / 2);
+    await new Promise((r) => setTimeout(r, delay));
+  }
+}
+```
+
+### TanStack Query: `onlineManager`, persistence, paused mutations
+
+For online-first apps, TanStack Query gives most of offline support for free: queries serve the persisted cache, and mutations made offline are **paused**, persisted, and resumed after restart.
+
+```ts title="src/query/queryClient.ts"
+import NetInfo from '@react-native-community/netinfo';
+import { focusManager, onlineManager, QueryClient } from '@tanstack/react-query';
+import { createAsyncStoragePersister } from '@tanstack/query-async-storage-persister';
+import { AppState } from 'react-native';
+import { api } from '../api/client';
+import { requireCacheStore } from '../storage/mmkv';
+import type { NewTodo, Todo } from '../types';
+
+onlineManager.setEventListener((setOnline) =>
+  NetInfo.addEventListener((state) => setOnline(!!state.isConnected)),
+);
+AppState.addEventListener('change', (s) => focusManager.setFocused(s === 'active'));
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: { gcTime: 24 * 60 * 60 * 1000, staleTime: 30_000, networkMode: 'offlineFirst' },
+  },
+});
+
+// Functions can't be serialized: persisted paused mutations find their mutationFn by key.
+queryClient.setMutationDefaults(['todos', 'add'], {
+  mutationFn: (todo: NewTodo) => api.post<Todo>('/todos', todo, { headers: { 'Idempotency-Key': todo.id } }),
+  onMutate: async (todo: NewTodo) => {
+    await queryClient.cancelQueries({ queryKey: ['todos'] });
+    const previous = queryClient.getQueryData<Todo[]>(['todos']);
+    queryClient.setQueryData<Todo[]>(['todos'], (old = []) => [...old, { ...todo, pending: true }]);
+    return { previous };
+  },
+  onError: (_err, _todo, ctx) => queryClient.setQueryData(['todos'], ctx?.previous),
+  onSettled: () => queryClient.invalidateQueries({ queryKey: ['todos'] }),
+  retry: 3,
+});
+
+export const persister = createAsyncStoragePersister({
+  storage: {
+    getItem: async (key) => requireCacheStore().getString(key) ?? null,
+    setItem: async (key, value) => requireCacheStore().set(key, value),
+    removeItem: async (key) => requireCacheStore().remove(key),
+  },
+  throttleTime: 1000,
+});
+```
+
+```tsx title="src/query/QueryProvider.tsx"
+import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client';
+import type { PropsWithChildren } from 'react';
+import { persister, queryClient } from './queryClient';
+
+const CACHE_BUSTER = 'v3'; // bump when cached data shapes change
+
+export function QueryProvider({ children }: PropsWithChildren) {
+  return (
+    <PersistQueryClientProvider
+      client={queryClient}
+      persistOptions={{ persister, maxAge: 24 * 60 * 60 * 1000, buster: CACHE_BUSTER }}
+      onSuccess={() => {
+        // cache restored: replay mutations that were paused when the app was killed
+        queryClient.resumePausedMutations().then(() => queryClient.invalidateQueries());
+      }}
+    >
+      {children}
+    </PersistQueryClientProvider>
+  );
+}
+```
+
+Call sites use `useMutation({ mutationKey: ['todos', 'add'] })` and generate the ID up front (`mutate({ id: randomUUID(), title })`) so retries reuse the same idempotency key. Rules: `gcTime` must be at least `maxAge` or restored queries are garbage-collected immediately; paused mutations resume in parallel, so use a real outbox when ordering between mutations matters.
+
+## Caching strategies
+
+| Concern | Practice |
+|---|---|
+| Stale-while-revalidate | Render cached data immediately, refetch in the background, swap in fresh data. TanStack's `staleTime` controls when a refetch is triggered; show "updated 5 min ago" when data is old. |
+| TTLs | Per data type: prices seconds to minutes, profiles hours, reference data days. Use `maxAge` on the persisted cache and a server `Cache-Control` for HTTP caches. |
+| Invalidation | Event-driven beats time-driven: invalidate on your own mutations, on a push saying "X changed", and on foreground. Invalidate by key prefix (`['todos']`). |
+| Eviction and quotas | Cap caches by count/size (LRU), prune tombstones and old media, check free space before big downloads, and never let caches grow unbounded; the OS or the user will clear everything. |
+| Versioning | Every persisted structure carries a version, with migrations or a buster that discards incompatible data. |
+
+### Versioning and migrating persisted state
+
+A release that changes the shape of persisted state without a migration crashes on launch for every existing user, and it doesn't show up in QA because QA installs fresh. Zustand's `version`/`migrate` is shown in the MMKV section above; redux-persist works the same way:
+
+```ts title="src/state/persist.ts"
+import { createMigrate, type MigrationManifest, type PersistConfig } from 'redux-persist';
+import type { RootState } from './store';
+import { reduxStorage } from './reduxStorage'; // { getItem, setItem, removeItem } returning Promises over MMKV
+
+type Persisted = Record<string, any>;
+
+const migrations: MigrationManifest = {
+  2: (state) => {
+    const s = state as Persisted;
+    return { ...s, settings: { ...s.settings, theme: s.settings?.darkMode ? 'dark' : 'system' } } as typeof state;
+  },
+  3: (state) => {
+    const { legacyCache: _dropped, ...rest } = state as Persisted;
+    return rest as typeof state;
+  },
+};
+
+export const persistConfig: PersistConfig<RootState> = {
+  key: 'root',
+  version: 3,
+  storage: reduxStorage,
+  whitelist: ['settings', 'session'],
+  migrate: createMigrate(migrations, { debug: __DEV__ }),
+};
+```
+
+redux-persist has seen little maintenance for years; for new code prefer Zustand persist or persisting only what you need with MMKV directly. For caches (as opposed to user data), a buster that throws everything away is often the right "migration".
+
+## Files and media offline
+
+| Directory | iOS | Android | Use for |
+|---|---|---|---|
+| Documents (`Paths.document`) | Persistent, **backed up to iCloud**, user-visible if file sharing is enabled | `filesDir`, persistent, included in Auto Backup by default | User-created content that can't be re-downloaded |
+| Cache (`Paths.cache`) | `Library/Caches`, **may be purged** under low storage, not backed up | `cacheDir`, may be cleared by the system or the user | Thumbnails, re-downloadable media |
+| Application Support | Persistent; exclude re-downloadable files from backup | n/a (use `filesDir/no_backup` or backup rules) | Downloaded content that must survive but can be refetched |
+
+Apple's storage guidelines are enforced in review: large re-downloadable content in `Documents` without the "exclude from backup" flag (`NSURLIsExcludedFromBackupKey`) can get an app rejected. `react-native-blob-util` exposes `excludeFromBackupKey(path)`; otherwise add a tiny native module that sets the resource value.
+
+```ts title="src/media/offlineMedia.ts"
+import { Directory, File, Paths } from 'expo-file-system';
+import type { SQLiteDatabase } from 'expo-sqlite';
+
+const mediaDir = new Directory(Paths.document, 'offline-media');
+
+export async function downloadForOffline(db: SQLiteDatabase, assetId: string, url: string, bytes: number) {
+  if (Paths.availableDiskSpace < bytes * 2) throw new Error('Not enough free space');
+  mediaDir.create({ idempotent: true, intermediates: true });
+  const target = new File(mediaDir, `${assetId}.mp4`);
+  if (target.exists) target.delete(); // replace partial or old downloads
+  const file = await File.downloadFileAsync(url, target);
+  await db.runAsync(
+    'INSERT OR REPLACE INTO offline_assets (id, uri, size, downloaded_at) VALUES (?, ?, ?, ?)',
+    assetId, file.uri, file.size ?? bytes, Date.now(),
+  );
+  return file.uri;
+}
+```
+
+Since SDK 54 this object API (`File`, `Directory`, `Paths`) is the default `expo-file-system` export; the older function API lives at `expo-file-system/legacy` (which also has `createDownloadResumable` for pause/resume). In bare apps, `react-native-blob-util` or `@dr.pogodin/react-native-fs` fill the same role. Large media rules:
+
+- **Store paths, not blobs.** Keep a SQLite index (`id, uri, size, last_accessed`) and the bytes on disk; never base64 media into SQLite, MMKV or Redux.
+- **Store relative paths.** On iOS the app container path changes between installs and some updates; rebuild absolute URIs from `Paths.document` at runtime.
+- **Stream, don't load.** Pass file URIs to players and image components rather than reading files into JS memory.
+- **Survive interruption.** Use resumable or background downloads for big files, verify size/checksum on completion, and reconcile the index with the directory on launch (orphans, missing files).
+- **Respect the user's data plan** (`isConnectionExpensive`) and offer a "download over Wi-Fi only" setting.
+
+## Security
+
+Offline data is data at rest on a device that can be lost, stolen, jailbroken or backed up. Full details are in the [Security guide](security.html); the storage-specific rules:
+
+- **Secrets only in the Keychain/Keystore** (see [Authentication & Sessions](authentication.html)). AsyncStorage and unencrypted MMKV are plain files readable on rooted/jailbroken devices and in unencrypted backups.
+- **Encrypt sensitive data at rest:** SQLCipher for SQLite (op-sqlite build flag, expo-sqlite `useSQLCipher`), MMKV `encryptionKey`, with keys generated at runtime and stored in the Keychain. Encryption doesn't protect against a compromised running app, but it protects lost devices, backups and forensic copies.
+- **Minimise what you store.** Don't cache full PII or payment data offline "just in case"; set retention limits.
+- **Wipe on logout**, and warn first if the outbox still holds unsynced changes.
+
+```ts title="src/auth/wipeLocalData.ts"
+import * as Keychain from 'react-native-keychain';
+import { deleteDatabaseAsync, type SQLiteDatabase } from 'expo-sqlite';
+import { Directory, Paths } from 'expo-file-system';
+import { queryClient, persister } from '../query/queryClient';
+import { wipeUserStorage } from '../storage/mmkv';
+
+export async function wipeLocalData(db: SQLiteDatabase) {
+  queryClient.clear();
+  await persister.removeClient();
+  wipeUserStorage();
+  await db.closeAsync();
+  await deleteDatabaseAsync('app.db');
+  const media = new Directory(Paths.document, 'offline-media');
+  if (media.exists) media.delete();
+  await Keychain.resetGenericPassword({ service: 'com.example.app.storage-key' });
+  // also: unregister background tasks and clear push tokens server-side
+}
+```
+
+## Edge cases & gotchas
+
+- **Clock skew.** Device clocks are wrong surprisingly often. Never use device time for ordering or conflict resolution across devices; use server versions and server timestamps.
+- **Multiple devices, same user.** Your sync must handle a user editing on phone and tablet; test it explicitly.
+- **Schema change plus pending outbox.** An app update can change payload shapes while old outbox items are still queued. Version outbox payloads, or drain the outbox before running breaking migrations.
+- **Logout/login as a different user** on a shared device: per-user DB files and MMKV instances make isolation structural rather than a filter you might forget.
+- **Low storage.** SQLite writes fail with `SQLITE_FULL`; handle it and tell the user rather than corrupting state.
+- **Large first sync.** A fresh install on a big account can mean hundreds of MB; page it, show progress, make it resumable, and let the user work with partial data.
+- **Android process death** can happen mid-sync while backgrounded. Every step must be resumable from persisted state: cursors saved transactionally, outbox items reset from `inflight`.
+
+## Testing & debugging
+
+| Technique | How |
+|---|---|
+| Airplane mode | The honest baseline on a real device. Also toggle it *mid-request* and mid-sync. |
+| iOS Network Link Conditioner | Real device: Settings > Developer > Network Link Conditioner (100% Loss, 3G, High Latency DNS). Mac (affects the simulator): install from Xcode's Additional Tools. |
+| Android emulator | Extended controls > Cellular (network type, signal), or `adb emu network speed edge` and `adb emu network delay gprs`. |
+| Android device toggles | `adb shell svc wifi disable` and `adb shell svc data disable` (re-enable with `enable`). |
+| Proxies | Charles or Proxyman: throttling, breakpoints to hold a response until the app times out, map-local to return 409/500, block lists to fake outages. |
+| Kill during sync | Swipe the app away or `adb shell am kill <package>` mid-drain, relaunch, verify no duplicates (idempotency) and no lost items. |
+| Inspect the DB | Android: `adb exec-out run-as com.example.app cat databases/app.db > app.db`. iOS simulator: `xcrun simctl get_app_container booted com.example.app data`, then open the file in DB Browser for SQLite. |
+| Automated | Unit-test merge and outbox logic with an in-memory SQLite; mock the network with MSW; E2E offline flows with Detox or Maestro plus device network toggles. |
+
+Also test **upgrade paths**: install the previous store build, create data (including queued offline changes), upgrade to the new build, and verify migrations and the outbox survive.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| App crashes on launch after an update | Persisted state or DB schema changed without migration | Add `version`/`migrate`, a cache buster, or a SQL migration; test upgrades from old builds |
+| Theme/locale flashes on startup | State persisted in async storage, rehydrated after first render | Move to MMKV (sync) or gate render on hydration |
+| Duplicate records after flaky network | Retries without idempotency; server-generated IDs | Client-generated IDs + `Idempotency-Key` with server-side dedupe |
+| Deleted items reappear after sync | Hard deletes on server; pull can't see them | Tombstones (`deleted_at`) in change feeds; purge after retention |
+| Some server changes never arrive | `updated_at` cursor misses late-committing transactions | Commit-time sequence cursor or overlap window + version dedupe |
+| Encrypted DB won't open on a restored Android device | Auto Backup restored files, Keystore key didn't migrate | Exclude encrypted stores from backup; on decrypt failure, delete and resync |
+| Background sync fails only when the phone is locked | `NSFileProtectionComplete` or `WHEN_UNLOCKED` keychain item | Use `CompleteUntilFirstUserAuthentication` and `AFTER_FIRST_UNLOCK` |
+| UI janks while syncing | Large result sets or per-row inserts on the JS thread | Batch in one transaction (`executeBatch`), page results, move heavy queries to op-sqlite |
+| Paused mutations lost after restart | No `setMutationDefaults` for the key, or `gcTime` shorter than `maxAge` | Register defaults by `mutationKey`; align `gcTime` and `maxAge` |
+| NetInfo says online but requests fail | Captive portal or dead network; `isConnected` isn't reachability | Try the request with timeout/backoff; use NetInfo only as a hint |
+| Downloaded media disappears on iOS | Stored in `Caches`, purged under storage pressure | Store in Documents/Application Support with exclude-from-backup |
+| "Database is locked" errors | Concurrent write transactions on multiple connections | Single writer connection, WAL mode, exclusive transactions |
+
+## Production checklist
+
+- [ ] Each data type is in the right layer: secrets in Keychain, small state in MMKV, domain data in SQLite, media on disk
+- [ ] Encryption keys are generated at runtime and stored with `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY`
+- [ ] Encrypted stores excluded from Android Auto Backup; decrypt failure triggers wipe and resync
+- [ ] Every persisted structure is versioned with migrations or a buster; upgrade from previous builds tested
+- [ ] Writes are local + outbox in one transaction; outbox is per-entity FIFO with coalescing
+- [ ] All mutations carry idempotency keys; IDs are client-generated
+- [ ] Backend exposes a commit-ordered change feed with tombstones and a full-resync path
+- [ ] Conflict strategy is documented per entity and conflicts/dead items are visible to users
+- [ ] Sync is resumable after process death and respects a time budget for background runs
+- [ ] Caches have TTLs and size limits; media index reconciles with disk on launch
+- [ ] Re-downloadable files are excluded from iCloud backup
+- [ ] Logout wipes DB, MMKV, query cache, files and keys, and warns about unsynced changes
+- [ ] Offline flows are tested with airplane mode, Network Link Conditioner, proxies and mid-sync kills
+- [ ] Sync failures, conflict rates and outbox depth are reported to monitoring
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [react-native-mmkv](https://github.com/mrousavy/react-native-mmkv)
+- [Expo SQLite](https://docs.expo.dev/versions/latest/sdk/sqlite/)
+- [WatermelonDB docs](https://watermelondb.dev/docs)
+- [TanStack Query — persistQueryClient](https://tanstack.com/query/latest/docs/framework/react/plugins/persistQueryClient)
+- [@react-native-community/netinfo](https://github.com/react-native-netinfo/react-native-netinfo)
+
+## Interview questions
+
+### How would you choose between AsyncStorage, MMKV, SQLite and the Keychain in a new app?
+
+**Short answer:** By data shape. Secrets go in the Keychain/Keystore; small, frequently read state in MMKV because it's synchronous and fast; structured, queryable or synced data in SQLite; media on the file system with an index in SQLite.
+
+AsyncStorage is async, unencrypted and slow at scale, so it's legacy for new code. MMKV isn't a database: it has no queries, and large blobs hurt memory. SQLite gives transactions, indexes and migrations. The Keychain is slow and small but hardware-protected. A senior answer also covers encryption keys living in the Keychain, backup behaviour, and per-user isolation.
+
+### What does "offline-first" mean architecturally, and when is it worth it?
+
+**Short answer:** The local database is the source of truth for the UI; writes go local first with an outbox, and a sync engine reconciles with the server in the background.
+
+It's worth it when users create or edit data without reliable connectivity (field work, POS, notes, messaging). The cost lands on both sides: the backend needs change feeds, tombstones, idempotency and conflict handling. For read-mostly apps, a persisted TanStack Query cache is usually enough.
+
+### How do you implement a reliable mutation queue?
+
+**Short answer:** A durable outbox table in the same SQLite database, written in the same transaction as the local change, drained in per-entity FIFO order with idempotency keys and capped, jittered backoff.
+
+Items move pending, in-flight, then done, waiting, conflict or dead. In-flight items reset on launch after a crash. Coalesce operations on the same record, classify errors (retry network/5xx/429, don't retry validation 4xx), and surface conflict and dead items in the UI instead of dropping them.
+
+### Why are idempotency keys necessary if you already retry carefully?
+
+**Short answer:** Because a timeout doesn't tell you whether the server committed the write. Without a key, a retry can create a duplicate order or charge.
+
+The client generates a key per logical operation and reuses it on every retry; the server stores the result keyed by it and replays that result on duplicates. Client-generated primary keys give the same guarantee for creates and let the app reference records offline.
+
+### How would you handle conflicts when two devices edit the same record offline?
+
+**Short answer:** Detect conflicts with server versions (`base_version` vs current), then resolve per entity: field-level three-way merge for independent fields, server-wins for sensitive data like money or inventory, CRDTs for collaborative text, and a user prompt only for true overlapping edits.
+
+Avoid naive last-write-wins on device timestamps because of clock skew and silent loss. Model counters as operations (`increment by 2`) rather than state, since operations merge cleanly.
+
+### How do you design incremental sync so the client never misses changes?
+
+**Short answer:** Pull with an opaque cursor based on a commit-ordered server sequence, page results, apply each page and save its cursor in one local transaction, and include tombstones for deletes.
+
+`updated_at > last_sync` can miss rows from transactions that commit late with older timestamps. Provide a full-resync path for expired cursors or schema changes, and push the outbox before pulling so the pull reflects the client's own writes.
+
+### How do you make TanStack Query work offline, including mutations made while offline?
+
+**Short answer:** Wire `onlineManager` to NetInfo, persist the cache with `PersistQueryClientProvider` and a storage persister (MMKV), register `setMutationDefaults` for each mutation key, and call `resumePausedMutations()` once the cache is restored.
+
+Queries use `networkMode: 'offlineFirst'` to serve cached data; keep `gcTime` at least `maxAge`. Paused mutations are persisted without their functions, which is why defaults keyed by `mutationKey` are required. Use a real outbox if ordering or durability guarantees matter more.
+
+### What can go wrong with persisted state across app updates, and how do you prevent it?
+
+**Short answer:** New code reads old-shaped data and crashes on launch for existing users only, which QA misses on fresh installs. Version every persisted structure and migrate.
+
+Use Zustand's `version`/`migrate`, redux-persist's `createMigrate`, TanStack's `buster`, `PRAGMA user_version` migrations for SQLite, and versioned outbox payloads. Validate on read with a schema (zod) so corrupt values fall back to defaults, and keep fixture data from old releases to test upgrades in CI.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

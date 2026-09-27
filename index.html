@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>React Native Interview Handbook — Beginner to Senior</title>
+<meta name="description" content="React Native interview questions with senior-level answers, plus detailed implementation guides: push notifications, deep links, payments, OTA updates, deployment, permissions, camera, location and more.">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="React Native Interview Handbook — Beginner to Senior">
+<meta property="og:description" content="Interview questions with senior-level answers and production implementation guides for React Native.">
+<meta property="og:type" content="website">
+<link rel="icon" href="./assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="./assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root="." data-page="index.html" data-type="home">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Home page content is plain HTML. Card grids are filled from assets/js/site.js. -->
+<script type="text/html" id="page-content">
+<section class="hero">
+  <span class="hero-eyebrow">React Native · 2026 edition · New Architecture era</span>
+  <h1>Prepare for the <span class="grad">Senior React Native</span> interview, then ship like one.</h1>
+  <p>Interview questions with the answers a senior engineer would give, from fundamentals to mobile system design. Alongside them are step-by-step implementation guides, with diagrams, for the features every production app needs: push notifications, deep links, payments, OTA updates, deployment, permissions, camera, location and more.</p>
+  <div class="hero-cta">
+    <a class="btn btn-primary" href="questions/beginner.html">Start the Q&amp;A</a>
+    <a class="btn" href="#guides">Browse implementation guides</a>
+    <button class="btn" type="button" data-open-search>Search <kbd>/</kbd></button>
+  </div>
+  <div class="stats">
+    <div class="stat"><b data-stat="questions">352</b><span>Interview questions &amp; challenges</span></div>
+    <div class="stat"><b data-stat="guides">17</b><span>Implementation guides</span></div>
+    <div class="stat"><b data-stat="diagrams">138</b><span>Flow &amp; architecture diagrams</span></div>
+    <div class="stat"><b>5</b><span>Levels, beginner → senior</span></div>
+  </div>
+</section>
+
+<section class="home-section" id="qa">
+  <h2>Interview Q&amp;A</h2>
+  <p class="sub">Every question opens into a structured answer: a short answer you can say out loud, then depth, code, trade-offs and what interviewers listen for. Mark questions as reviewed to track your progress.</p>
+  <div class="card-grid" data-cards="qa"></div>
+</section>
+
+<section class="home-section" id="guides">
+  <h2>Implementation guides</h2>
+  <p class="sub">Production references with requirements, iOS and Android setup (bare React Native and Expo), code, sequence diagrams, troubleshooting tables, checklists, and interview questions for each topic.</p>
+  <h3 style="margin:26px 0 12px">Platform features</h3>
+  <div class="card-grid" data-cards="features"></div>
+  <h3 style="margin:30px 0 12px">Ship &amp; operate</h3>
+  <div class="card-grid" data-cards="ship"></div>
+  <h3 style="margin:30px 0 12px">Architecture &amp; quality</h3>
+  <div class="card-grid" data-cards="arch"></div>
+</section>
+
+<section class="home-section" id="study-plan">
+  <h2>A four-week study plan</h2>
+  <p class="sub">About an hour a day. Explain each answer out loud before you expand it; that's the skill interviews actually test.</p>
+  <div class="plan">
+    <div class="plan-step">
+      <h3>Week 1 · Foundations</h3>
+      <p>Get the fundamentals fluent and precise.</p>
+      <ul>
+        <li><a href="questions/beginner.html">Beginner Q&amp;A</a></li>
+        <li><a href="questions/intermediate.html">Intermediate Q&amp;A</a></li>
+        <li><a href="guides/permissions.html">Permissions</a> &amp; <a href="guides/app-icon-splash.html">Icon/Splash</a></li>
+      </ul>
+    </div>
+    <div class="plan-step">
+      <h3>Week 2 · Internals</h3>
+      <p>How React Native really works, and how to make it fast.</p>
+      <ul>
+        <li><a href="questions/advanced.html">Advanced Q&amp;A</a></li>
+        <li><a href="guides/new-architecture.html">The New Architecture</a></li>
+        <li><a href="guides/performance.html">Performance</a></li>
+      </ul>
+    </div>
+    <div class="plan-step">
+      <h3>Week 3 · Production features</h3>
+      <p>The features every take-home and system design touches.</p>
+      <ul>
+        <li><a href="guides/push-notifications.html">Push</a>, <a href="guides/deep-linking.html">Deep links</a>, <a href="guides/authentication.html">Auth</a></li>
+        <li><a href="guides/payments.html">Payments &amp; IAP</a>, <a href="guides/offline-storage.html">Offline</a></li>
+        <li><a href="guides/location.html">Location</a>, <a href="guides/camera.html">Camera</a>, <a href="guides/background-tasks.html">Background</a></li>
+      </ul>
+    </div>
+    <div class="plan-step">
+      <h3>Week 4 · The senior loop</h3>
+      <p>Design, ship, operate, and tell the story.</p>
+      <ul>
+        <li><a href="questions/senior.html">System design &amp; STAR stories</a></li>
+        <li><a href="guides/deployment.html">Deployment</a>, <a href="guides/ota-updates.html">OTA</a>, <a href="guides/monitoring.html">Monitoring</a></li>
+        <li><a href="questions/coding-challenges.html">Live coding</a> &amp; <a href="guides/security.html">Security</a></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="home-section" id="what-interviewers-look-for">
+  <h2>What senior interviewers are listening for</h2>
+  <p class="sub">Correct answers get you to the bar. These get you over it.</p>
+  <div class="tips">
+    <div class="tip"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg><div><b>Trade-offs, not trivia</b>Name the options, pick one, and explain what you're giving up and when you'd choose differently.</div></div>
+    <div class="tip"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></svg><div><b>Platform depth</b>Know what happens on iOS and Android underneath: threads, permissions, signing, lifecycle and store rules.</div></div>
+    <div class="tip"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><div><b>Production scars</b>Crash rates, rollbacks, rejections, flaky releases. Concrete incidents and numbers beat hypotheticals.</div></div>
+    <div class="tip"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg><div><b>Ownership &amp; influence</b>How you set standards, unblock others, and make decisions stick across teams.</div></div>
+  </div>
+</section>
+
+<section class="home-section" id="how-to-use">
+  <h2>How to use this handbook</h2>
+  <div class="tips">
+    <div class="tip"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg><div><b>Track progress</b>Mark answers as reviewed; progress is saved in your browser and shown in the sidebar.</div></div>
+    <div class="tip"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg><div><b>Practice mode</b>Use <em>Random</em> and <em>Hide reviewed</em> on any Q&amp;A page to drill unseen questions.</div></div>
+    <div class="tip"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><div><b>Search everything</b>Press <kbd>/</kbd> or <kbd>⌘K</kbd> to search every question, guide and section.</div></div>
+    <div class="tip"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg><div><b>Offline copy</b>Use <em>Print / save as PDF</em> in the page outline to export a page with every answer expanded.</div></div>
+  </div>
+</section>
+</script>
+<script src="./assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="./assets/js/app.js"></script>
+</body>
+</html>

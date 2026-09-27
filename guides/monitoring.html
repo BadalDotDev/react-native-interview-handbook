@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitoring, Crash Reporting &amp; Analytics · React Native Interview Handbook</title>
+<meta name="description" content="How to see what your React Native app is doing in production: native crashes, JS errors, ANRs and hangs, performance, and product analytics. It covers setting up Sentry and…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Monitoring, Crash Reporting &amp; Analytics · React Native Interview Handbook">
+<meta property="og:description" content="How to see what your React Native app is doing in production: native crashes, JS errors, ANRs and hangs, performance, and product analytics. It covers setting up Sentry and…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/monitoring.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Monitoring, Crash Reporting & Analytics
+
+How to see what your React Native app is doing in production: native crashes, JS errors, ANRs and hangs, performance, and product analytics. It covers setting up Sentry and Crashlytics with working symbolication (including after OTA updates), handling errors in layers, designing privacy-safe analytics, and using release-health data to decide whether a staged rollout continues.
+
+## How it works
+
+### What to observe
+
+| Signal | Examples | Captured by |
+|---|---|---|
+| Native crashes | `SIGSEGV`/`SIGABRT`, uncaught `NSException` or Java/Kotlin exceptions, NDK crashes | SDK signal and uncaught-exception handlers |
+| JS errors | Uncaught exceptions (fatal in release), reported errors, unhandled rejections, render errors | JS SDK: global handler, rejection tracker, ErrorBoundary |
+| ANRs / app hangs | Android main thread blocked ~5 s (input ANR); iOS main thread unresponsive over ~250 ms, or watchdog kill | SDK watchdogs, `ApplicationExitInfo` (Android 11+), MetricKit, consoles |
+| Uncatchable terminations | OOM kills, launch watchdog kills | SDK heuristics, store consoles |
+| Performance | Cold/warm start, TTID/TTFD, slow/frozen frames, network, JS thread stalls | Tracing (Sentry, Firebase Performance, Datadog RUM) |
+| Breadcrumbs / logs | Navigation, taps, HTTP calls, state transitions, custom logs | SDK auto-instrumentation + your logger |
+| Product analytics | `checkout_started`, `order_completed`, funnels, retention | Analytics SDK behind your own abstraction |
+| User feedback | In-app feedback, TestFlight feedback, store reviews | Feedback widgets, consoles |
+
+### Key metrics
+
+| Metric | Definition | Rough target |
+|---|---|---|
+| Crash-free sessions | % of sessions that didn't end in a crash | ≥ 99.8% |
+| Crash-free users | % of users with no crash in the period | ≥ 99.5% (best-in-class apps hit ≥ 99.9%) |
+| User-perceived crash rate (Android vitals) | % of daily active users who had at least one crash they likely noticed | Below Google's bad-behaviour threshold |
+| User-perceived ANR rate (Android vitals) | % of daily active users who had at least one user-perceived ANR | Below Google's bad-behaviour threshold |
+| Hang rate (Xcode Organizer) | Seconds of hang per hour of foreground use | Trending down release over release |
+| Cold start p50 / p90 | Process start to first meaningful frame | Under 2 s / 4 s on mid-range devices |
+| Slow / frozen frames | Frames over the frame budget / over 700 ms | Slow under ~5%, frozen close to 0 |
+
+> [!IMPORTANT] Google Play bad-behaviour thresholds
+> Google Play defines **overall** and **per-device-model** bad-behaviour thresholds for user-perceived crash and ANR rates. At the time of writing they were about 1.09% (crashes) and 0.47% (ANRs) overall, and 8% per device model. Going over them can reduce your app's visibility on Play, and may add a warning to your store listing on affected devices. These numbers change, so check the current values in Play Console → Android vitals.
+
+### Data flow
+
+```mermaid
+flowchart TD
+    subgraph app["React Native app"]
+        JS["JS layer<br/>ErrorBoundary, global handler,<br/>spans, analytics calls"]
+        NativeSDK["Native layer<br/>signal and exception handlers,<br/>ANR and hang watchdogs"]
+        Queue[("On-device envelope queue<br/>(persisted to disk)")]
+    end
+    JS --> Queue
+    NativeSDK --> Queue
+    Queue -->|"sent on next launch<br/>or when back online"| Ingest["Vendor ingestion"]
+    Build["CI build and OTA publish"] -->|"source maps, dSYMs,<br/>R8 mapping, NDK symbols"| Symbols[("Symbol store")]
+    Ingest --> Proc["Processing: symbolication,<br/>grouping, scrubbing, sampling"]
+    Symbols --> Proc
+    Proc --> Dash["Dashboards and release health"]
+    Proc --> Alerts["Alerts: Slack, PagerDuty"]
+    Alerts --> Tracker["Issue tracker"]
+    Consoles["Play Console and<br/>Xcode Organizer"] --> Dash
+```
+*Figure: Monitoring data flow. When the app crashes, the native handler writes the report to disk, and the report is uploaded on the next launch. Symbol files come from your build pipeline. Without them, the stack traces you receive can't be read.*
+
+## Requirements & prerequisites
+
+| Item | Notes |
+|---|---|
+| Vendor accounts | A Sentry org/project per app (or one per platform), a Firebase project, and an analytics workspace. Choose the data region (for example Sentry's EU region) before sending any data. |
+| CI secrets | `SENTRY_AUTH_TOKEN` (an org token scoped to releases/uploads), Firebase config files. Never commit tokens in `sentry.properties`. |
+| Build settings | iOS Release: *Debug Information Format* = **DWARF with dSYM File**. Android release: R8 enabled, with mapping upload; `ndk.debugSymbolLevel` for native libraries. |
+| Privacy & legal | Privacy policy, App Store privacy "nutrition labels", Play Data safety form, `PrivacyInfo.xcprivacy` (SDKs ship their own; aggregate them), a consent management platform (CMP) for the EU/UK, and data processing agreements (DPAs) with vendors. |
+| Process | An owner for each alert route, an on-call rotation, and a runbook for halting a rollout, pushing an OTA fix and flipping a kill switch. |
+
+## Choosing tools
+
+| Tool | Strengths | Watch out for |
+|---|---|---|
+| **Sentry** (`@sentry/react-native`) | Best JS symbolication (Hermes, Debug IDs, OTA), native crashes, ANR/hangs, tracing, profiling, replay, release health, self-host option | Event quotas: sample traces and replays |
+| **Firebase Crashlytics** | Free, excellent native crash grouping, integrates with Analytics/Remote Config | JS errors are non-fatals with **unsymbolicated** stacks; performance data lives in the separate Firebase Performance |
+| **Bugsnag** | Stability score, good RN support including source maps | Smaller ecosystem; check current packaging |
+| **Datadog RUM** | Links mobile sessions to backend APM and logs; replay | Per-session pricing; best if the backend already uses Datadog |
+| **Embrace** | Full session timelines, strong on ANRs/OOMs/network, OpenTelemetry-based | Heavier SDK |
+
+| Analytics | Best for | Watch out for |
+|---|---|---|
+| **Firebase / GA4** | Free; attribution, Google Ads, BigQuery export, A/B tests | Naming limits; weak ad-hoc product analysis |
+| **Amplitude** / **Mixpanel** | Product analytics: funnels, retention, cohorts, experiments | Cost at scale; need taxonomy discipline |
+| **PostHog** | Open source: analytics + flags + replay + experiments; EU/self-host | You run it if self-hosted |
+| **Segment** (or RudderStack) | CDP: instrument once, route to many tools and a warehouse | Added cost; still needs a tracking plan |
+
+**Recommendation:** Use **Sentry** for JS errors, native crashes, performance and release health, because JS symbolication and OTA support are where RN apps struggle. Use **one** product-analytics tool (Amplitude, Mixpanel or PostHog), or GA4 if marketing attribution drives the choice, behind your own abstraction. If you already use Firebase, Crashlytics is a reasonable free native crash reporter, but **don't run two native crash handlers** (see below).
+
+> [!WARNING] One native crash reporter
+> Native crash reporters install process-wide signal and uncaught-exception handlers. With two installed, they chain unreliably: one may miss crashes, or reports may be corrupted or duplicated. Choose one for native crashes. You can still send JS errors to a second tool if you really need to.
+
+## Sentry deep dive
+
+### Step 1 — Install
+
+**Bare React Native:** run the wizard. It installs `@sentry/react-native`, adds `Sentry.init`, wraps Metro with the Sentry plugin (which injects Debug IDs), adds the Xcode build phases and the Gradle hook for source map and dSYM upload, creates `sentry.properties`, and runs `pod install`.
+
+```bash
+npx @sentry/wizard@latest -i reactNative
+```
+
+**Expo (CNG):** install the package and add the config plugin. Prebuild then generates the native build steps.
+
+```bash
+npx expo install @sentry/react-native
+```
+
+```json title="app.json"
+{
+  "expo": {
+    "plugins": [
+      ["@sentry/react-native/expo", { "url": "https://sentry.io/", "organization": "acme", "project": "shop-mobile" }]
+    ]
+  }
+}
+```
+
+```js title="metro.config.js"
+// Expo
+const { getSentryExpoConfig } = require('@sentry/react-native/metro');
+module.exports = getSentryExpoConfig(__dirname);
+
+// Bare RN equivalent:
+// const { getDefaultConfig } = require('@react-native/metro-config');
+// const { withSentryConfig } = require('@sentry/react-native/metro');
+// module.exports = withSentryConfig(getDefaultConfig(__dirname));
+```
+
+Store `SENTRY_AUTH_TOKEN` as a secret EAS environment variable (or CI secret). EAS Build then uploads source maps and dSYMs automatically.
+
+### Step 2 — Initialise as early as possible
+
+```ts title="src/monitoring/sentry.ts"
+import * as Sentry from '@sentry/react-native';
+import { env } from '@/config/env';
+import { beforeBreadcrumb, beforeSend } from './scrub';
+
+export const navigationIntegration = Sentry.reactNavigationIntegration({
+  enableTimeToInitialDisplay: true,
+  ignoreEmptyBackNavigationTransactions: true,
+});
+
+Sentry.init({
+  dsn: env.SENTRY_DSN,
+  enabled: !__DEV__, // or send dev events to a separate 'development' environment
+  environment: env.APP_ENV, // 'production' | 'staging'
+  // release/dist default to '<bundleId>@<version>+<build>' / '<build>'; override only for OTA (Step 3)
+  sendDefaultPii: false,
+  tracesSampleRate: env.APP_ENV === 'production' ? 0.1 : 1.0,
+  profilesSampleRate: 0.1, // relative to sampled traces; check current profiling options
+  replaysSessionSampleRate: 0,
+  replaysOnErrorSampleRate: 1.0,
+  tracePropagationTargets: [/^https:\/\/api\.example\.com/],
+  attachScreenshot: false, // screenshots can contain PII
+  maxBreadcrumbs: 100,
+  integrations: [
+    navigationIntegration,
+    Sentry.mobileReplayIntegration({ maskAllText: true, maskAllImages: true, maskAllVectors: true }),
+  ],
+  beforeSend,
+  beforeBreadcrumb,
+});
+```
+
+Import this file **first** in `index.js` (`import './src/monitoring/sentry';`), before `AppRegistry` and before anything that can throw. That way headless JS tasks and early errors are covered too.
+
+```tsx title="src/App.tsx"
+import * as Sentry from '@sentry/react-native';
+import { NavigationContainer, useNavigationContainerRef } from '@react-navigation/native';
+import { navigationIntegration } from '@/monitoring/sentry';
+import { CrashScreen } from '@/components/CrashScreen';
+import { RootNavigator } from '@/navigation/RootNavigator';
+
+function App() {
+  const navigationRef = useNavigationContainerRef();
+  return (
+    <Sentry.ErrorBoundary fallback={({ resetError }) => <CrashScreen onRetry={resetError} />}>
+      <NavigationContainer
+        ref={navigationRef}
+        onReady={() => navigationIntegration.registerNavigationContainer(navigationRef)}
+      >
+        <RootNavigator />
+      </NavigationContainer>
+    </Sentry.ErrorBoundary>
+  );
+}
+
+export default Sentry.wrap(App);
+```
+
+`Sentry.wrap` adds touch breadcrumbs, a root profiler used for app-start measurement, and the providers the feedback and replay features need. With Expo Router, get the ref from `useNavigationContainerRef()` in `expo-router` and register it in the root layout's effect.
+
+### Step 3 — Releases, dist and source maps
+
+A crash in a Hermes release build arrives as bytecode offsets in a minified bundle, for example `index.android.bundle:1:84211`. To turn that into `CartScreen.tsx:42`, Sentry needs the **exact source map** for that bundle. Recent SDKs use **Debug IDs**: the Metro plugin writes the same unique ID into the bundle and its map, so a map is matched even if `release`/`dist` are wrong. `release` still matters for release health, regressions and suspect commits.
+
+#### Bare RN — Android
+
+```gradle title="android/app/build.gradle"
+// Added by the wizard: bundles and uploads the (Hermes-composed) source map on release builds
+apply from: new File(["node", "--print", "require.resolve('@sentry/react-native/package.json')"].execute().text.trim(), "../sentry.gradle")
+
+// Optional: Sentry Android Gradle Plugin for R8 mapping + NDK symbols
+// (add classpath "io.sentry:sentry-android-gradle-plugin:<version>" in android/build.gradle)
+apply plugin: "io.sentry.android.gradle"
+
+sentry {
+    autoUploadProguardMapping = true
+    uploadNativeSymbols = true
+    autoInstallation { enabled = false } // the RN SDK already brings sentry-android
+}
+```
+
+```properties title="android/sentry.properties"
+defaults.url=https://sentry.io/
+defaults.org=acme
+defaults.project=shop-mobile
+```
+
+The auth token comes from the `SENTRY_AUTH_TOKEN` environment variable in CI; never commit it to this file.
+
+#### Bare RN — iOS
+
+The wizard wraps the **Bundle React Native code and images** build phase so source maps are generated and uploaded:
+
+```bash
+set -e
+WITH_ENVIRONMENT="$REACT_NATIVE_PATH/scripts/xcode/with-environment.sh"
+SENTRY_XCODE="../node_modules/@sentry/react-native/scripts/sentry-xcode.sh"
+BUNDLE_REACT_NATIVE="/bin/sh $SENTRY_XCODE $REACT_NATIVE_PATH/scripts/react-native-xcode.sh"
+/bin/sh -c "$WITH_ENVIRONMENT \"$BUNDLE_REACT_NATIVE\""
+```
+
+It also adds an **Upload Debug Symbols to Sentry** phase for dSYMs:
+
+```bash
+/bin/sh ../node_modules/@sentry/react-native/scripts/sentry-xcode-debug-files.sh
+```
+
+Set `SENTRY_DISABLE_AUTO_UPLOAD=true` for local release builds that shouldn't upload. With Hermes, React Native's build scripts compile the bundle to bytecode and **compose** the Metro source map with the Hermes map. The Sentry scripts upload the composed map, which is the only one that resolves Hermes frames correctly. Since Bitcode was removed (Xcode 14), the dSYMs from *your* archive are the final ones; you no longer download them from App Store Connect.
+
+#### OTA updates (EAS Update, self-hosted CodePush)
+
+An OTA update runs **new JS inside an old binary**. The native release is still `2.4.0+312`, but the bundle and its source map are new. Every update needs its own map upload, and events should say which update produced them.
+
+```bash
+eas update --branch production --message "Fix cart total rounding"
+npx sentry-expo-upload-sourcemaps dist   # uploads the maps eas update exported to dist/
+```
+
+```ts title="src/monitoring/otaContext.ts"
+import * as Updates from 'expo-updates';
+import * as Sentry from '@sentry/react-native';
+
+export function tagOtaContext() {
+  Sentry.setTags({
+    'ota.update_id': Updates.updateId ?? 'none',
+    'ota.channel': Updates.channel ?? 'none',
+    'ota.runtime_version': Updates.runtimeVersion ?? 'unknown',
+    'ota.embedded': String(Updates.isEmbeddedLaunch),
+  });
+}
+```
+
+For release health per update, encode the update in `release` or `dist`. A common choice is to keep `release` = the binary version and set `dist` to the update ID; if you need separate crash-free rates per OTA, use a distinct release per update instead. Recent SDK versions attach some Expo Updates context automatically. For self-hosted CodePush-style tools, the pipeline is: bundle with `--sourcemap-output`, compile with Hermes, compose the maps, inject Debug IDs, upload with `sentry-cli sourcemaps upload`, *then* publish the bundle. See [OTA Updates](ota-updates.html).
+
+### Step 4 — User context, tags and breadcrumbs
+
+```ts title="src/monitoring/context.ts"
+import * as Sentry from '@sentry/react-native';
+
+export function identifyForMonitoring(user: { id: string; plan: 'free' | 'pro' }) {
+  Sentry.setUser({ id: user.id }); // opaque internal ID only: no email, name or phone
+  Sentry.setTag('plan', user.plan);
+}
+
+export function clearMonitoringUser() {
+  Sentry.setUser(null); // on logout, so the next user isn't blamed for earlier events
+}
+
+export function reportHandled(error: unknown, feature: string, extra?: Record<string, unknown>) {
+  Sentry.withScope((scope) => {
+    scope.setTag('feature', feature);
+    if (extra) scope.setContext('details', extra);
+    Sentry.captureException(error);
+  });
+}
+
+// Custom breadcrumb for a domain event
+Sentry.addBreadcrumb({ category: 'cart', message: 'Promo applied', level: 'info', data: { type: 'percent' } });
+```
+
+**Tags** are indexed and searchable, so keep them low-cardinality (`plan`, `feature`, `ota.channel`). **Contexts** hold richer structured data that isn't indexed.
+
+### Step 5 — Scrub before it leaves the device
+
+```ts title="src/monitoring/scrub.ts"
+import * as Sentry from '@sentry/react-native';
+
+type Options = NonNullable<Parameters<typeof Sentry.init>[0]>;
+
+const SENSITIVE_KEY = /pass(word)?|token|secret|authorization|cookie|otp|card|cvv|iban|ssn|email|phone/i;
+const EMAIL = /[^\s@]+@[^\s@]+\.[^\s@]+/g;
+
+function redact(value: unknown, depth = 0): unknown {
+  if (value == null || depth > 6) return value;
+  if (typeof value === 'string') return value.replace(EMAIL, '[email]');
+  if (Array.isArray(value)) return value.map((v) => redact(v, depth + 1));
+  if (typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+        k,
+        SENSITIVE_KEY.test(k) ? '[redacted]' : redact(v, depth + 1),
+      ]),
+    );
+  }
+  return value;
+}
+
+const stripQuery = (url?: string) => url?.split('?')[0];
+
+export const beforeSend: NonNullable<Options['beforeSend']> = (event) => {
+  if (event.request) {
+    event.request.url = stripQuery(event.request.url);
+    delete event.request.data;
+    delete event.request.cookies;
+  }
+  event.extra = redact(event.extra) as typeof event.extra;
+  event.contexts = redact(event.contexts) as typeof event.contexts;
+  event.exception?.values?.forEach((ex) => {
+    if (ex.value) ex.value = ex.value.replace(EMAIL, '[email]'); // PII in error messages
+  });
+  return event;
+};
+
+export const beforeBreadcrumb: NonNullable<Options['beforeBreadcrumb']> = (crumb) => {
+  if (crumb.category === 'console' && !__DEV__) return null; // console args often carry PII
+  if (crumb.data?.url) crumb.data.url = stripQuery(String(crumb.data.url));
+  return crumb;
+};
+```
+
+Add server-side data scrubbing rules in the Sentry project settings as a second layer. Scrubbing on the client is best effort; the server rules catch what it misses.
+
+### Step 6 — Error boundaries and session replay
+
+Wrap each navigator or major screen in its own `Sentry.ErrorBoundary`, so a crashing widget shows a local fallback ("Couldn't load reviews — retry") instead of replacing the whole app. The boundary reports the error with its **component stack**. Keep one root boundary as the last resort.
+
+**Session replay** on mobile captures native screenshots of the view hierarchy with redaction, and the SDK uploads them alongside the error. Keep `maskAllText`/`maskAllImages` on. Use `<Sentry.Mask>` to hide extra areas and `<Sentry.Unmask>` only for content you've confirmed is safe. Record on error (`replaysOnErrorSampleRate: 1.0`) rather than every session. Check the CPU and memory overhead on low-end Android, and disclose recording in your privacy policy.
+
+### Release health
+
+With session tracking (on by default), Sentry computes **crash-free sessions and users per release**, adoption, and session outcomes (healthy, errored, crashed, abnormal). A session covers foreground use and ends after the app has been backgrounded for a while (30 s by default). Release comparisons are what the rollout gates later in this guide use. User feedback can be attached to events with `Sentry.captureFeedback({ message, associatedEventId })` or the built-in feedback widget.
+
+## Firebase Crashlytics
+
+### Setup — bare React Native
+
+1. Install: `npm i @react-native-firebase/app @react-native-firebase/crashlytics`, then `cd ios && pod install`.
+2. **Android:** put `google-services.json` in `android/app/`, then add the plugins. The Crashlytics Gradle plugin uploads the **R8 mapping file** for minified builds, and NDK symbols if you enable it.
+
+```gradle title="android/build.gradle"
+buildscript {
+    dependencies {
+        classpath("com.google.gms:google-services:4.4.2")            // check current versions
+        classpath("com.google.firebase:firebase-crashlytics-gradle:3.0.2")
+    }
+}
+```
+
+```gradle title="android/app/build.gradle"
+apply plugin: "com.google.gms.google-services"
+apply plugin: "com.google.firebase.crashlytics"
+
+android {
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
+            firebaseCrashlytics {
+                mappingFileUploadEnabled true
+                nativeSymbolUploadEnabled true
+            }
+        }
+    }
+}
+```
+
+3. **iOS:** add `ios/<AppName>/GoogleService-Info.plist` to the target, call `FirebaseApp.configure()` in `AppDelegate`, and use static frameworks in `ios/Podfile` (`use_frameworks! :linkage => :static` + `$RNFirebaseAsStaticFramework = true`). For dSYM upload, make sure there's exactly one Run Script phase calling `"${PODS_ROOT}/FirebaseCrashlytics/run"`, with the dSYM, plist and executable paths as input files (required by Xcode's script sandboxing). To upload manually: `Pods/FirebaseCrashlytics/upload-symbols -gsp <AppName>/GoogleService-Info.plist -p ios <dSYMs>`.
+4. **Expo:** add `@react-native-firebase/app` and `@react-native-firebase/crashlytics` to `plugins`, set `ios.googleServicesFile` / `android.googleServicesFile`, and set `expo-build-properties` → `ios.useFrameworks: "static"`.
+
+```json title="firebase.json"
+{
+  "react-native": {
+    "crashlytics_debug_enabled": false,
+    "crashlytics_auto_collection_enabled": false,
+    "crashlytics_is_error_generation_on_js_crash_enabled": true,
+    "crashlytics_javascript_exception_handler_chaining_enabled": true
+  }
+}
+```
+
+Auto-collection is off here so you can enable it after consent. Debug builds don't report unless `crashlytics_debug_enabled` is true.
+
+### Implementation (modular API)
+
+```ts title="src/monitoring/crashlytics.ts"
+import {
+  getCrashlytics,
+  log,
+  recordError,
+  setAttributes,
+  setCrashlyticsCollectionEnabled,
+  setUserId,
+} from '@react-native-firebase/crashlytics';
+
+const crashlytics = getCrashlytics();
+
+export async function enableCrashReporting(consented: boolean) {
+  await setCrashlyticsCollectionEnabled(crashlytics, consented);
+}
+
+export function identify(userId: string, attrs: Record<string, string>) {
+  void setUserId(crashlytics, userId); // opaque ID only
+  void setAttributes(crashlytics, attrs); // e.g. { plan: 'pro', ota_update: '...' }
+}
+
+export function breadcrumb(message: string) {
+  log(crashlytics, message); // attached to the next crash or non-fatal
+}
+
+export function reportNonFatal(error: unknown, name?: string) {
+  const err = error instanceof Error ? error : new Error(String(error));
+  recordError(crashlytics, err, name);
+}
+```
+
+RNFirebase installs a global JS handler, so **JS errors appear in Crashlytics as non-fatal issues**. Crashlytics doesn't apply JS source maps, so their stacks show bundle positions: give errors meaningful names and use `log()` breadcrumbs generously. A fatal JS error then terminates the app natively (see the error layers below). To test, call `crash(crashlytics)`, then **relaunch without the debugger attached**. Reports are sent on the next launch.
+
+## Symbolication explained
+
+```mermaid
+flowchart TD
+    Raw(["Raw crash or error event"]) --> Kind{"Which kind of frames?"}
+    Kind -->|"JS on Hermes"| JSF["Bundle offsets<br/>index.android.bundle:1:84211"]
+    Kind -->|"iOS native"| IOSF["Memory addresses<br/>+ binary image UUIDs"]
+    Kind -->|"Android JVM"| JVMF["Obfuscated names<br/>a.b.c.d (Unknown Source)"]
+    Kind -->|"Android NDK"| NDKF["Addresses in .so files<br/>+ build IDs"]
+    JSF --> SM[("Composed source map<br/>matched by Debug ID or release + dist")]
+    IOSF --> DSYM[("dSYM<br/>matched by UUID")]
+    JVMF --> MAP[("R8 mapping.txt<br/>matched per build")]
+    NDKF --> SYM[("Unstripped .so / symbol files<br/>matched by build ID")]
+    SM --> Out(["Readable frames:<br/>file, function, line"])
+    DSYM --> Out
+    MAP --> Out
+    SYM --> Out
+```
+*Figure: Each kind of frame needs its own symbol file, produced by the exact build that shipped. Rebuilding "the same" commit doesn't produce matching symbols.*
+
+| Frames | Symbol file | Where it comes from | Manual tool |
+|---|---|---|---|
+| JS (Hermes) | Composed source map (Metro + Hermes) | RN build scripts when generating the bundle; `eas update` output | `npx metro-symbolicate app.map < stack.txt` |
+| iOS native | `.dSYM` | Xcode archive (Release, DWARF with dSYM); one per framework | `atos -arch arm64 -o App.dSYM/Contents/Resources/DWARF/App -l <load address> <address>` |
+| Android Java/Kotlin | `mapping.txt` | `android/app/build/outputs/mapping/release/` | `retrace mapping.txt stacktrace.txt` (Android SDK command-line tools) |
+| Android NDK | Unstripped `.so` / symbol files | Native build intermediates; `ndk.debugSymbolLevel 'FULL'` | `ndk-stack -sym <dir> -dump tombstone.txt` |
+
+Verify that a dSYM matches a crash with `dwarfdump --uuid App.app.dSYM`. For Google Play, uploading an **AAB** includes the R8 mapping (and native debug symbols if configured) in the bundle metadata, so Android vitals are deobfuscated automatically. Your crash reporter still needs its own copy.
+
+## JS error-handling layers
+
+| Layer | Catches | Doesn't catch | Report as |
+|---|---|---|---|
+| Local `try/catch`, query/mutation `onError` | Expected failures in handlers and async code you await | Anything you didn't wrap | Handled/non-fatal (often not at all for expected 4xx) |
+| React **ErrorBoundary** | Errors thrown while rendering, in lifecycle methods and constructors of children | Event handlers, async code, timers, errors in the boundary itself | Non-fatal with component stack; show a fallback UI |
+| **`ErrorUtils.setGlobalHandler`** | Any uncaught JS exception (handlers, timers, render errors with no boundary) | Promise rejections, native crashes | Fatal when `isFatal`; RN terminates the app in release |
+| **Unhandled promise rejections** | Rejected promises nobody awaited or caught | — | RN only shows a LogBox warning in dev; in release nothing happens unless your SDK tracks them (Sentry does) |
+| **Native crash handlers** | Signals, uncaught `NSException` / Java exceptions, NDK crashes, including the native abort after a fatal JS error | OOM and watchdog kills (inferred instead) | Fatal crash, written to disk and sent on next launch |
+| **ANR / hang watchdogs** | Main thread blocked (Android ANR, iOS hang) | JS-thread-only stalls (use JS stall tracking) | ANR/hang events with main-thread stack |
+
+```mermaid
+flowchart TD
+    Err(["Error thrown"]) --> Where{"Where?"}
+    Where -->|"render / lifecycle"| HasEB{"ErrorBoundary above?"}
+    HasEB -->|"yes"| EB["Boundary renders fallback<br/>and reports non-fatal"]
+    HasEB -->|"no"| GH["ErrorUtils global handler"]
+    Where -->|"handler / timer"| TC{"Caught locally?"}
+    TC -->|"yes"| Handled["Handled: UI message,<br/>optional captureException"]
+    TC -->|"no"| GH
+    Where -->|"rejected promise"| PR{"Awaited and caught?"}
+    PR -->|"yes"| Handled
+    PR -->|"no"| UPR["Rejection tracker<br/>(silent in release without SDK)"]
+    Where -->|"Swift / Kotlin / C++"| NH["Native crash handler"]
+    GH -->|"isFatal in release"| Fatal["RN fatal: app terminates"]
+    Fatal --> NH
+```
+*Figure: Where JS errors end up. In release builds, a fatal JS error triggers a native abort (`RCTFatal` on iOS, `JavascriptException` on Android). The JS SDK should report the source-mapped JS error first, and dedupe the native crash that follows.*
+
+If you ever install your own global handler (most apps shouldn't; the SDK does it), **chain the previous one**, or you'll break RN's red box and other SDKs:
+
+```ts title="src/monitoring/globalHandler.ts"
+export function installGlobalHandler(report: (error: unknown, fatal: boolean) => void) {
+  const previous = ErrorUtils.getGlobalHandler();
+  ErrorUtils.setGlobalHandler((error, isFatal) => {
+    try {
+      report(error, Boolean(isFatal));
+    } finally {
+      previous(error, isFatal);
+    }
+  });
+}
+```
+
+## Performance monitoring
+
+| Metric | How it's measured | Notes |
+|---|---|---|
+| App start (cold/warm) | Native process start → root component mounted / first frame | Needs `Sentry.wrap`. Compare cold starts only, and segment by device class. |
+| TTID / TTFD per screen | Navigation start → first frame (TTID); → content loaded (TTFD) | TTID is automatic with `enableTimeToInitialDisplay`. Mark TTFD yourself. |
+| Slow / frozen frames | Native frame timing on the UI thread | Slow = over the frame budget (16.7 ms at 60 Hz), frozen = over 700 ms. |
+| JS thread stalls | Event-loop lag sampling | Not the same as dropped native frames; a stalled JS thread makes taps feel dead while scrolling stays smooth. |
+| Network | Automatic `fetch`/XHR spans with status and duration | `tracePropagationTargets` links mobile spans to backend traces. |
+
+```tsx title="src/features/orders/OrderDetailsScreen.tsx"
+import * as Sentry from '@sentry/react-native';
+import { useOrder } from './useOrder';
+import { OrderView, OrderSkeleton } from './components';
+
+export function OrderDetailsScreen({ orderId }: { orderId: string }) {
+  const { data, isSuccess } = useOrder(orderId);
+  return (
+    <>
+      <Sentry.TimeToFullDisplay record={isSuccess} />
+      {data ? <OrderView order={data} /> : <OrderSkeleton />}
+    </>
+  );
+}
+```
+
+Custom spans around business-critical work:
+
+```ts title="src/features/feed/loadFeed.ts"
+import * as Sentry from '@sentry/react-native';
+import { api } from '@/api';
+import { db } from '@/db';
+
+export function loadFeed(userId: string) {
+  return Sentry.startSpan({ name: 'feed.load', op: 'function' }, async () => {
+    const posts = await api.getFeed(userId); // fetch span is created automatically
+    await Sentry.startSpan({ name: 'feed.persist', op: 'db' }, () => db.savePosts(posts));
+    return posts;
+  });
+}
+```
+
+**Firebase Performance** (`@react-native-firebase/perf`) gives you an automatic app-start trace, network monitoring captured at the native HTTP layer, and custom traces (`const t = trace(getPerformance(), 'checkout_submit'); await t.start(); t.putMetric('items', 3); await t.stop();`). Its automatic screen traces are per Activity/ViewController, which means little in a single-activity RN app. For deeper investigation, see [Performance](performance.html).
+
+## Product analytics
+
+### Event taxonomy and tracking plan
+
+Analytics data is only as good as its naming. Use **object–action** names in `snake_case`, past tense (`product_viewed`, `cart_item_added`, `checkout_started`, `order_completed`), a small set of consistently typed properties, and **no dynamic event names** (`button_42_clicked` makes 10,000 event types). Design within the strictest destination's limits. GA4, for example, allows event names up to 40 characters (letters, digits, underscores, starting with a letter), a limited number of parameters per event, and reserves the `firebase_`, `google_` and `ga_` prefixes.
+
+| Event | Trigger | Properties | Owner | Status |
+|---|---|---|---|---|
+| `product_viewed` | Product screen gets focus with data loaded | `product_id`, `category`, `price_cents`, `source` (`search`/`feed`/`deep_link`) | Growth | Live |
+| `checkout_started` | Checkout button pressed with a non-empty cart | `item_count`, `value_cents`, `currency` | Payments | Live |
+| `order_completed` | Server confirms the order (not the button tap) | `order_id`, `value_cents`, `currency`, `payment_method` | Payments | Live |
+| `sign_up_completed` | Account created | `method` (`email`/`apple`/`google`) | Identity | Planned |
+
+Keep the tracking plan in the repo, and **generate TypeScript types from it**, so a misspelled event or missing property fails to compile:
+
+```ts title="src/analytics/events.ts"
+export type AnalyticsEvents = {
+  product_viewed: { product_id: string; category: string; price_cents: number; source: 'search' | 'feed' | 'deep_link' };
+  cart_item_added: { product_id: string; quantity: number; price_cents: number };
+  checkout_started: { item_count: number; value_cents: number; currency: string };
+  order_completed: { order_id: string; value_cents: number; currency: string; payment_method: 'card' | 'apple_pay' | 'google_pay' };
+  sign_up_completed: { method: 'email' | 'apple' | 'google' };
+};
+
+export type EventName = keyof AnalyticsEvents;
+```
+
+### A provider-agnostic analytics layer
+
+Screens should never import a vendor SDK. A thin layer gives you type safety, a single consent gate, fan-out to several providers, and painless vendor swaps. It's also trivial to mock in tests.
+
+```ts title="src/analytics/analytics.ts"
+import type { AnalyticsEvents, EventName } from './events';
+import { reportNonFatal } from '@/monitoring/reporter';
+
+export type UserTraits = { plan?: 'free' | 'pro'; locale?: string; signup_month?: string };
+type Props = Record<string, string | number | boolean>;
+
+export interface AnalyticsProvider {
+  readonly name: string;
+  init(): Promise<void>;
+  track(event: string, props: Props): void;
+  screen(name: string, props?: Props): void;
+  identify(userId: string, traits: UserTraits): void;
+  reset(): void;
+  setEnabled(enabled: boolean): void;
+  flush?(): Promise<void>;
+}
+
+type Consent = 'unknown' | 'granted' | 'denied';
+const MAX_BUFFER = 100;
+
+class Analytics {
+  private providers: AnalyticsProvider[] = [];
+  private consent: Consent = 'unknown';
+  private buffer: Array<(p: AnalyticsProvider) => void> = [];
+  private superProps: Props = {};
+
+  async init(providers: AnalyticsProvider[], superProps: Props) {
+    this.providers = providers;
+    this.superProps = superProps; // app_version, build, ota_update_id, platform
+    await Promise.allSettled(providers.map((p) => p.init()));
+    providers.forEach((p) => p.setEnabled(false)); // off until consent is known
+  }
+
+  setConsent(consent: Consent) {
+    this.consent = consent;
+    this.providers.forEach((p) => p.setEnabled(consent === 'granted'));
+    if (consent === 'granted') this.buffer.forEach((fn) => this.run(fn));
+    this.buffer = []; // granted: flushed above; denied: dropped
+  }
+
+  track<E extends EventName>(event: E, props: AnalyticsEvents[E]) {
+    const payload: Props = { ...this.superProps, ...props };
+    if (__DEV__) console.debug('[analytics]', event, payload);
+    this.dispatch((p) => p.track(event, payload));
+  }
+
+  screen(name: string) {
+    this.dispatch((p) => p.screen(name, this.superProps));
+  }
+
+  identify(userId: string, traits: UserTraits = {}) {
+    this.dispatch((p) => p.identify(userId, traits)); // internal opaque ID, never email
+  }
+
+  reset() {
+    this.providers.forEach((p) => p.reset()); // logout: new anonymous ID, no cross-user bleed
+  }
+
+  async flush() {
+    await Promise.allSettled(this.providers.map((p) => p.flush?.()));
+  }
+
+  private dispatch(fn: (p: AnalyticsProvider) => void) {
+    if (this.consent === 'denied') return;
+    if (this.consent === 'unknown') {
+      if (this.buffer.length < MAX_BUFFER) this.buffer.push(fn); // memory only, never persisted
+      return;
+    }
+    this.run(fn);
+  }
+
+  private run(fn: (p: AnalyticsProvider) => void) {
+    for (const p of this.providers) {
+      try {
+        fn(p);
+      } catch (e) {
+        reportNonFatal(e, `analytics.${p.name}`); // analytics must never crash the app
+      }
+    }
+  }
+}
+
+export const analytics = new Analytics();
+```
+
+An adapter per vendor maps the interface onto the SDK:
+
+```ts title="src/analytics/providers/amplitude.ts"
+import * as amplitude from '@amplitude/analytics-react-native';
+import type { AnalyticsProvider } from '../analytics';
+import { env } from '@/config/env';
+
+export function createAmplitudeProvider(): AnalyticsProvider {
+  return {
+    name: 'amplitude',
+    init: () => amplitude.init(env.AMPLITUDE_KEY, undefined, { trackingOptions: { ipAddress: false } }).promise,
+    track: (event, props) => void amplitude.track(event, props),
+    screen: (name, props) => void amplitude.track('screen_viewed', { screen_name: name, ...props }),
+    identify: (userId, traits) => {
+      amplitude.setUserId(userId);
+      const id = new amplitude.Identify();
+      Object.entries(traits).forEach(([k, v]) => v !== undefined && id.set(k, v));
+      amplitude.identify(id);
+    },
+    reset: () => amplitude.reset(),
+    setEnabled: (enabled) => amplitude.setOptOut(!enabled),
+    flush: () => amplitude.flush().promise,
+  };
+}
+```
+
+A Firebase adapter looks the same, using the modular API (`logEvent(getAnalytics(), name, params)`, `setUserId`, `setUserProperties`, `setAnalyticsCollectionEnabled`, `resetAnalyticsData`). Log screens as `logEvent(analytics, 'screen_view', { screen_name, screen_class })`. Disable Firebase's automatic screen reporting in `firebase.json` (`google_analytics_automatic_screen_reporting_enabled: false`): in a single-activity RN app it only ever reports `MainActivity`.
+
+### Screen tracking
+
+```tsx title="src/navigation/AppNavigationContainer.tsx"
+import { useRef, type ReactNode } from 'react';
+import { NavigationContainer, useNavigationContainerRef } from '@react-navigation/native';
+import { analytics } from '@/analytics/analytics';
+import { navigationIntegration } from '@/monitoring/sentry';
+
+export function AppNavigationContainer({ children }: { children: ReactNode }) {
+  const navigationRef = useNavigationContainerRef();
+  const currentRoute = useRef<string | undefined>(undefined);
+
+  return (
+    <NavigationContainer
+      ref={navigationRef}
+      onReady={() => {
+        navigationIntegration.registerNavigationContainer(navigationRef);
+        currentRoute.current = navigationRef.getCurrentRoute()?.name;
+        if (currentRoute.current) analytics.screen(currentRoute.current);
+      }}
+      onStateChange={() => {
+        const next = navigationRef.getCurrentRoute()?.name;
+        if (next && next !== currentRoute.current) analytics.screen(next); // dedupe re-renders and param changes
+        currentRoute.current = next;
+      }}
+    >
+      {children}
+    </NavigationContainer>
+  );
+}
+```
+
+With Expo Router, track `usePathname()` changes in the root layout, and normalise dynamic segments (`/orders/[id]`, not `/orders/8412`) to keep cardinality down and IDs out of screen names.
+
+### Identification and privacy
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant App as App
+    participant CMP as Consent UI
+    participant AL as Analytics layer
+    participant V as Vendor SDK
+    App->>AL: init (providers disabled)
+    App->>CMP: show consent (EEA/UK) or apply regional default
+    U->>CMP: accept analytics, reject ads
+    CMP->>AL: setConsent granted
+    AL->>V: enable, flush in-memory buffer
+    U->>App: log in
+    App->>AL: identify(internal user id)
+    AL->>V: setUserId, merge anonymous history
+    U->>App: log out
+    App->>AL: reset
+    AL->>V: new anonymous id
+```
+*Figure: Consent-gated identification. Nothing is sent before consent where it's required. Identify uses an opaque internal ID, and logout resets the identity so a shared device doesn't merge two people.*
+
+- **Consent:** in the EEA and UK, get consent before non-essential analytics and advertising collection. Turn SDK auto-collection off at build time (for example `analytics_auto_collection_enabled: false` in `firebase.json`) and enable it after consent. For Firebase/Google Ads, pass Consent Mode signals (`setConsent` with `analytics_storage`, `ad_storage`, `ad_user_data`, `ad_personalization`).
+- **ATT (iOS):** App Tracking Transparency is required only for *tracking*: linking your data with other companies' data for ads, or sharing it with data brokers. First-party product analytics doesn't need the ATT prompt, but must be declared in the privacy labels and privacy manifest. If you do track, add `NSUserTrackingUsageDescription` and request authorisation (`expo-tracking-transparency` or `react-native-tracking-transparency`) after a pre-prompt. The IDFA is all zeros until the user grants it. Since iOS 17, connections to domains declared as tracking domains in a privacy manifest are blocked while tracking isn't permitted.
+- **Minimisation:** no emails, phone numbers, names, free text, precise location or tokens in event properties. Hashing an email doesn't anonymise it (it's still personal data under GDPR). Bucket values where you can (`order_value_band`).
+- **Deletion:** account deletion (mandatory on iOS for apps that allow sign-up) must also trigger the vendors' user-deletion APIs. Set retention periods deliberately.
+
+### Batching, offline and delivery
+
+SDKs persist events to disk, batch them (by count or interval), and retry with backoff, so offline events arrive later with their original client timestamps. Flush when the app goes to the background (`AppState` → `'background'` → `analytics.flush()`), because the OS may kill the process at any point after that. Use insert/dedupe IDs where the vendor supports them, so retries don't double-count. Remember that client clocks are wrong sometimes: compute durations on the device and store both client and server timestamps.
+
+### Debugging analytics
+
+| Tool | How |
+|---|---|
+| Firebase DebugView | Android: `adb shell setprop debug.firebase.analytics.app com.example.shop` (reset with `.none.`). iOS: `-FIRDebugEnabled` launch argument. Events show in seconds; standard reports lag by up to a day. |
+| Amplitude / Mixpanel / PostHog / Segment | Live event streams, user lookup, and Segment's source debugger. |
+| Proxy (Proxyman, Charles) | Inspect batches, and confirm nothing is sent before consent. |
+| Unit tests | Assert that key screens call a mocked `analytics.track` with the right payload. |
+
+## Logging, feature flags and remote config
+
+### Logging
+
+In production, `console.log` goes nowhere useful, and it costs time when you log large objects. Route logs through a small logger: to the console in development, to breadcrumbs in production (attached to the next error), and escalate errors. Recent Sentry SDKs also offer structured logs (`enableLogs`, `Sentry.logger.*`), and Datadog has mobile log ingestion, if you need searchable logs rather than breadcrumbs. Strip leftover `console.*` calls from release bundles with `babel-plugin-transform-remove-console`.
+
+```ts title="src/monitoring/logger.ts"
+import * as Sentry from '@sentry/react-native';
+
+type Level = 'debug' | 'info' | 'warn' | 'error';
+type LogData = Record<string, string | number | boolean | null>;
+
+function write(level: Level, category: string, message: string, data?: LogData) {
+  if (__DEV__) {
+    (level === 'debug' ? console.log : console[level])(`[${category}] ${message}`, data ?? '');
+    return;
+  }
+  Sentry.addBreadcrumb({ category, message, data, level: level === 'warn' ? 'warning' : level });
+  if (level === 'error') Sentry.captureMessage(`${category}: ${message}`, 'error');
+}
+
+export const logger = {
+  debug: (c: string, m: string, d?: LogData) => write('debug', c, m, d),
+  info: (c: string, m: string, d?: LogData) => write('info', c, m, d),
+  warn: (c: string, m: string, d?: LogData) => write('warn', c, m, d),
+  error: (c: string, m: string, d?: LogData) => write('error', c, m, d),
+};
+```
+
+### Feature flags and kill switches
+
+| Tool | Strengths |
+|---|---|
+| Firebase Remote Config | Free; conditions and percentage rollouts; A/B testing with Analytics; real-time update listener |
+| LaunchDarkly | Enterprise targeting, streaming updates, audit logs, experimentation |
+| Statsig | Flags + experiments + product analytics with strong statistics |
+| GrowthBook | Open source, self-hostable, warehouse-native experiments |
+| PostHog / Unleash / Flagsmith | Open-source options; PostHog bundles flags with analytics and replay |
+
+A **kill switch** is a remote flag that disables a feature without a release: a broken payment method, a crashing new screen, a third-party SDK that misbehaves. It's the fastest mitigation you have, faster than an OTA update and much faster than a store release.
+
+```ts title="src/flags/remoteConfig.ts"
+import {
+  fetchAndActivate,
+  getRemoteConfig,
+  getValue,
+  setConfigSettings,
+  setDefaults,
+} from '@react-native-firebase/remote-config';
+import { logger } from '@/monitoring/logger';
+
+const DEFAULTS = {
+  checkout_enabled: true, // existing features default ON: a failed fetch must not disable checkout
+  new_feed_enabled: false, // risky new features default OFF
+  min_supported_build: 0, // forced-upgrade gate
+};
+
+const rc = getRemoteConfig();
+
+export async function initRemoteConfig() {
+  await setDefaults(rc, DEFAULTS);
+  await setConfigSettings(rc, { minimumFetchIntervalMillis: __DEV__ ? 0 : 15 * 60 * 1000 });
+  try {
+    await fetchAndActivate(rc); // falls back to cached, then default values
+  } catch {
+    logger.warn('flags', 'Remote Config fetch failed; using cached/default values');
+  }
+}
+
+export const flags = {
+  checkoutEnabled: () => getValue(rc, 'checkout_enabled').asBoolean(),
+  newFeedEnabled: () => getValue(rc, 'new_feed_enabled').asBoolean(),
+  minSupportedBuild: () => getValue(rc, 'min_supported_build').asNumber(),
+};
+```
+
+Rules:
+
+- **Safe defaults** that work offline and on first launch. **Evaluate at safe points** (app start, screen entry), never in the middle of checkout.
+- **Enforce on the server too.** Client flags are advisory, and a modified client can flip them.
+- **Tag monitoring events** with the flags that matter (`Sentry.setTag('ff.new_feed', 'on')`), so crash spikes can be attributed to a variant.
+- **Remove stale flags.** Each flag gets an owner and an expiry date.
+
+## Alerting and process
+
+### Alerts that matter
+
+| Alert | Example condition | Route |
+|---|---|---|
+| New issue in the latest release | First seen in `release:latest` and affecting more than 50 users in 1 h | Team Slack channel |
+| Crash-free sessions drop | Latest release below 99.5% over 1 h, with at least 1,000 sessions | Page on-call during a rollout |
+| Regression | A resolved issue reappears in a newer release | Slack; ticket reopened |
+| ANR / hang spike | ANR rate above the previous release by more than 30% | Slack; review Play vitals |
+| Critical flow errors | Checkout span error rate above 2% for 10 min | Page on-call |
+| Funnel anomaly | `checkout_started` → `order_completed` conversion drops 20% day over day | Product and payments channel |
+
+Set **minimum volumes** so a single user can't page anyone at 3 a.m. Route by ownership rules (paths or tags → team), and review alert noise monthly.
+
+### Release-health gates for staged rollouts
+
+```mermaid
+flowchart TD
+    Start(["Release approved"]) --> Stage1["Staged rollout 1-5%<br/>(Play staged rollout, iOS phased release)"]
+    Stage1 --> Soak["Soak 24-48 h until<br/>minimum sessions reached"]
+    Soak --> Check{"Crash-free and ANR rates<br/>at or better than previous release?"}
+    Check -->|"no"| Halt["Halt rollout or<br/>pause phased release"]
+    Check -->|"yes"| Issues{"New high-volume issue<br/>or funnel drop?"}
+    Issues -->|"no"| Expand["Expand: 20% then 50% then 100%"]
+    Issues -->|"yes"| Triage["Triage within SLA"]
+    Halt --> Triage
+    Triage --> Fix{"Mitigation?"}
+    Fix -->|"flag"| Kill["Flip kill switch"]
+    Fix -->|"JS only"| OTA["OTA fix to that runtime,<br/>verify, then resume"]
+    Fix -->|"native"| Hotfix["Hotfix build,<br/>new staged rollout"]
+    Expand --> Watch(["Keep watching for 7 days"])
+```
+*Figure: A release gate. You can't roll back a store release. Users who already updated keep the new version. So the mitigations are halting the rollout, a kill switch, an OTA fix, or a new build.*
+
+Platform mechanics: Google Play **staged rollouts** can be halted and resumed. You can automate halting through the Play Developer API (update the track release's status or user fraction) when an alert fires. The App Store's **phased release** increases the share of automatic updates over 7 days (1% → 2% → 5% → 10% → 20% → 50% → 100%) and can be paused (for up to 30 days in total). It only affects *automatic* updates: users can still update manually from the store. See [Deployment](deployment.html) and [OTA Updates](ota-updates.html).
+
+### Triage workflow
+
+```mermaid
+stateDiagram-v2
+    state "Resolved in next release" as ResolvedNext
+    state "In progress" as InProgress
+    [*] --> New : first seen
+    New --> Triaged : owner and severity set
+    New --> Ignored : noise, archived with reason
+    Ignored --> New : volume exceeds threshold
+    Triaged --> InProgress : ticket linked
+    InProgress --> ResolvedNext : fix merged
+    ResolvedNext --> Verified : no events in fixed release
+    ResolvedNext --> Regressed : seen again in fixed release
+    Regressed --> Triaged : auto-reopened
+    Verified --> [*]
+```
+*Figure: Issue lifecycle. "Resolve in next release" lets the tool detect regressions automatically. Archiving with a threshold keeps noise out without losing real spikes.*
+
+| Severity | Example | Response |
+|---|---|---|
+| S1 | Crash on launch, checkout broken, data loss, security issue | Page on-call, halt rollout, kill switch/OTA/hotfix within hours |
+| S2 | Crash in a major flow affecting more than 0.5% of users | Fix in the current sprint; consider a hotfix |
+| S3 | Edge-case crash, degraded feature with a workaround | Backlog with a due date |
+| S4 | Cosmetic, third-party noise | Archive or fix opportunistically |
+
+**Process essentials:**
+
+- **Mobile on-call** has a runbook: halt the rollout, publish or roll back an OTA, flip a kill switch, and contact backend on-call.
+- **Link to the issue tracker.** A Sentry/Crashlytics → Jira/Linear/GitHub integration creates tickets from issues. Putting `Fixes SHOP-MOBILE-1A2` in a commit message resolves the issue when the release ships.
+- **Associate commits with releases** (`sentry-cli releases set-commits --auto`), so each issue shows *suspect commits*.
+- **Regression detection:** compare every release with the previous one (crash-free rate, top new issues, TTID p75, cold start), backed in CI by the performance and E2E suites from [Testing Strategy](testing.html).
+
+## Store consoles
+
+| Console | What you get | Notes |
+|---|---|---|
+| **Play Console → Android vitals** | Crash and ANR rates against the thresholds, per device and OS; slow start, slow/frozen rendering, wakeups, battery; clustered stacks; peer benchmarks | Deobfuscated from the AAB's mapping; exportable via the Play Developer Reporting API |
+| **Xcode Organizer** | Crashes, hang rate, launch time, memory, disk writes, energy, scroll hitches, terminations | Opt-in users only, delayed by a day or more |
+| **App Store Connect** | TestFlight crashes and screenshot feedback, App Analytics | Opt-in users only |
+| **MetricKit** | Daily on-device metrics and diagnostics (crash, hang, CPU, disk writes) delivered to your app | Catches watchdog kills your SDK misses; several SDKs ingest it |
+
+The consoles see what your SDK can't (crashes before SDK init, OOM and watchdog kills, SDK crashes), and they're what the stores judge you on. Your SDK sees consenting users in near real time, with breadcrumbs and JS stacks. Use both.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| JS frames show `index.android.bundle:1:84211` | Source map not uploaded, Debug ID missing (Metro plugin not applied), or the Hermes map wasn't composed | Check `withSentryConfig`/`getSentryExpoConfig`, the build phases or `sentry.gradle`; run `sentry-cli sourcemaps explain <event-id>` |
+| Readable before, unreadable after an OTA | Maps for the update were never uploaded | Run `sentry-expo-upload-sourcemaps dist` (or your upload step) in the same CI job as every `eas update` |
+| iOS native frames are raw addresses | Missing dSYM (DWARF-only setting, upload phase skipped, CI archive not uploaded) | DWARF with dSYM for Release; `sentry-cli debug-files upload <path>`; compare UUIDs with `dwarfdump --uuid` |
+| Android frames like `a.b.c.d` | R8 mapping not uploaded for *that* build | Enable mapping upload in the Sentry/Crashlytics Gradle plugin; every build has a unique mapping |
+| No crashes from debug builds | Crashlytics collection disabled in debug; debugger intercepts crashes; Sentry `enabled: !__DEV__` | Test on a release build without the debugger attached; relaunch to send |
+| Crash on launch never reported | Crash before SDK init, or watchdog kill | Initialise first in `index.js`; check Organizer / Play vitals |
+| Duplicate crash reports | Two native crash reporters, or JS fatal + native abort not deduplicated | One native reporter; keep SDK dedupe defaults |
+| Duplicate analytics events | React StrictMode double effects in dev, tracking in render, auto + manual screen tracking, retries without insert IDs | Track in handlers or focus effects, turn off auto screen reporting, dedupe route changes, use insert IDs |
+| Firebase events missing | Standard reports lag by up to a day; collection disabled pending consent | Use DebugView; check the consent flow and `firebase.json` flags |
+| Quota exhausted overnight | Error loop (retrying failed request each render) or trace sampling too high | Fix the loop; spike protection; lower `tracesSampleRate`; client-side rate limiting |
+
+## Production checklist
+
+- [ ] One native crash reporter; SDK initialised first in `index.js`, with `Sentry.wrap` and root + per-screen error boundaries.
+- [ ] Source maps (Hermes-composed, Debug IDs), dSYMs, R8 mapping and NDK symbols uploaded by CI for every build.
+- [ ] Source maps uploaded for **every OTA update**; update ID, channel and runtime version tagged on events.
+- [ ] `environment`, `release` and `dist` consistent across JS and native; commits associated with releases.
+- [ ] `sendDefaultPii: false`, `beforeSend`/`beforeBreadcrumb` scrubbing, plus server-side scrubbing rules.
+- [ ] User context is an opaque ID only; cleared on logout.
+- [ ] Session replay masked by default, sampled on error, disclosed in the privacy policy.
+- [ ] Traces sampled; TTID/TTFD on key screens; custom spans on critical flows; distributed tracing to the backend.
+- [ ] Typed tracking plan; analytics behind an abstraction; consent-gated; no PII in properties; auto screen reporting off.
+- [ ] ATT only if you actually track; privacy labels, Data safety form and privacy manifests match what SDKs collect.
+- [ ] Kill switches for risky features, with safe defaults; forced-upgrade flag.
+- [ ] Alerts: new issues in the latest release, crash-free drop, regressions, ANR spikes, critical-flow errors, funnel anomalies.
+- [ ] Staged rollout gates with owners, halt procedure (automated where possible) and an on-call runbook.
+- [ ] Weekly review of Play vitals, Xcode Organizer and top issues; symbolication verified on each release candidate.
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [Sentry for React Native](https://docs.sentry.io/platforms/react-native/)
+- [React Native Firebase — Crashlytics](https://rnfirebase.io/crashlytics/usage)
+- [Android vitals](https://developer.android.com/topic/performance/vitals)
+- [Apple — MetricKit](https://developer.apple.com/documentation/metrickit)
+
+## Interview questions
+
+### How would you set up crash reporting for a new React Native app?
+
+**Short answer:** Choose one tool that handles both JS and native crashes (usually Sentry), initialise it first in `index.js`, wrap the app, add error boundaries, and, most importantly, wire symbol uploads into CI: Hermes-composed source maps, dSYMs, R8 mappings and NDK symbols for every build and every OTA update.
+
+Add context (opaque user ID, environment, OTA update ID), scrub in `beforeSend`, sample traces, and alert per release. Verify by deliberately crashing a *release* build and checking the stack.
+
+> [!INTERVIEW]
+> Senior signal: talking about symbolication and OTA source maps without being prompted, and choosing a single native crash handler. Red flag: "we just add the SDK".
+
+### How does symbolication work for JS, iOS and Android crashes?
+
+**Short answer:** JS frames on Hermes are bytecode offsets in a minified bundle, resolved with the composed Metro + Hermes source map (matched by Debug ID or release/dist). iOS frames are memory addresses resolved with the dSYM whose UUID matches the binary. Android JVM frames are R8-obfuscated names resolved with that build's `mapping.txt`. NDK frames need unstripped `.so` symbol files.
+
+Every artifact must come from the exact build that shipped. Rebuilding the same commit gives new UUIDs and a new mapping.
+
+### What happens when an uncaught JS error occurs in a release build?
+
+**Short answer:** It reaches the `ErrorUtils` global handler with `isFatal: true`. The SDK reports the source-mapped JS error, and then RN aborts natively (`RCTFatal` on iOS, `JavascriptException` on Android), so the app terminates and native crash reporters see a generic native crash.
+
+Render errors can be stopped earlier by an ErrorBoundary. Unhandled promise rejections don't go through the global handler; in release they're silent unless the SDK tracks them. Good setups dedupe the JS fatal and the native crash that follows.
+
+### How do you keep stack traces readable after an OTA update?
+
+**Short answer:** Upload the source maps produced by each OTA publish (for example `npx sentry-expo-upload-sourcemaps dist` after `eas update`) in the same CI job, and tag events with the update ID, channel and runtime version.
+
+Debug IDs mean the maps match even though the native release is unchanged. Decide whether an OTA gets its own `dist` or release, depending on whether you need per-update release health.
+
+### Which metrics decide whether a staged rollout continues?
+
+**Short answer:** Crash-free sessions and users compared with the previous release (with a minimum sample size), user-perceived ANR rate and hang rate, new high-volume issues, and business funnels such as checkout conversion.
+
+If any gate fails: halt the Play rollout or pause the App Store phased release, then mitigate with a kill switch, an OTA fix (JS only) or a hotfix build. You can't roll back a store release.
+
+### How do you design analytics so the data stays trustworthy?
+
+**Short answer:** A typed tracking plan with object–action event names, consistent property types and owners. A provider-agnostic layer that screens call, with a single consent gate. Screen tracking from navigation state changes with dedupe, and identify/reset tied to login and logout.
+
+Add super properties (app version, OTA update ID), flush on background, insert IDs against duplicates, and verify events with DebugView and unit tests.
+
+### What must never end up in crash reports or analytics, and how do you enforce that?
+
+**Short answer:** Credentials and tokens, payment data, emails, phone numbers, names, free-text input, precise location, and health or other sensitive data. Enforce it in code (`sendDefaultPii: false`, `beforeSend`/`beforeBreadcrumb` scrubbing, typed analytics properties that forbid free-form strings where possible), in server-side scrubbing rules, and by masking session replay by default.
+
+Also: consent gating in the EEA/UK, ATT only if you actually track, accurate privacy labels and Data safety forms, and deletion requests passed on to vendors.
+
+### How do ANRs and iOS hangs differ, and how do you find their cause in RN?
+
+**Short answer:** An Android ANR is the system reporting that the main thread was blocked (about 5 s for input), and it counts against Play's bad-behaviour threshold. An iOS hang is main-thread unresponsiveness (over about 250 ms), reported as a hang rate in Xcode Organizer, and a watchdog kills slow launches.
+
+In RN, the usual causes are synchronous native work on the main thread (large storage reads, synchronous TurboModule calls, heavy view creation), work at startup, and main-thread I/O in native modules. Use the SDK's ANR/hang events with main-thread stacks, Play vitals clusters and MetricKit hang diagnostics. Separately, track JS thread stalls, which make taps feel dead without registering as ANRs.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

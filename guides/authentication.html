@@ -1,0 +1,1564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authentication &amp; Sessions · React Native Interview Handbook</title>
+<meta name="description" content="How to design, implement and defend authentication in React Native: session models and token lifetimes, every common login method (password, OTP, Google, Apple, OAuth/OIDC with…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Authentication &amp; Sessions · React Native Interview Handbook">
+<meta property="og:description" content="How to design, implement and defend authentication in React Native: session models and token lifetimes, every common login method (password, OTP, Google, Apple, OAuth/OIDC with…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="guides/authentication.html" data-type="guide">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Authentication & Sessions
+
+How to design, implement and defend authentication in React Native: session models and token lifetimes, every common login method (password, OTP, Google, Apple, OAuth/OIDC with PKCE, magic links, passkeys), the app-side auth state machine, launch-time session restore, a correct single-flight token refresh, biometric unlock, logout, and the store policies that shape all of it.
+
+## How it works
+
+A mobile app is an OAuth **public client**: it cannot keep a secret, runs on a device the user controls, and may be offline, backgrounded or killed at any moment. That leads to a standard architecture:
+
+- The user proves their identity **once** (password, OTP, social provider, passkey).
+- The server issues a **session**: either an opaque session ID, or a short-lived **access token** plus a long-lived **refresh token**.
+- The app keeps the long-lived credential in the **Keychain/Keystore**, the short-lived one in memory, and silently renews the session until the user logs out, the refresh token expires, or the server revokes it.
+
+### Session models
+
+| | Opaque server session | JWT access token + rotating refresh token |
+|---|---|---|
+| What the app holds | Random session ID (cookie or bearer) | Signed JWT (5–15 min) + opaque refresh token (days–months) |
+| Validation | Server looks up the session on every request | APIs verify the JWT signature locally (JWKS); refresh hits the auth server |
+| Revocation | Instant — delete the session row | Access token lives until expiry; revoke the refresh token (and optionally keep a deny-list) |
+| Scale / microservices | Central session store on the hot path | Stateless verification at every service and at the edge |
+| Mobile fit | Fine for a monolith; cookie handling in RN is awkward, so use a bearer header | The de facto standard, and what every IdP (Auth0, Cognito, Firebase, Supabase) issues |
+| Main risk | Session store availability | Long-lived access tokens, refresh token theft — mitigate with short TTLs, rotation, reuse detection, device binding |
+
+### Token lifetimes (sensible defaults)
+
+| Token | Lifetime | Stored in | Notes |
+|---|---|---|---|
+| Access token | 5–15 minutes | Memory (optionally Keychain for faster cold start) | Sent as `Authorization: Bearer …`; never in URLs |
+| Refresh token | 30–90 days, **sliding** on use, with an absolute maximum (e.g. 1 year) | Keychain/Keystore, `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY` | Rotated on every use; single-use; bound to device if possible |
+| ID token (OIDC) | Minutes | Not stored long-term | Proves identity to the *client*; not for calling your APIs |
+| Step-up / elevated token | 5 minutes | Memory | Issued after biometric/password re-auth for sensitive actions |
+
+```mermaid
+flowchart TD
+    User(["User"]) --> LoginUI["Login screen"]
+    LoginUI --> Method{"Method"}
+    Method -->|"password / OTP"| AuthAPI["Auth server<br/>/auth/login, /auth/refresh"]
+    Method -->|"Google / Apple SDK"| Native["Native provider SDK<br/>returns ID token"]
+    Method -->|"OAuth / OIDC"| Browser["System browser<br/>ASWebAuthenticationSession / Custom Tabs"]
+    Native --> AuthAPI
+    Browser --> AuthAPI
+    AuthAPI -->|"access + refresh tokens"| Store["Auth store<br/>(memory state)"]
+    Store --> KC[("Keychain / Keystore<br/>refresh token")]
+    Store --> Client["API client<br/>interceptors: attach, refresh, retry"]
+    Client -->|"Bearer access token"| API["Resource APIs<br/>verify JWT via JWKS"]
+    Client -.->|"401 or near expiry"| AuthAPI
+```
+*Figure: Authentication architecture — identity is proven once, then the API client keeps the session alive with short-lived access tokens.*
+
+> [!INTERVIEW]
+> Interviewers probe whether you understand *why* the split exists: short access tokens limit the damage of a leak and let APIs verify statelessly; the refresh token is the real long-term credential, so it gets the strongest storage, rotation and revocation. Red flag: "we store a 30-day JWT in AsyncStorage".
+
+## Requirements & prerequisites
+
+| Method | Console / account setup | App configuration | Server responsibilities |
+|---|---|---|---|
+| Email + password / OTP | Your auth backend or IdP; an SMS/email provider (Twilio Verify, Firebase Phone Auth, AWS SNS/SES…) | Autofill props on inputs; Android SMS Retriever app hash if used | Password hashing (Argon2id/bcrypt), rate limits, OTP expiry and attempt limits, SMS fraud controls |
+| Google Sign-In | Google Cloud (or Firebase) project, OAuth consent screen; a **Web** client ID; an **iOS** client ID; **Android** OAuth client(s) with package name + SHA-1 of the **debug, upload and Play App Signing** keys | iOS URL scheme = reversed iOS client ID; Expo config plugin with `iosUrlScheme` | Verify the ID token: signature, `aud` = web client ID, `iss`, `exp` |
+| Sign in with Apple | "Sign in with Apple" capability on the App ID; a **Services ID** (with domains and return URLs) for Android/web; a Sign in with Apple **key (.p8)** for code exchange and revocation; register email-relay sending domains | Entitlement `com.apple.developer.applesignin` = `Default`; Expo `ios.usesAppleSignIn: true` | Verify `identityToken` against Apple's JWKS; exchange the authorization code; revoke tokens on account deletion; optional server-to-server notification endpoint |
+| OAuth 2.0 / OIDC (Auth0, Okta, Keycloak, Cognito, Entra ID) | A **native/public** application (no client secret), PKCE enabled, allowed callback and logout URLs registered | Redirect scheme (Android `manifestPlaceholders`, iOS URL type) or an https Universal/App Link | Validate access tokens (JWKS or introspection) |
+| Magic links | Email provider, a domain you control | Associated Domains `applinks:example.com`; Android intent filter with `autoVerify` + `assetlinks.json` | Single-use, short-lived, hashed link tokens |
+| Passkeys | Relying Party ID = your domain | Associated Domains `webcredentials:example.com` + AASA `webcredentials.apps`; Android `assetlinks.json` with `delegate_permission/common.get_login_creds` | WebAuthn server library (e.g. SimpleWebAuthn) storing credential public keys |
+
+Platform versions: passkeys need iOS 16+ and Android 9+ (via Credential Manager / Play services); App Attest-based protections need iOS 14+.
+
+## Choosing an approach
+
+### Auth provider comparison
+
+| Provider | RN integration | Strengths | Watch-outs |
+|---|---|---|---|
+| **Auth0** (Okta) | `react-native-auth0` (Universal Login in the system browser, PKCE; Expo config plugin) | Enterprise SSO (SAML/OIDC), MFA, passkeys, extensibility (Actions), mature docs | MAU-based pricing climbs quickly; B2B features on higher tiers |
+| **Firebase Auth** | `@react-native-firebase/auth` | Email, phone, Google, Apple, anonymous auth; generous free tier; pairs with Firestore rules and App Check | Firebase-issued ID tokens (1 hour) — your own API verifies them with the Admin SDK; SMS costs; advanced features need Identity Platform |
+| **Amazon Cognito** | Amplify (`aws-amplify` + `@aws-amplify/react-native`) | Cheap at scale, AWS IAM integration, federation, managed login UI | DX and customisation are the usual complaints; migration off is hard |
+| **Supabase Auth** | `@supabase/supabase-js` with a custom storage adapter | Tight Postgres Row Level Security integration, open source, self-hostable | You must supply secure storage (session JSON can exceed SecureStore's size guidance — encrypt it with a key kept in SecureStore) |
+| **Clerk** | `@clerk/clerk-expo` | Prebuilt UI, very fast setup, sessions/organisations out of the box | Vendor lock-in, per-MAU pricing, Expo-centric |
+| **Custom** (your backend, or Keycloak / Ory self-hosted) | Your own API client | Full control, data residency, no per-user fees | You own hashing, rotation, MFA, abuse prevention, audits — highest effort and risk |
+
+**Recommendation:** use a managed IdP unless you have a concrete reason (compliance, cost at very large scale, unusual flows) not to. Whatever you choose, keep an **auth service boundary** in the app (`authService.signIn()`, `authService.refresh()`) so the provider can be swapped.
+
+### Login method comparison
+
+| Method | Security | UX | Effort | Notes |
+|---|---|---|---|---|
+| Email + password | Medium (phishing, reuse) — better with MFA | Familiar; autofill helps | Low | Needs reset flow, breach checks |
+| SMS OTP | Low–medium (SIM swap, SMS pumping fraud) | Very smooth with autofill | Medium | Costs money per SMS; region-dependent deliverability |
+| Google / Apple | High (provider handles credentials) | One tap | Medium | Offering Google usually triggers the Sign in with Apple requirement |
+| OAuth/OIDC (enterprise SSO) | High | Browser hop | Medium | Required for B2B customers with their own IdP |
+| Magic link | Medium (email account = key) | Good on the same device, poor across devices | Medium | Needs Universal/App Links |
+| Passkeys | **Highest** (phishing-resistant, no shared secret) | Excellent once enrolled | Medium–high | Library ecosystem still maturing in RN |
+
+## Login methods
+
+All snippets below share two small modules: a bare axios instance for unauthenticated auth endpoints, and the token types.
+
+```ts title="src/api/authClient.ts"
+import axios from 'axios';
+
+// No interceptors: used for login, refresh and logout, so it can never recurse.
+export const authClient = axios.create({ baseURL: 'https://api.example.com', timeout: 15_000 });
+```
+
+```ts title="src/auth/tokenStore.ts"
+import * as Keychain from 'react-native-keychain';
+
+export type TokenResponse = { accessToken: string; refreshToken: string; expiresIn: number };
+export type TokenSet = { accessToken: string; refreshToken: string; expiresAt: number };
+
+const SERVICE = 'com.example.app.refresh';
+let current: TokenSet | null = null;
+
+/** expiresAt uses the DEVICE clock at receipt time, so server/device clock skew does not matter. */
+export const toTokenSet = (r: TokenResponse): TokenSet => ({
+  accessToken: r.accessToken,
+  refreshToken: r.refreshToken,
+  expiresAt: Date.now() + r.expiresIn * 1000,
+});
+
+export const tokenStore = {
+  get: (): TokenSet | null => current,
+  async set(tokens: TokenSet): Promise<void> {
+    current = tokens;
+    await Keychain.setGenericPassword('refresh', tokens.refreshToken, {
+      service: SERVICE,
+      accessible: Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+    });
+  },
+  async loadRefreshToken(): Promise<string | null> {
+    const creds = await Keychain.getGenericPassword({ service: SERVICE });
+    return creds ? creds.password : null;
+  },
+  async clear(): Promise<void> {
+    current = null;
+    await Keychain.resetGenericPassword({ service: SERVICE });
+  },
+};
+```
+
+### Email and password
+
+Client responsibilities are small but matter for UX and security:
+
+```tsx title="src/auth/CredentialsFields.tsx (excerpt)"
+<TextInput
+  value={email}
+  onChangeText={setEmail}
+  autoComplete="email"
+  textContentType="username"     // iOS pairs this with the password field for AutoFill
+  keyboardType="email-address"
+  autoCapitalize="none"
+  autoCorrect={false}
+/>
+<TextInput
+  value={password}
+  onChangeText={setPassword}
+  autoComplete="password"        // use "password-new" + textContentType="newPassword" on sign-up
+  textContentType="password"
+  secureTextEntry
+/>
+```
+
+- Add the `webcredentials:example.com` Associated Domain (plus `webcredentials` in your AASA file) so iOS offers saved passwords for your domain and "Save Password" after sign-up; Android's autofill uses `assetlinks.json` similarly.
+- Never store the password; exchange it for tokens once.
+- Server: Argon2id or bcrypt, breached-password checks, **generic error messages** ("email or password is incorrect") to prevent account enumeration, progressive delays per account and per IP, and MFA for sensitive apps.
+
+### OTP with autofill
+
+**iOS** reads codes from Messages (and Mail on recent iOS versions) and suggests them above the keyboard when the field has `textContentType="oneTimeCode"`. **Android** offers codes via Google's autofill/keyboard with `autoComplete="sms-otp"`, and apps can read the message directly with the **SMS Retriever API** (no permission; requires an 11-character app hash at the end of the SMS) or the **SMS User Consent API** (no hash; the user taps "Allow" on a system prompt for one message).
+
+```tsx title="src/auth/OtpInput.tsx"
+import { Platform, TextInput } from 'react-native';
+
+type Props = { value: string; onChange: (code: string) => void };
+
+export function OtpInput({ value, onChange }: Props) {
+  return (
+    <TextInput
+      value={value}
+      onChangeText={(text) => onChange(text.replace(/\D/g, '').slice(0, 6))}
+      keyboardType="number-pad"
+      textContentType="oneTimeCode"
+      autoComplete={Platform.OS === 'android' ? 'sms-otp' : 'one-time-code'}
+      maxLength={6}
+      autoFocus
+      accessibilityLabel="Verification code"
+    />
+  );
+}
+```
+
+SMS templates differ per platform, so let the client tell the server which one to send:
+
+```plaintext
+iOS (domain-bound code: autofill only offered in apps associated with example.com)
+Your Example code is 482913.
+
+@example.com #482913
+
+Android (SMS Retriever: app hash at the end)
+Your Example code is 482913
+FA+9qCX9VSu
+```
+
+```ts title="src/auth/useSmsRetriever.ts"
+import { useEffect } from 'react';
+import { Platform } from 'react-native';
+import { removeListener, startOtpListener } from 'react-native-otp-verify';
+
+export function useSmsRetriever(onCode: (code: string) => void) {
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    startOtpListener((message: string) => {
+      const code = /\b(\d{6})\b/.exec(message)?.[1];
+      if (code) onCode(code);
+    });
+    return () => removeListener();
+  }, [onCode]);
+}
+```
+
+> [!WARNING]
+> The SMS Retriever app hash is derived from the package name **and signing certificate**. With Play App Signing, production installs are signed by Google's key, so the production hash differs from your debug and upload builds. Compute it from the Play App Signing certificate or codes will silently stop auto-filling in production. Check the maintenance status of any SMS Retriever wrapper before adopting it.
+
+Server-side OTP rules: 6+ digits, 5-minute expiry, single use, maximum attempts per code, resend cooldowns, rate limits per phone/IP/device, and **SMS pumping (toll fraud) protection** — attackers trigger OTPs to premium numbers you pay for. Geo allow-lists, attestation on the "send code" endpoint (see [Security](security.html)) and provider fraud guards (e.g. Twilio Verify) are standard.
+
+### Google Sign-In
+
+`@react-native-google-signin/google-signin` wraps the native Google SDKs and returns an **ID token** that your backend verifies.
+
+**Which client IDs go where** — the most common source of failures:
+
+| Client (Google Cloud → Credentials) | Used by | How |
+|---|---|---|
+| **Web application** client | Your backend, and the ID token audience | Passed as `webClientId` in `configure()`. Without it you get no `idToken`. |
+| **iOS** client | iOS SDK | `iosClientId` in `configure()` (or `GoogleService-Info.plist`), plus the **reversed client ID** as a URL scheme |
+| **Android** client(s) | Android SDK (matched by package + SHA-1, never referenced in code) | One per signing key: **debug keystore, upload key, and the Play App Signing key** from Play Console → App integrity |
+
+```bash
+# SHA-1 fingerprints for the Android OAuth clients
+cd android && ./gradlew signingReport
+keytool -list -v -keystore ~/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android
+# Play App Signing key: Play Console -> App integrity -> App signing
+# EAS-managed keystores: eas credentials
+```
+
+```xml title="ios/MyApp/Info.plist (excerpt, bare RN)"
+<key>CFBundleURLTypes</key>
+<array>
+    <dict>
+        <key>CFBundleURLSchemes</key>
+        <array>
+            <string>com.googleusercontent.apps.123456789-abcdef</string>
+        </array>
+    </dict>
+</array>
+```
+
+```json title="app.json (excerpt, Expo)"
+{
+  "expo": {
+    "plugins": [
+      [
+        "@react-native-google-signin/google-signin",
+        { "iosUrlScheme": "com.googleusercontent.apps.123456789-abcdef" }
+      ]
+    ]
+  }
+}
+```
+
+```ts title="src/auth/providers/google.ts"
+import {
+  GoogleSignin,
+  isErrorWithCode,
+  isSuccessResponse,
+  statusCodes,
+} from '@react-native-google-signin/google-signin';
+import { authClient } from '../../api/authClient';
+import { toTokenSet, type TokenResponse, type TokenSet } from '../tokenStore';
+
+GoogleSignin.configure({
+  webClientId: '123456789-web.apps.googleusercontent.com',
+  iosClientId: '123456789-abcdef.apps.googleusercontent.com',
+});
+
+export async function signInWithGoogle(): Promise<TokenSet | null> {
+  try {
+    await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+    const response = await GoogleSignin.signIn();
+    if (!isSuccessResponse(response)) return null; // user cancelled
+    const { idToken } = response.data;
+    if (!idToken) throw new Error('google_missing_id_token'); // webClientId misconfigured
+    const { data } = await authClient.post<TokenResponse>('/auth/google', { idToken });
+    return toTokenSet(data);
+  } catch (error) {
+    if (isErrorWithCode(error)) {
+      if (error.code === statusCodes.IN_PROGRESS) return null;
+      if (error.code === statusCodes.PLAY_SERVICES_NOT_AVAILABLE) {
+        throw new Error('play_services_unavailable');
+      }
+    }
+    throw error;
+  }
+}
+```
+
+```ts title="server/auth/google.ts"
+import { OAuth2Client } from 'google-auth-library';
+
+const google = new OAuth2Client();
+const AUDIENCES = [process.env.GOOGLE_WEB_CLIENT_ID!, process.env.GOOGLE_IOS_CLIENT_ID!];
+
+export async function verifyGoogleIdToken(idToken: string) {
+  const ticket = await google.verifyIdToken({ idToken, audience: AUDIENCES }); // checks sig, iss, exp
+  const payload = ticket.getPayload();
+  if (!payload?.sub || !payload.email_verified) throw new Error('invalid_google_token');
+  return { googleUserId: payload.sub, email: payload.email }; // key accounts by sub, not email
+}
+```
+
+> [!NOTE]
+> On Android, Google is steering sign-in towards **Credential Manager** ("Sign in with Google"). The library's free API wraps the older Google Sign-In SDK, while its sponsor-only "Universal Sign In" module is built on Credential Manager. Check the library docs for the current recommendation before starting a new project.
+
+### Sign in with Apple
+
+Required by App Review Guideline 4.8 when you offer third-party social login (unless another option meets Apple's privacy criteria). Use `expo-apple-authentication` (works in bare apps too) or `@invertase/react-native-apple-authentication` (also offers an Android web-based flow).
+
+Key facts:
+
+- The native credential returns `email` and `fullName` **only on the first authorization** for that Apple ID and app. Send them to your backend in the same request — if that request fails, you cannot get them again (the user would have to revoke the app in *Settings → [your name] → Sign-In & Security → Sign in with Apple* and sign in again).
+- The `identityToken` (a JWT) usually carries the email claim on later sign-ins but **never the name**. Users can hide their email; you then get a `privaterelay.appleid.com` relay address — register your sending domains in the developer portal or your emails bounce.
+- Key accounts by the token's `sub` (stable per team), never by email.
+- Use a **nonce** to bind the token to this sign-in attempt and prevent replay. Libraries differ: `expo-apple-authentication` sends the nonce as-is (pass the SHA-256 hash, keep the raw value), while the Invertase library SHA-256 hashes the nonce you pass.
+- Use Apple's official button component (`AppleAuthenticationButton`) — the Human Interface Guidelines are enforced in review.
+
+```ts title="src/auth/providers/apple.ts"
+import * as AppleAuthentication from 'expo-apple-authentication';
+import * as Crypto from 'expo-crypto';
+import { authClient } from '../../api/authClient';
+import { toTokenSet, type TokenResponse, type TokenSet } from '../tokenStore';
+
+export async function signInWithApple(): Promise<TokenSet | null> {
+  const rawNonce = Crypto.randomUUID();
+  const hashedNonce = await Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    rawNonce, // hex-encoded by default
+  );
+  try {
+    const credential = await AppleAuthentication.signInAsync({
+      requestedScopes: [
+        AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+        AppleAuthentication.AppleAuthenticationScope.EMAIL,
+      ],
+      nonce: hashedNonce,
+    });
+    if (!credential.identityToken || !credential.authorizationCode) {
+      throw new Error('apple_missing_token');
+    }
+    const { data } = await authClient.post<TokenResponse>('/auth/apple', {
+      identityToken: credential.identityToken,
+      authorizationCode: credential.authorizationCode,
+      rawNonce,
+      email: credential.email, // first authorization only
+      fullName: credential.fullName
+        ? { given: credential.fullName.givenName, family: credential.fullName.familyName }
+        : null,
+    });
+    return toTokenSet(data);
+  } catch (error) {
+    if ((error as { code?: string }).code === 'ERR_REQUEST_CANCELED') return null;
+    throw error;
+  }
+}
+```
+
+With the Invertase library the call is `appleAuth.performRequest({ requestedOperation: appleAuth.Operation.LOGIN, requestedScopes: [appleAuth.Scope.FULL_NAME, appleAuth.Scope.EMAIL], nonce: rawNonce })`; you can also check `appleAuth.getCredentialStateForUser(user)` on launch and listen for `onCredentialRevoked` to sign the user out when they revoke access.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant App as RN App
+    participant AS as Apple on device
+    participant BE as Backend
+    participant AID as appleid.apple.com
+    App->>App: create rawNonce, SHA-256 hash it
+    App->>AS: signInAsync with hashed nonce
+    AS->>U: Face ID, share or hide email
+    U-->>AS: approve
+    AS-->>App: identityToken, authorizationCode, name and email on first auth only
+    App->>BE: POST /auth/apple with token, code, rawNonce, name
+    BE->>AID: fetch JWKS (cached)
+    BE->>BE: verify signature, iss, aud, exp, nonce hash
+    BE->>AID: exchange code with client secret JWT
+    AID-->>BE: Apple refresh token, kept for revocation
+    BE->>BE: find or create user by sub
+    BE-->>App: your access and refresh tokens
+```
+*Figure: Sign in with Apple with server-side verification of the identity token.*
+
+```ts title="server/auth/apple.ts"
+import { createHash } from 'node:crypto';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+
+const APPLE_JWKS = createRemoteJWKSet(new URL('https://appleid.apple.com/auth/keys'));
+// Bundle ID for native iOS sign-in, Services ID for web/Android sign-in
+const AUDIENCES = ['com.example.app', 'com.example.app.signin'];
+
+export async function verifyAppleIdentityToken(identityToken: string, rawNonce: string) {
+  const { payload } = await jwtVerify(identityToken, APPLE_JWKS, {
+    issuer: 'https://appleid.apple.com',
+    audience: AUDIENCES,
+    algorithms: ['RS256'],
+  });
+  const expectedNonce = createHash('sha256').update(rawNonce).digest('hex');
+  if (payload.nonce !== expectedNonce) throw new Error('apple_nonce_mismatch');
+  if (typeof payload.sub !== 'string') throw new Error('apple_missing_sub');
+  return {
+    appleUserId: payload.sub,
+    email: typeof payload.email === 'string' ? payload.email : undefined,
+    isPrivateEmail: String(payload.is_private_email) === 'true',
+  };
+}
+```
+
+The server should also exchange the `authorizationCode` at `https://appleid.apple.com/auth/token` (using a client-secret JWT signed with your Sign in with Apple key) and store Apple's refresh token: Apple requires apps to **revoke** Sign in with Apple tokens (`/auth/revoke`) when a user deletes their account. For stronger replay protection, have the server issue the nonce and mark it used.
+
+### OAuth 2.0 / OIDC with PKCE
+
+For Auth0, Okta, Keycloak, Cognito's hosted UI, Entra ID or any enterprise SSO, use the **authorization code flow with PKCE in the system browser** — `ASWebAuthenticationSession` on iOS, Custom Tabs on Android. This is the IETF best practice for native apps (**RFC 8252**, "OAuth 2.0 for Native Apps").
+
+**Why not an embedded WebView?**
+
+- The app controls the WebView, so it can read the user's password and cookies — exactly what OAuth exists to prevent. Users cannot verify the URL bar.
+- No single sign-on: the WebView does not share the browser's sessions or password manager/passkeys.
+- Google (and other IdPs) actively block OAuth in embedded WebViews (`disallowed_useragent`).
+
+**Why PKCE?** A mobile app cannot keep a client secret, and a custom-scheme redirect can be intercepted by another app registering the same scheme. PKCE binds the authorization code to a one-time secret (`code_verifier`) that never leaves your app, so an intercepted code is useless.
+
+```mermaid
+sequenceDiagram
+    participant App as RN App
+    participant BR as System browser
+    participant IdP as Authorization server
+    participant API as Resource API
+    App->>App: create code_verifier, code_challenge, state
+    App->>BR: open /authorize with code_challenge and state
+    BR->>IdP: user signs in, MFA, SSO session
+    IdP-->>BR: redirect to app with code and state
+    BR-->>App: redirect URI handled by the app
+    App->>App: check state matches
+    App->>IdP: POST /token with code and code_verifier
+    IdP->>IdP: SHA-256 of verifier must equal challenge
+    IdP-->>App: access, refresh and ID tokens
+    App->>API: request with Bearer access token
+    Note over App,IdP: An app that steals the code cannot redeem it without the verifier
+```
+*Figure: Authorization code flow with PKCE through the system browser.*
+
+**Bare React Native — react-native-app-auth** (AppAuth-iOS / AppAuth-Android):
+
+```ts title="src/auth/providers/oidc.ts"
+import { authorize, revoke, type AuthConfiguration } from 'react-native-app-auth';
+import type { TokenSet } from '../tokenStore';
+
+const config: AuthConfiguration = {
+  issuer: 'https://login.example.com',
+  clientId: 'mobile-app',                          // public client: no secret
+  redirectUrl: 'com.example.app:/oauthredirect',
+  scopes: ['openid', 'profile', 'email', 'offline_access'],
+  usePKCE: true,                                   // the default, shown for emphasis
+  iosPrefersEphemeralSession: false,               // true = no shared SSO cookies, no iOS consent alert
+};
+
+export async function signInWithOidc(): Promise<TokenSet> {
+  const result = await authorize(config);
+  if (!result.refreshToken) throw new Error('oidc_missing_refresh_token'); // offline_access not granted
+  return {
+    accessToken: result.accessToken,
+    refreshToken: result.refreshToken,
+    expiresAt: new Date(result.accessTokenExpirationDate).getTime(),
+  };
+}
+
+export async function revokeOidc(refreshToken: string): Promise<void> {
+  await revoke(config, { tokenToRevoke: refreshToken, sendClientId: true });
+}
+```
+
+```gradle title="android/app/build.gradle (excerpt)"
+android {
+    defaultConfig {
+        manifestPlaceholders = [appAuthRedirectScheme: 'com.example.app']
+    }
+}
+```
+
+On iOS, register the `com.example.app` URL scheme in `Info.plist` (`CFBundleURLTypes`) and make `AppDelegate` conform to `RNAppAuthAuthorizationFlowManager`, forwarding `application(_:open:options:)` to it — copy the snippet for your RN version from the library README, since the AppDelegate template changed across releases.
+
+**Expo — expo-auth-session:**
+
+```ts title="src/auth/useOidcSignIn.ts"
+import { useEffect } from 'react';
+import * as WebBrowser from 'expo-web-browser';
+import {
+  exchangeCodeAsync,
+  makeRedirectUri,
+  useAuthRequest,
+  useAutoDiscovery,
+} from 'expo-auth-session';
+import type { TokenSet } from './tokenStore';
+
+WebBrowser.maybeCompleteAuthSession(); // required on web, harmless on native
+
+const CLIENT_ID = 'mobile-app';
+const redirectUri = makeRedirectUri({ scheme: 'myapp', path: 'oauthredirect' });
+
+export function useOidcSignIn(onTokens: (tokens: TokenSet) => void, onError: (e: unknown) => void) {
+  const discovery = useAutoDiscovery('https://login.example.com');
+  const [request, response, promptAsync] = useAuthRequest(
+    { clientId: CLIENT_ID, redirectUri, usePKCE: true, scopes: ['openid', 'profile', 'email', 'offline_access'] },
+    discovery,
+  );
+
+  useEffect(() => {
+    if (response?.type !== 'success' || !discovery || !request?.codeVerifier) return;
+    (async () => {
+      try {
+        const result = await exchangeCodeAsync(
+          {
+            clientId: CLIENT_ID,
+            redirectUri,
+            code: response.params.code,
+            extraParams: { code_verifier: request.codeVerifier! },
+          },
+          discovery,
+        );
+        if (!result.refreshToken) throw new Error('oidc_missing_refresh_token');
+        onTokens({
+          accessToken: result.accessToken,
+          refreshToken: result.refreshToken,
+          expiresAt: Date.now() + (result.expiresIn ?? 300) * 1000,
+        });
+      } catch (error) {
+        onError(error);
+      }
+    })();
+  }, [response, discovery, request, onTokens, onError]);
+
+  return { ready: Boolean(request), signIn: () => promptAsync() };
+}
+```
+
+`useAuthRequest` generates the verifier/challenge and validates `state` for you. Set `scheme` in `app.json` and register the exact redirect URI with the IdP.
+
+> [!TIP] Redirect URIs
+> Custom schemes (`com.example.app:/oauthredirect`) are simple but claimable by other apps — PKCE makes that safe. Claimed https redirects (Universal Links / App Links) are stronger and are supported by `ASWebAuthenticationSession` on recent iOS versions; use them if your IdP and minimum OS allow. Use a reverse-DNS scheme you own, never a generic one like `myapp://`.
+
+If your IdP insists on a client secret, do not ship it — put a thin backend in front (a "backend for frontend") that performs the token exchange.
+
+### Magic links via Universal Links
+
+The user enters an email, receives a link like `https://example.com/auth/magic?token=…`, taps it, and the OS opens your app directly (Universal Link / App Link) — see [Deep Linking & Universal Links](deep-linking.html) for the AASA/assetlinks setup.
+
+```ts title="src/auth/magicLink.ts"
+import { authClient } from '../api/authClient';
+import { toTokenSet, type TokenResponse } from './tokenStore';
+import { useAuthStore } from './authStore';
+
+const MAGIC_LINK = /^https:\/\/example\.com\/auth\/magic\?token=([A-Za-z0-9_-]{32,128})$/;
+
+/** Returns true if the URL was a magic link and was handled. */
+export async function handleMagicLink(url: string): Promise<boolean> {
+  const match = MAGIC_LINK.exec(url);
+  if (!match) return false;
+  const { data } = await authClient.post<TokenResponse>('/auth/magic-link/verify', {
+    token: match[1],
+  });
+  await useAuthStore.getState().completeSignIn(toTokenSet(data));
+  return true;
+}
+```
+
+Design rules:
+
+- Tokens are random (128+ bits), **single-use**, short-lived (10–15 minutes) and stored hashed server-side.
+- **Consume with a POST, not the GET.** Corporate email scanners pre-fetch links; if a GET logs the user in, the scanner burns the token. The app (or a fallback web page with a "Continue" button) POSTs the token.
+- Cross-device is the classic UX failure (link requested on the phone, opened on a laptop). Include a short numeric code in the same email as a fallback.
+- Must use verified Universal/App Links, never a custom scheme — otherwise another app could receive the login token.
+
+### Passkeys
+
+Passkeys are WebAuthn credentials synced by the platform (iCloud Keychain, Google Password Manager, third-party managers). The private key never leaves the authenticator and is bound to your domain, which makes them **phishing-resistant** — the strongest consumer login available.
+
+Setup:
+
+```json title="https://example.com/.well-known/apple-app-site-association"
+{
+  "webcredentials": { "apps": ["ABCDE12345.com.example.app"] },
+  "applinks": {
+    "details": [{ "appIDs": ["ABCDE12345.com.example.app"], "components": [{ "/": "/auth/*" }] }]
+  }
+}
+```
+
+```json title="https://example.com/.well-known/assetlinks.json"
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls",
+      "delegate_permission/common.get_login_creds"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.example.app",
+      "sha256_cert_fingerprints": ["PLAY_APP_SIGNING_SHA256", "UPLOAD_KEY_SHA256"]
+    }
+  }
+]
+```
+
+Add `webcredentials:example.com` (and `applinks:example.com`) to Associated Domains — `ios.associatedDomains` in Expo, or the `com.apple.developer.associated-domains` entitlement in `ios/MyApp/MyApp.entitlements`.
+
+The RN library ecosystem is still community-driven; `react-native-passkey` is a commonly used wrapper around `ASAuthorization` and Android Credential Manager. Verify its current API and maintenance before adopting:
+
+```ts title="src/auth/providers/passkey.ts"
+import { Passkey } from 'react-native-passkey';
+import { authClient } from '../../api/authClient';
+import { toTokenSet, type TokenResponse, type TokenSet } from '../tokenStore';
+
+export async function signInWithPasskey(): Promise<TokenSet | null> {
+  if (!(await Passkey.isSupported())) return null;
+  // Server generates WebAuthn options (challenge, rpId, allowCredentials) and stores the challenge
+  const { data: options } = await authClient.post('/auth/passkey/login/options');
+  const assertion = await Passkey.get(options);
+  // Server verifies signature, challenge, origin/rpId and counter (e.g. with SimpleWebAuthn)
+  const { data } = await authClient.post<TokenResponse>('/auth/passkey/login/verify', assertion);
+  return toTokenSet(data);
+}
+```
+
+Offer passkey creation *after* a successful login ("Sign in faster next time"), keep a fallback method, and let users manage passkeys in settings.
+
+## Implementation
+
+The app side has four moving parts: an **auth store** (state machine), a **bootstrap** that restores the session behind the splash screen, **navigation** that renders from auth state, and an **API client** that attaches and refreshes tokens. Token storage uses the `tokenStore` above; storage details (Keychain classes, reinstall handling) are in the [Security](security.html) guide.
+
+### Auth state machine
+
+```mermaid
+stateDiagram-v2
+    state "Restoring (splash visible)" as Restoring
+    state "Signed out" as SignedOut
+    state "Signed in" as SignedIn
+    [*] --> Restoring
+    Restoring --> SignedOut : no refresh token
+    Restoring --> SignedOut : refresh rejected
+    Restoring --> SignedIn : refresh ok and user loaded
+    Restoring --> SignedIn : offline, cached user
+    SignedOut --> SignedIn : completeSignIn
+    SignedIn --> SignedOut : manual logout
+    SignedIn --> SignedOut : refresh rejected or reuse detected
+```
+*Figure: The three auth states. Every screen decision derives from this, never from ad-hoc flags.*
+
+```ts title="src/auth/authEvents.ts"
+type Listener = () => void;
+const listeners = new Set<Listener>();
+
+/** Decouples the API layer from the store (avoids circular imports). */
+export const authEvents = {
+  onSessionExpired(listener: Listener): () => void {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  },
+  emitSessionExpired(): void {
+    listeners.forEach((listener) => listener());
+  },
+};
+```
+
+```ts title="src/auth/userCache.ts"
+import { getSecureStorage } from '../security/secureMmkv'; // encrypted MMKV, key in Keychain
+import type { User } from './authStore';
+
+const KEY = 'cachedUser';
+
+export const userCache = {
+  async get(): Promise<User | null> {
+    const raw = (await getSecureStorage()).getString(KEY);
+    return raw ? (JSON.parse(raw) as User) : null;
+  },
+  async set(user: User): Promise<void> {
+    (await getSecureStorage()).set(KEY, JSON.stringify(user));
+  },
+};
+```
+
+```ts title="src/auth/authStore.ts"
+import { create } from 'zustand';
+import { api } from '../api/client';
+import { authClient } from '../api/authClient';
+import { queryClient } from '../api/queryClient';
+import { unregisterPushToken } from '../notifications/pushToken';
+import { clearKeychainOnFreshInstall } from '../security/clearKeychainOnFreshInstall';
+import { wipeLocalData } from '../security/wipeLocalData';
+import { authEvents } from './authEvents';
+import { refreshTokens, SessionExpiredError } from './refresh';
+import { tokenStore, toTokenSet, type TokenResponse, type TokenSet } from './tokenStore';
+import { userCache } from './userCache';
+
+export type User = { id: string; name: string; email: string };
+export type SignOutReason = 'manual' | 'expired';
+
+type AuthState =
+  | { status: 'restoring'; user: null }
+  | { status: 'signedOut'; user: null; reason?: SignOutReason }
+  | { status: 'signedIn'; user: User };
+
+type AuthActions = {
+  bootstrap: () => Promise<void>;
+  signInWithPassword: (email: string, password: string) => Promise<void>;
+  completeSignIn: (tokens: TokenSet) => Promise<void>;
+  signOut: (reason?: SignOutReason) => Promise<void>;
+};
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+let signingOut = false;
+
+export const useAuthStore = create<AuthState & AuthActions>()((set, get) => ({
+  status: 'restoring',
+  user: null,
+
+  bootstrap: async () => {
+    try {
+      await clearKeychainOnFreshInstall(); // iOS Keychain survives reinstall
+      const refreshToken = await tokenStore.loadRefreshToken();
+      if (!refreshToken) {
+        set({ status: 'signedOut', user: null });
+        return;
+      }
+      await withTimeout(refreshTokens(), 8_000); // never hold the splash forever
+      const { data: user } = await api.get<User>('/me');
+      await userCache.set(user);
+      set({ status: 'signedIn', user });
+    } catch (error) {
+      if (error instanceof SessionExpiredError) {
+        await tokenStore.clear();
+        set({ status: 'signedOut', user: null, reason: 'expired' });
+        return;
+      }
+      // Offline, timeout or 5xx: keep the refresh token and start from cache.
+      const cached = await userCache.get().catch(() => null);
+      set(cached ? { status: 'signedIn', user: cached } : { status: 'signedOut', user: null });
+    }
+  },
+
+  signInWithPassword: async (email, password) => {
+    const { data } = await authClient.post<TokenResponse>('/auth/login', { email, password });
+    await get().completeSignIn(toTokenSet(data));
+  },
+
+  completeSignIn: async (tokens) => {
+    await tokenStore.set(tokens);
+    const { data: user } = await api.get<User>('/me');
+    await userCache.set(user);
+    set({ status: 'signedIn', user });
+  },
+
+  signOut: async (reason = 'manual') => {
+    if (signingOut) return;
+    signingOut = true;
+    try {
+      const tokens = tokenStore.get();
+      const refreshToken = tokens?.refreshToken ?? (await tokenStore.loadRefreshToken().catch(() => null));
+      const accessToken = tokens?.accessToken;
+
+      // 1. Local first: never show one user's data to the next, even when offline.
+      await tokenStore.clear();
+      set({ status: 'signedOut', user: null, reason }); // navigation swaps to the auth stack
+      queryClient.clear();
+      await wipeLocalData(); // other Keychain entries, encrypted MMKV, files, image cache
+
+      // 2. Server cleanup, best effort, using the captured credentials.
+      if (reason === 'manual') {
+        await Promise.allSettled([
+          accessToken ? unregisterPushToken(accessToken) : Promise.resolve(),
+          refreshToken
+            ? authClient.post('/auth/logout', { refreshToken }, { timeout: 5_000 })
+            : Promise.resolve(),
+        ]);
+      }
+    } finally {
+      signingOut = false;
+    }
+  },
+}));
+
+authEvents.onSessionExpired(() => {
+  if (useAuthStore.getState().status === 'signedIn') {
+    void useAuthStore.getState().signOut('expired');
+  }
+});
+```
+
+Why this shape:
+
+- **One source of truth.** Navigation, API client and UI all read `status`; there is no `isLoggedIn` flag in three places.
+- **`completeSignIn` is provider-agnostic.** Password, Google, Apple, OIDC, magic link and passkey flows all end by handing a `TokenSet` to it.
+- **Offline start.** A network failure during restore is not a logout. Only an explicit rejection (`400`/`401` from the refresh endpoint) signs the user out.
+- **Zustand** is used because the store must be reachable outside React (interceptors, push handlers). A Context + `useReducer` works too if you expose the same actions.
+
+### Restoring the session on launch
+
+Keep the **native splash screen** visible until the auth state is known — otherwise users see a flash of the login screen before being bounced into the app.
+
+```mermaid
+sequenceDiagram
+    participant SP as Native splash
+    participant App as RN bootstrap
+    participant KC as Keychain
+    participant BE as Auth server
+    participant API as Resource API
+    SP->>App: JS loaded, status restoring
+    App->>KC: clear if fresh install, read refresh token
+    alt no token
+        KC-->>App: null
+        App->>App: status signedOut
+    else token found
+        KC-->>App: refresh token
+        App->>BE: POST /auth/refresh
+        alt success
+            BE-->>App: new access and rotated refresh token
+            App->>KC: save rotated refresh token
+            App->>API: GET /me
+            API-->>App: user profile
+            App->>App: status signedIn
+        else rejected with 400 or 401
+            BE-->>App: invalid_grant
+            App->>KC: delete token
+            App->>App: status signedOut, reason expired
+        else offline or timeout
+            App->>App: status signedIn from cached user
+        end
+    end
+    App->>SP: hide splash when navigation is ready
+```
+*Figure: App-launch session restore while the splash screen is visible.*
+
+```tsx title="App.tsx"
+import { useEffect } from 'react';
+import { NavigationContainer } from '@react-navigation/native';
+import { QueryClientProvider } from '@tanstack/react-query';
+import BootSplash from 'react-native-bootsplash';
+import { queryClient } from './src/api/queryClient';
+import { useAuthStore } from './src/auth/authStore';
+import { RootNavigator } from './src/navigation/RootNavigator';
+
+export default function App() {
+  const status = useAuthStore((s) => s.status);
+
+  useEffect(() => {
+    void useAuthStore.getState().bootstrap();
+  }, []);
+
+  if (status === 'restoring') return null; // the native splash still covers the screen
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      <NavigationContainer onReady={() => BootSplash.hide({ fade: true })}>
+        <RootNavigator />
+      </NavigationContainer>
+    </QueryClientProvider>
+  );
+}
+```
+
+In Expo, call `SplashScreen.preventAutoHideAsync()` from `expo-splash-screen` at module scope and `SplashScreen.hideAsync()` in `onReady`. Initialise certificate pinning (if used) before `bootstrap()` so the very first refresh is pinned. See [App Icon & Splash Screen](app-icon-splash.html).
+
+### Navigation: render stacks from auth state
+
+With React Navigation, **do not navigate to Home after login**. Render different screens depending on `status`; when the state flips, React Navigation swaps the stacks, drops the old history (no "back" into the login screen, no back into the app after logout) and animates the change.
+
+```tsx title="src/navigation/RootNavigator.tsx"
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { useAuthStore } from '../auth/authStore';
+import { HomeScreen } from '../screens/HomeScreen';
+import { SettingsScreen } from '../screens/SettingsScreen';
+import { SignInScreen } from '../screens/SignInScreen';
+import { SignUpScreen } from '../screens/SignUpScreen';
+
+export type RootStackParamList = {
+  SignIn: undefined;
+  SignUp: undefined;
+  Home: undefined;
+  Settings: undefined;
+};
+
+const Stack = createNativeStackNavigator<RootStackParamList>();
+
+export function RootNavigator() {
+  const status = useAuthStore((s) => s.status);
+  const reason = useAuthStore((s) => (s.status === 'signedOut' ? s.reason : undefined));
+
+  return (
+    <Stack.Navigator>
+      {status === 'signedIn' ? (
+        <Stack.Group>
+          <Stack.Screen name="Home" component={HomeScreen} />
+          <Stack.Screen name="Settings" component={SettingsScreen} />
+        </Stack.Group>
+      ) : (
+        <Stack.Group
+          screenOptions={{
+            headerShown: false,
+            animationTypeForReplace: reason === 'manual' ? 'pop' : 'push',
+          }}
+        >
+          <Stack.Screen name="SignIn" component={SignInScreen} />
+          <Stack.Screen name="SignUp" component={SignUpScreen} />
+        </Stack.Group>
+      )}
+    </Stack.Navigator>
+  );
+}
+```
+
+With React Navigation 7's **static API**, express the same thing with `if` hooks on groups:
+
+```ts title="src/navigation/RootStack.ts"
+const useIsSignedIn = () => useAuthStore((s) => s.status === 'signedIn');
+const useIsSignedOut = () => useAuthStore((s) => s.status !== 'signedIn');
+
+export const RootStack = createNativeStackNavigator({
+  groups: {
+    SignedIn: { if: useIsSignedIn, screens: { Home: HomeScreen, Settings: SettingsScreen } },
+    SignedOut: { if: useIsSignedOut, screens: { SignIn: SignInScreen, SignUp: SignUpScreen } },
+  },
+});
+```
+
+With **Expo Router**, wrap routes in `<Stack.Protected guard={isSignedIn}>` (and `guard={!isSignedIn}` for auth routes) in the root layout. Deep links that target protected screens while signed out should be stored and replayed after sign-in — see [Deep Linking & Universal Links](deep-linking.html).
+
+### Login screen
+
+```tsx title="src/screens/SignInScreen.tsx"
+import { useState } from 'react';
+import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import axios from 'axios';
+import { useAuthStore } from '../auth/authStore';
+import { signInWithGoogle } from '../auth/providers/google';
+import type { TokenSet } from '../auth/tokenStore';
+
+function messageFor(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    if (!error.response) return 'No connection. Check your network and try again.';
+    if (error.response.status === 401) return 'Email or password is incorrect.';
+    if (error.response.status === 429) return 'Too many attempts. Try again in a few minutes.';
+  }
+  return 'Something went wrong. Please try again.';
+}
+
+export function SignInScreen() {
+  const signInWithPassword = useAuthStore((s) => s.signInWithPassword);
+  const completeSignIn = useAuthStore((s) => s.completeSignIn);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = async (task: () => Promise<void>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await task(); // on success the store flips to signedIn and this screen unmounts
+    } catch (e) {
+      setError(messageFor(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const withProvider = (provider: () => Promise<TokenSet | null>) =>
+    run(async () => {
+      const tokens = await provider();
+      if (tokens) await completeSignIn(tokens); // null = user cancelled
+    });
+
+  return (
+    <View style={styles.container}>
+      <TextInput
+        style={styles.input}
+        placeholder="Email"
+        value={email}
+        onChangeText={setEmail}
+        autoComplete="email"
+        textContentType="username"
+        keyboardType="email-address"
+        autoCapitalize="none"
+        autoCorrect={false}
+      />
+      <TextInput
+        style={styles.input}
+        placeholder="Password"
+        value={password}
+        onChangeText={setPassword}
+        autoComplete="password"
+        textContentType="password"
+        secureTextEntry
+        onSubmitEditing={() => run(() => signInWithPassword(email.trim(), password))}
+      />
+      {error ? <Text accessibilityRole="alert" style={styles.error}>{error}</Text> : null}
+      <Pressable
+        accessibilityRole="button"
+        disabled={busy || !email || !password}
+        onPress={() => run(() => signInWithPassword(email.trim(), password))}
+        style={styles.button}
+      >
+        {busy ? <ActivityIndicator /> : <Text style={styles.buttonText}>Sign in</Text>}
+      </Pressable>
+      <Pressable accessibilityRole="button" disabled={busy} onPress={() => withProvider(signInWithGoogle)}>
+        <Text>Continue with Google</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, justifyContent: 'center', padding: 24, gap: 12 },
+  input: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 8, padding: 12 },
+  error: { color: '#b00020' },
+  button: { backgroundColor: '#1f6feb', borderRadius: 8, padding: 14, alignItems: 'center' },
+  buttonText: { color: 'white', fontWeight: '600' },
+});
+```
+
+### Token refresh: single-flight with a queue
+
+The refresh logic is where most production auth bugs live: refresh storms, infinite 401 loops, random logouts, and — with rotation — users logged out because two parallel refreshes presented the same refresh token. Requirements for a correct implementation:
+
+1. **Single flight.** At most one refresh request in flight; every other request that needs a token waits for it (that waiting set *is* the queue) and then replays with the new token — or fails together if the refresh fails.
+2. **Proactive refresh** shortly before expiry, so the common case never sees a 401.
+3. **Reactive refresh** on 401 as a safety net, retried **once** per request.
+4. **Stale 401s** — a request sent with the old token that fails *after* another request already refreshed — must retry with the current token, not trigger a second refresh.
+5. **Failure semantics:** `400/401` from the refresh endpoint means the session is dead → log out. A network error or `5xx` is *not* a logout.
+6. The refresh call uses a **separate client** without interceptors, so it can never recurse.
+
+```ts title="src/auth/refresh.ts"
+import axios from 'axios';
+import { authClient } from '../api/authClient';
+import { authEvents } from './authEvents';
+import { tokenStore, toTokenSet, type TokenResponse, type TokenSet } from './tokenStore';
+
+export class SessionExpiredError extends Error {
+  constructor() {
+    super('session_expired');
+    this.name = 'SessionExpiredError';
+  }
+}
+
+let inFlight: Promise<TokenSet> | null = null;
+
+async function performRefresh(): Promise<TokenSet> {
+  const refreshToken = tokenStore.get()?.refreshToken ?? (await tokenStore.loadRefreshToken());
+  if (!refreshToken) throw new SessionExpiredError();
+  try {
+    const { data } = await authClient.post<TokenResponse>('/auth/refresh', { refreshToken });
+    const tokens = toTokenSet(data);
+    await tokenStore.set(tokens); // persist the ROTATED refresh token before anyone uses it
+    return tokens;
+  } catch (error) {
+    const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+    if (status === 400 || status === 401) throw new SessionExpiredError(); // invalid_grant
+    throw error; // offline, timeout, 5xx: keep the session
+  }
+}
+
+/**
+ * Single-flight refresh. Concurrent callers share one promise: they are queued
+ * behind the same request and all resume (or fail) when it settles.
+ */
+export function refreshTokens(): Promise<TokenSet> {
+  if (!inFlight) {
+    inFlight = performRefresh()
+      .catch((error: unknown) => {
+        if (error instanceof SessionExpiredError) authEvents.emitSessionExpired();
+        throw error;
+      })
+      .finally(() => {
+        inFlight = null;
+      });
+  }
+  return inFlight;
+}
+```
+
+```ts title="src/api/client.ts"
+import axios, { type AxiosError, type InternalAxiosRequestConfig } from 'axios';
+import { refreshTokens } from '../auth/refresh';
+import { tokenStore } from '../auth/tokenStore';
+
+const EXPIRY_SKEW_MS = 60_000; // refresh one minute before expiry
+
+type AuthedConfig = InternalAxiosRequestConfig & { _retried?: boolean; _sentToken?: string };
+
+export const api = axios.create({ baseURL: 'https://api.example.com', timeout: 15_000 });
+
+async function getValidAccessToken(): Promise<string> {
+  const tokens = tokenStore.get();
+  if (tokens && tokens.expiresAt - EXPIRY_SKEW_MS > Date.now()) return tokens.accessToken;
+  return (await refreshTokens()).accessToken; // proactive, shares the in-flight refresh
+}
+
+function isStepUpChallenge(error: AxiosError): boolean {
+  const header = String(error.response?.headers?.['www-authenticate'] ?? '');
+  return header.includes('insufficient_user_authentication'); // RFC 9470 step-up, not expiry
+}
+
+api.interceptors.request.use(async (config) => {
+  const token = await getValidAccessToken();
+  config.headers.set('Authorization', `Bearer ${token}`);
+  (config as AuthedConfig)._sentToken = token;
+  return config;
+});
+
+api.interceptors.response.use(
+  (response) => response,
+  async (error: unknown) => {
+    if (!axios.isAxiosError(error) || !error.config) throw error; // includes SessionExpiredError
+    const config = error.config as AuthedConfig;
+    if (error.response?.status !== 401 || config._retried || isStepUpChallenge(error)) throw error;
+    config._retried = true;
+
+    const current = tokenStore.get();
+    if (!current || current.accessToken === config._sentToken) {
+      await refreshTokens(); // single flight: parallel 401s queue behind one refresh
+    }
+    // Replay: the request interceptor attaches the newest token.
+    return api.request(config);
+  },
+);
+```
+
+```mermaid
+sequenceDiagram
+    participant A as Request A
+    participant B as Request B
+    participant C as API client
+    participant BE as Auth server
+    participant API as Resource API
+    A->>C: GET /orders
+    B->>C: GET /profile
+    C->>C: token expires within 60 s
+    C->>BE: POST /auth/refresh, single flight
+    Note over B,C: B awaits the same in-flight promise
+    BE-->>C: new access and rotated refresh token
+    C->>C: save to memory and Keychain
+    C->>API: GET /orders with new token
+    C->>API: GET /profile with new token
+    API-->>A: 200
+    API-->>B: 200
+    Note over C,BE: On 400 or 401 from refresh, all waiters fail and the app signs out
+```
+*Figure: Proactive single-flight refresh — concurrent requests queue behind one refresh call.*
+
+**Testing it.** A unit test should fire several requests with an expired token (MSW or axios-mock-adapter) and assert exactly **one** call to `/auth/refresh`, that all requests succeed with the new token, and that a `401` from refresh produces one `sessionExpired` event and no retry loop.
+
+> [!WARNING] Other processes
+> The single-flight guard only covers one JS runtime. Headless JS tasks, background fetch, notification service extensions or a share extension that refresh independently can race the main app and trip reuse detection. Route background work through the same module where possible, and give the server a short rotation grace window (below).
+
+### Refresh token rotation and reuse detection
+
+With **rotation**, every refresh returns a *new* refresh token and invalidates the old one. With **reuse detection**, presenting an already-used refresh token is treated as theft: the server revokes the whole **token family** (every descendant of the original login), logging out both the attacker and the victim, who then re-authenticates.
+
+```ts title="server/auth/rotateRefreshToken.ts"
+const GRACE_MS = 30_000; // tolerate a lost response followed by a client retry
+
+export async function rotateRefreshToken(presented: string): Promise<TokenResponse> {
+  return db.transaction(async (tx) => {
+    const record = await tx.refreshTokens.findByHash(sha256(presented)); // store only hashes
+    if (!record || record.expiresAt < new Date() || record.familyRevokedAt) {
+      throw new InvalidGrantError();
+    }
+    if (record.usedAt) {
+      const withinGrace = Date.now() - record.usedAt.getTime() < GRACE_MS;
+      if (!withinGrace) {
+        await tx.refreshTokens.revokeFamily(record.familyId); // reuse: assume theft
+        await securityLog.warn('refresh_token_reuse', { userId: record.userId });
+        throw new InvalidGrantError();
+      }
+      await tx.refreshTokens.revoke(record.replacedById); // retry: replace the lost successor
+    }
+    const next = randomToken(32);
+    const nextId = await tx.refreshTokens.insert({
+      hash: sha256(next),
+      familyId: record.familyId,
+      userId: record.userId,
+      deviceId: record.deviceId,
+      expiresAt: slidingExpiry(record.familyCreatedAt), // sliding, capped by an absolute maximum
+    });
+    await tx.refreshTokens.markUsed(record.id, nextId);
+    return { accessToken: signAccessToken(record.userId), refreshToken: next, expiresIn: 600 };
+  });
+}
+```
+
+The grace window exists because mobile networks drop responses: the server rotated, the client never received the new token, and the retry presents the old one. Without it, flaky connections look like theft and users get random logouts.
+
+### Proactive refresh, clock skew and app foreground
+
+- **Compute expiry from `expires_in` at receipt** (`toTokenSet`) rather than comparing the JWT `exp` to the device clock — users' clocks are frequently wrong by minutes or hours. If you must use `exp`, estimate the offset from the server's `Date` response header.
+- Refresh a margin before expiry (60 s, or ~80% of the lifetime).
+- On `AppState` → `active`, check expiry and refresh early, so the first request after hours in the background is not delayed:
+
+```ts title="src/auth/refreshOnForeground.ts"
+import { AppState } from 'react-native';
+import { refreshTokens } from './refresh';
+import { tokenStore } from './tokenStore';
+
+export function startRefreshOnForeground(): () => void {
+  const sub = AppState.addEventListener('change', (state) => {
+    const tokens = tokenStore.get();
+    if (state === 'active' && tokens && tokens.expiresAt - 60_000 < Date.now()) {
+      refreshTokens().catch(() => undefined); // failures are handled by refreshTokens/authEvents
+    }
+  });
+  return () => sub.remove();
+}
+```
+
+Servers should also allow a small leeway (30–60 s) when validating `exp`/`nbf` to absorb clock differences between services.
+
+### Logout
+
+A complete logout, as implemented in `signOut` above:
+
+1. Capture the current tokens, then **clear the Keychain** entry and in-memory tokens.
+2. Flip state to `signedOut` — conditional navigation unmounts the signed-in tree, which is the navigation **reset** (use `navigation.reset` only if you do not render stacks from state).
+3. `queryClient.clear()` so no cached server data from the previous user survives; wipe encrypted MMKV, downloaded files, image and WebView caches (`wipeLocalData`, see [Security](security.html)).
+4. **Unregister the push token** on the server (and delete it locally, e.g. `deleteToken()` in Firebase Messaging) so the next user of the device does not receive the previous user's notifications — see [Push Notifications](push-notifications.html).
+5. **Revoke the refresh token server-side** (`/auth/logout`, or the IdP's revocation endpoint such as `revoke()` in react-native-app-auth). Without this, a copied refresh token keeps working until it expires.
+6. Sign out of provider SDKs (`GoogleSignin.signOut()`, Firebase `signOut()`), reset analytics/crash-reporter user identity (`Sentry.setUser(null)`).
+
+Local cleanup runs first and never waits on the network: logout must work offline. For forced logouts (`expired`), bind push tokens to the session server-side so revoking the session also removes its push registration.
+
+### Biometric unlock
+
+Two production-grade designs (a bare `LocalAuthentication` boolean is **not** one of them — see [Security](security.html)):
+
+| | A: Refresh token behind biometric access control | B: Server-bound signing key |
+|---|---|---|
+| Mechanism | Keychain/Keystore item readable only after the OS verifies biometrics (`BIOMETRY_CURRENT_SET`) | Key pair in Secure Enclave / StrongBox; biometrics required to sign a server challenge |
+| Library | react-native-keychain (`accessControl`), expo-secure-store (`requireAuthentication`) | react-native-biometrics or a small custom native module |
+| Server changes | None | Register public key, challenge + verify endpoints |
+| Server knows biometrics happened | No | Yes |
+| Rotation interplay | Each refresh rewrites the protected item (on Android, depending on storage type, writes may prompt too — test it) | Key does not rotate; server issues fresh tokens after verification |
+| Best for | "Unlock with Face ID" on cold start | Passwordless login, step-up for payments and transfers |
+
+```ts title="src/auth/biometricUnlock.ts"
+import * as Keychain from 'react-native-keychain';
+
+const BIO_SERVICE = 'com.example.app.refresh.biometric';
+
+export async function isBiometricUnlockAvailable(): Promise<boolean> {
+  return (await Keychain.getSupportedBiometryType()) !== null;
+}
+
+/** Move the refresh token into a biometric-protected slot (opt-in from settings). */
+export async function enableBiometricUnlock(refreshToken: string): Promise<void> {
+  await Keychain.setGenericPassword('refresh', refreshToken, {
+    service: BIO_SERVICE,
+    accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_CURRENT_SET, // new enrolment invalidates it
+    accessible: Keychain.ACCESSIBLE.WHEN_PASSCODE_SET_THIS_DEVICE_ONLY,
+  });
+}
+
+/** Returns the refresh token, or null if cancelled, locked out or invalidated. */
+export async function unlockWithBiometrics(): Promise<string | null> {
+  try {
+    const creds = await Keychain.getGenericPassword({
+      service: BIO_SERVICE,
+      authenticationPrompt: { title: 'Unlock Example', cancel: 'Use password' },
+    });
+    return creds ? creds.password : null;
+  } catch {
+    return null;
+  }
+}
+```
+
+Practical rules:
+
+- Make biometric unlock **opt-in after a full login**, and store the token *only* in the biometric slot while enabled (otherwise the plain slot is a bypass).
+- `BIOMETRY_CURRENT_SET` invalidates the item when fingerprints/faces change — someone who adds their own face cannot unlock. Handle it as "please sign in again".
+- Always offer a fallback: device passcode (`BIOMETRY_CURRENT_SET_OR_DEVICE_PASSCODE` if policy allows) or full re-login. Handle "not enrolled", lockout after failed attempts, and cancellation distinctly.
+- iOS needs `NSFaceIDUsageDescription` in `Info.plist` (Expo: `faceIDPermission` in the expo-secure-store / expo-local-authentication plugin config).
+- Background refresh cannot read a biometric-protected item; that is acceptable for high-security apps, but design for it.
+
+### Step-up re-authentication
+
+Some actions (changing email or password, adding a payee, large transfers, deleting the account) should require **recent** authentication even inside a valid session. The server tracks `auth_time`/authentication method on the session and, when it is too old, responds `401` with `WWW-Authenticate: Bearer error="insufficient_user_authentication"` (RFC 9470) or a dedicated `403` code. The app then prompts for biometrics (design B signature) or the password, obtains a short-lived elevated grant, and retries:
+
+```ts title="src/auth/withStepUp.ts"
+import axios from 'axios';
+import { signChallenge } from '../security/biometricKeys'; // server-verified signature
+
+export async function withStepUp<T>(action: (grant?: string) => Promise<T>): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    const header = axios.isAxiosError(error)
+      ? String(error.response?.headers?.['www-authenticate'] ?? '')
+      : '';
+    if (!header.includes('insufficient_user_authentication')) throw error;
+    const grant = await signChallenge('payment'); // Face ID / fingerprint prompt
+    return action(grant); // e.g. sent as an X-Step-Up header
+  }
+}
+```
+
+Note that the API client's response interceptor explicitly skips refresh for step-up challenges — refreshing would not help and would hide the challenge.
+
+## Security & policy
+
+### Token and session security
+
+- **Never store tokens in AsyncStorage**, unencrypted MMKV, or a persisted Redux/Zustand store. Refresh tokens go to the Keychain/Keystore with a `ThisDeviceOnly` class; access tokens live in memory.
+- **Bind refresh tokens to the device.** Options, from simple to strong: store a device ID with the token family and reject refreshes from a different device; require a signature from a Keystore/Secure Enclave key registered at login on each refresh; or adopt **DPoP** (RFC 9449), where every token request and API call carries a proof signed by a device key and tokens are bound to that key's thumbprint. A stolen refresh token is then useless off-device. Attestation on login and refresh (see [Security](security.html)) raises the bar further.
+- **Rate limiting and lockouts.** Limit per account, per IP and per device; use progressive delays and challenges (attestation, CAPTCHA on web) instead of hard lockouts — hard lockouts let attackers lock victims out. Notify users of sign-ins from new devices.
+- **MFA.** Prefer passkeys or TOTP apps; SMS only as a fallback (SIM-swap risk). Provide recovery codes and a support-backed recovery path.
+- **Session management.** Offer a "devices" screen with remote sign-out; revoke all refresh token families on password change or account recovery.
+- **Account linking.** Only link accounts by email when the provider asserts a *verified* email; otherwise an attacker who registers your user's email at a weaker provider can take over the account. Apple relay addresses never match other providers' emails.
+- **Avoid account enumeration** on login, sign-up and password reset responses (same message and similar timing whether or not the account exists).
+
+### Store policies that shape auth
+
+| Policy | What it requires | Design impact |
+|---|---|---|
+| Apple Guideline 4.8 (Login Services) | If you offer third-party or social login (Google, Facebook…), also offer an equivalent option that limits collection to name and email, lets users hide their email, and does not track without consent — Sign in with Apple qualifies | Plan Apple sign-in whenever Google sign-in is in scope; exceptions exist (e.g. your own account system only, enterprise/education accounts) |
+| Apple Guideline 5.1.1(v) | Apps that support account creation must let users **initiate account deletion in the app**; apps without significant account-based features should work without login | Build a deletion flow (it may finish on the web if linked directly); revoke Sign in with Apple tokens on deletion |
+| Google Play account deletion | In-app deletion path **and** a web link for deletion requests, declared in the Data safety form | Same backend flow, exposed on the web too |
+| App Review / Play "App access" | Reviewers need working credentials (or a demo mode) — including for OTP-only logins | Provide a non-expiring demo account; for phone login, a test number with a fixed code that works only for that account |
+| Privacy labels / Data safety | Declare identifiers, email, phone and any data collected by auth SDKs | Keep the auth SDK inventory current |
+
+> [!NOTE]
+> Review guidelines change every year. Check the current App Store Review Guidelines (§4.8, §5.1.1) and Google Play's account deletion and User Data policies before each major release.
+
+## Edge cases & gotchas
+
+- **Account switching / multiple accounts** — namespace every cache and storage key by user ID, or wipe fully on switch.
+- **Long background periods** — the refresh token may expire while the app sleeps; show a friendly re-login and preserve the user's intended destination (deep link) for after sign-in.
+- **Server-side revocation** (password changed on web, account deleted, admin ban) — surfaces as a refresh rejection; the app must handle it anywhere, not only at launch.
+- **Apple credential revoked** in Settings — check `getCredentialStateForUser` on launch (Invertase) or handle Apple's server-to-server notifications.
+- **iOS consent alert** — `ASWebAuthenticationSession` shows "App wants to use example.com to sign in" because it shares browser cookies; `iosPrefersEphemeralSession` removes the alert but also removes SSO.
+- **Android process death during the browser hop** — on low-memory devices the app can be killed while the Custom Tab is open; make sure the redirect still completes or fails cleanly and the user can retry.
+- **Password managers** — toggling `secureTextEntry` for a "show password" button can break autofill on some iOS versions; test with iCloud Keychain and a third-party manager.
+
+## Testing & debugging
+
+- Use **short TTLs in staging** (access token 30–60 s, refresh token 10 minutes) so refresh, rotation and expiry paths run constantly during QA.
+- Test on **real devices** for Sign in with Apple, biometrics, passkeys and OTP autofill; simulators are unreliable for all four.
+- Reset Apple's first-authorization behaviour by stopping "Sign in with Apple" for the app in iOS Settings.
+- Decode JWTs **locally** (a quick `jwt-decode` call or `jq`) — do not paste production tokens into third-party websites.
+- Inspect refresh traffic with Proxyman/Charles on a debug build and watch for duplicate `/auth/refresh` calls.
+
+```bash
+# Simulate OAuth redirects / magic links reaching the app
+xcrun simctl openurl booted "com.example.app:/oauthredirect?code=test&state=test"
+adb shell am start -W -a android.intent.action.VIEW \
+  -d "https://example.com/auth/magic?token=test" com.example.app
+
+# Android signing fingerprints for Google OAuth clients
+cd android && ./gradlew signingReport
+```
+
+```ts title="src/api/__tests__/client.test.ts"
+import MockAdapter from 'axios-mock-adapter';
+import { api } from '../client';
+import { authClient } from '../authClient';
+import { tokenStore } from '../../auth/tokenStore';
+
+jest.mock('react-native-keychain', () => ({
+  ACCESSIBLE: { AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY: 'AfterFirstUnlockThisDeviceOnly' },
+  setGenericPassword: jest.fn().mockResolvedValue(true),
+  getGenericPassword: jest.fn().mockResolvedValue(false),
+  resetGenericPassword: jest.fn().mockResolvedValue(true),
+}));
+
+const apiMock = new MockAdapter(api);
+const authMock = new MockAdapter(authClient);
+
+test('parallel requests with an expired token trigger exactly one refresh', async () => {
+  await tokenStore.set({ accessToken: 'old', refreshToken: 'r1', expiresAt: Date.now() - 1 });
+  authMock
+    .onPost('/auth/refresh')
+    .reply(200, { accessToken: 'new', refreshToken: 'r2', expiresIn: 600 });
+  apiMock
+    .onGet(/\/items\/\d+/)
+    .reply((config) => (config.headers?.Authorization === 'Bearer new' ? [200, { ok: true }] : [401]));
+
+  const results = await Promise.all([1, 2, 3, 4, 5].map((id) => api.get(`/items/${id}`)));
+
+  expect(results.every((r) => r.status === 200)).toBe(true);
+  expect(authMock.history.post.filter((r) => r.url === '/auth/refresh')).toHaveLength(1);
+});
+```
+
+Add sibling tests for: refresh returns `401` → one `sessionExpired` event and no retry loop; refresh network error → no logout; stale `401` after a completed refresh → retry without a second refresh. See [Testing Strategy](testing.html) for MSW-based setups.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Google Sign-In `DEVELOPER_ERROR` (code 10) on Android | Package name / SHA-1 not registered on an Android OAuth client in the **same** project as the web client, or the wrong ID passed as `webClientId` | Add SHA-1s for debug, upload and Play App Signing keys; pass the **Web** client ID as `webClientId` |
+| Google works in debug and internal builds, fails from the Play Store | Play App Signing key SHA-1 missing | Copy it from Play Console → App integrity and add an Android OAuth client for it |
+| `idToken` is `null` after Google sign-in | `webClientId` missing or not a Web client | Configure the Web client ID |
+| Apple returns `null` email and name | Not the first authorization for this Apple ID + app | Persist them on first sign-in; to re-test, stop using Sign in with Apple for the app in iOS Settings |
+| Apple token fails `aud` check on the server | Native sign-in uses the bundle ID, web/Android use the Services ID | Accept exactly your bundle ID and Services ID |
+| Apple `nonce` mismatch | Hashing done twice or not at all (libraries differ) | Expo: pass the SHA-256 hash, send raw to server; Invertase: pass raw (library hashes) |
+| OAuth redirect does not return to the app | Redirect URI not registered with the IdP or not matching exactly; scheme missing (`manifestPlaceholders`, `CFBundleURLTypes`); iOS `AppDelegate` not forwarding URLs | Align the URI character-for-character; register the scheme; add the AppDelegate hook |
+| Google blocks login with `disallowed_useragent` | OAuth attempted inside a WebView | Use the native SDK or the system browser (RFC 8252) |
+| Burst of `/auth/refresh` calls (refresh storm) | No single-flight, several API client instances, or background tasks refreshing independently | One shared refresh promise; one API client module; route background work through it |
+| Infinite 401 → refresh → 401 loop | Refresh call goes through the intercepted client, or no retry-once flag | Separate `authClient`; `_retried` flag; treat refresh `401` as session expiry |
+| Random logouts in the field | Rotation race or lost responses without a grace window; network errors treated as logout; `WhenUnlocked` Keychain reads in the background | Grace window on the server; log out only on `400/401` from refresh; `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY` |
+| After logout, the next user sees old data | `queryClient.clear()` not called, persisted query cache, MMKV/image caches kept | Wipe all caches in `signOut`; namespace storage per user |
+| Previous user's notifications arrive after logout | Push token not unregistered | Unregister server-side and delete the local token on logout |
+| Login screen flashes on launch | Splash hidden before `bootstrap` completes | Hide the splash in `NavigationContainer.onReady` after `status !== 'restoring'` |
+| iOS app is "still logged in" after reinstall | Keychain survives uninstall | Clear Keychain on first launch |
+| SMS code auto-fills in debug but not in production (Android) | SMS Retriever hash computed from the wrong certificate | Recompute from the Play App Signing certificate |
+| App Review rejection: "unable to sign in" | Missing/expired demo account, OTP not reachable by reviewers | Non-expiring demo account; fixed test number and code |
+
+## Production checklist
+
+- [ ] Session model chosen and documented: access token TTL, refresh token TTL (sliding + absolute), rotation and reuse detection with a grace window
+- [ ] Refresh token in Keychain/Keystore (`ThisDeviceOnly`); access token in memory; nothing in AsyncStorage
+- [ ] Single-flight refresh with queued retries, proactive refresh, retry-once on 401, stale-401 handling, separate client for auth calls
+- [ ] Only `400/401` from the refresh endpoint logs out; offline start works with cached data
+- [ ] Session restored behind the splash; no login flash; bootstrap has a timeout
+- [ ] Navigation renders stacks from auth state (or `Stack.Protected` in Expo Router); pending deep links replayed after login
+- [ ] Logout: server revocation, push token unregistered, Keychain + storage + caches wiped, `queryClient.clear()`, provider SDK sign-out
+- [ ] Google: Web/iOS/Android clients configured; SHA-1s for debug, upload and Play App Signing keys; server verifies `aud`
+- [ ] Apple: capability, nonce, first-auth name/email persisted, server JWKS verification, code exchange, token revocation on deletion
+- [ ] OAuth/OIDC via system browser with PKCE; exact redirect URIs registered; no client secret in the app
+- [ ] Magic links on verified Universal/App Links, single-use, POST to consume
+- [ ] OTP: autofill props, correct SMS Retriever hash, rate limits and SMS-fraud protection
+- [ ] Biometric unlock uses Keychain access control or server-verified signatures; fallback and invalidation handled
+- [ ] Step-up re-auth for sensitive actions; interceptor does not refresh on step-up challenges
+- [ ] Rate limiting, MFA option, new-device notifications, remote session revocation
+- [ ] In-app account deletion (both stores) and Sign in with Apple compliance (4.8) verified
+- [ ] Demo account for App Review and Play "App access" provided and non-expiring
+- [ ] Unit tests for refresh concurrency and failure paths; staging runs with short TTLs
+
+## Official references
+
+Primary documentation worth bookmarking. APIs and store policies change, so check these before you ship.
+
+- [RFC 8252 — OAuth 2.0 for Native Apps](https://datatracker.ietf.org/doc/html/rfc8252)
+- [react-native-app-auth](https://github.com/FormidableLabs/react-native-app-auth)
+- [Expo — Authentication guide](https://docs.expo.dev/guides/authentication/)
+- [React Native Google Sign-In docs](https://react-native-google-signin.github.io/docs/install)
+- [Sign in with Apple](https://developer.apple.com/sign-in-with-apple/)
+
+## Interview questions
+
+### Would you use JWTs with refresh tokens or opaque server sessions for a mobile app?
+
+**Short answer:** Usually short-lived JWT access tokens plus rotating opaque refresh tokens. APIs verify JWTs statelessly, leaks are time-limited, and the refresh token — the real long-term credential — can be stored securely, rotated and revoked.
+
+Opaque sessions are simpler and revoke instantly, and are perfectly fine for a monolith; the cost is a session lookup on every request. With JWTs, keep access tokens at 5–15 minutes, rotate refresh tokens with reuse detection, and add a deny-list only if you need instant revocation of access tokens. Either way, store the long-lived credential in the Keychain/Keystore and never ship a long-lived JWT in AsyncStorage.
+
+### How do you implement token refresh so concurrent requests do not trigger multiple refreshes?
+
+**Short answer:** A single-flight refresh: the first caller starts the refresh and stores its promise; every other request that needs a token awaits the same promise (that is the queue) and replays when it resolves, or fails with it.
+
+Refresh proactively in the request interceptor when the token is near expiry, and reactively on `401` with a retry-once flag. Handle stale 401s by comparing the token a request was sent with against the current one. Use a separate axios instance for the refresh call to avoid recursion. Only `400/401` from the refresh endpoint means logout; network errors do not. With rotation this is mandatory — two parallel refreshes present the same token and trigger reuse detection.
+
+### What is refresh token rotation with reuse detection, and what can go wrong on mobile?
+
+**Short answer:** Each refresh returns a new refresh token and invalidates the old one; if an old token is ever presented again, the server assumes theft and revokes the whole token family.
+
+On mobile the failure mode is false positives: a response lost on a flaky network means the client retries with the old token, or two runtimes (app and a background task) refresh at once. Mitigate with client-side single-flight, persisting the rotated token before using it, routing background work through the same module, and a short server-side grace window during which the just-used token can mint a replacement once.
+
+### Why must OAuth in a mobile app use the system browser with PKCE instead of a WebView?
+
+**Short answer:** RFC 8252: the system browser (`ASWebAuthenticationSession`, Custom Tabs) keeps credentials out of the app's reach, gives SSO and password-manager/passkey support, and is what IdPs allow — Google blocks embedded WebViews. PKCE protects the authorization code because a public client cannot keep a secret.
+
+In a WebView the app can read the password and cookies, and users cannot verify the domain. PKCE sends a hash of a one-time verifier in the authorization request and the verifier itself in the token request, so an app that intercepts the redirect cannot redeem the code. Use react-native-app-auth or expo-auth-session, register exact redirect URIs, and never ship a client secret.
+
+### How do you restore a session on launch without flashing the login screen, and what about offline?
+
+**Short answer:** Keep the native splash visible while a bootstrap reads the refresh token from the Keychain, refreshes, and loads the user; render navigation only when the status leaves `restoring`, and hide the splash in `onReady`.
+
+Clear the Keychain on first launch after a reinstall (iOS), time-box the refresh (e.g. 8 s), and distinguish outcomes: no token → signed out; refresh rejected → signed out with "session expired"; offline or timeout → signed in from a cached profile while keeping the refresh token, letting the interceptor refresh later.
+
+### What are the gotchas of Sign in with Apple?
+
+**Short answer:** Name and email come only on the first authorization, users may hide their email behind a relay address, nonce handling differs between libraries, and the server must verify the identity token and later revoke tokens on account deletion.
+
+Send name/email to the backend in the same request; key accounts by `sub`; register relay sending domains; verify the token against Apple's JWKS (`iss`, `aud` = bundle ID or Services ID, `exp`, nonce hash); exchange the authorization code and store Apple's refresh token for revocation; use Apple's button; and remember Guideline 4.8 makes it mandatory when you offer Google or other social logins.
+
+### Google Sign-In works in debug but fails in production with DEVELOPER_ERROR. How do you debug it?
+
+**Short answer:** It is almost always a certificate or client ID mismatch: the production build is signed by the Play App Signing key, whose SHA-1 is not registered on an Android OAuth client in the same Google Cloud project as the web client.
+
+Check with `./gradlew signingReport` and Play Console → App integrity; add Android OAuth clients for the debug, upload and Play signing SHA-1s with the correct package name; confirm `webClientId` is the **Web** client ID (a null `idToken` points at this too). On iOS the equivalent failures are a missing reversed-client-ID URL scheme or a wrong `iosClientId`.
+
+### How would you implement "unlock with Face ID"?
+
+**Short answer:** Store the refresh token in a Keychain/Keystore item protected by biometric access control (`BIOMETRY_CURRENT_SET`), so the OS releases it only after a successful match; for server-verifiable biometrics, use a Secure Enclave/Keystore key that signs a server challenge.
+
+Make it opt-in after a full login, keep the token only in the protected slot while enabled, handle invalidation when enrolments change, lockout and cancellation, and always provide a password/passcode fallback. Never gate on a bare `authenticate()` boolean — it is trivially hooked. Add `NSFaceIDUsageDescription`. Use the signature approach for step-up on payments or sensitive changes.
+
+### What must a logout do in a React Native app?
+
+**Short answer:** Wipe everything local immediately, then clean up on the server: clear Keychain tokens, flip auth state (which resets navigation), `queryClient.clear()`, wipe encrypted storage, files and caches, unregister the push token, revoke the refresh token server-side, and sign out of provider SDKs.
+
+Local cleanup must not depend on the network so logout works offline; server calls are best effort with captured credentials. Guard against re-entrancy (a failing refresh during logout emitting another logout). Forgetting push unregistration or cache clearing leaks one user's data to the next person using the device.
+
+### Which App Store and Google Play policies affect authentication design?
+
+**Short answer:** Sign in with Apple is required alongside third-party social login (4.8), apps with account creation must offer in-app account deletion (Apple 5.1.1(v), Google Play also requires a web deletion link), and reviewers need working demo credentials.
+
+Also: don't force login for features that don't need an account, declare auth-related data in privacy labels and Data safety, revoke Sign in with Apple tokens on deletion, and provide a fixed test number/code for OTP-only apps. These rules change yearly, so verify the current guidelines before each major release.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

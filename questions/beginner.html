@@ -1,0 +1,1723 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beginner Q&amp;A · React Native Interview Handbook</title>
+<meta name="description" content="React Native fundamentals: what RN actually is, core components, styling and Flexbox, state, lists, navigation, networking, debugging and platform basics. The topics are…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Beginner Q&amp;A · React Native Interview Handbook">
+<meta property="og:description" content="React Native fundamentals: what RN actually is, core components, styling and Flexbox, state, lists, navigation, networking, debugging and platform basics. The topics are…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="questions/beginner.html" data-type="qa">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Beginner Q&A
+
+React Native fundamentals: what RN actually is, core components, styling and Flexbox, state, lists, navigation, networking, debugging and platform basics. The topics are "beginner", but interviewers use them to test depth, so every answer here is pitched at the level a senior candidate should give out loud.
+
+## What React Native Is and How It Works
+
+### What is React Native, and how is it different from hybrid frameworks, Flutter, and React on the web?
+
+**Short answer:** React Native is a framework for building iOS and Android apps with React and JavaScript/TypeScript, where your components render **real platform views** (UIKit views on iOS, Android `View`s on Android), not HTML in a WebView and not pixels drawn by a custom engine. React runs in a JS engine (Hermes); a native renderer turns the React tree into native views laid out with Flexbox (Yoga).
+
+```mermaid
+flowchart TD
+    Code["Your TSX components"] --> Metro["Metro: resolve, transform, bundle"]
+    Metro --> Bundle["JS bundle (Hermes bytecode in release)"]
+    Bundle --> Hermes["Hermes engine runs React"]
+    Hermes --> Reconciler["React reconciler: render + diff"]
+    Reconciler -->|"JSI (C++)"| Fabric["Fabric renderer: shadow tree"]
+    Fabric --> Yoga["Yoga: Flexbox layout"]
+    Yoga --> Mount["Mount on the UI thread"]
+    Mount --> IOSViews["UIKit views (iOS)"]
+    Mount --> AndroidViews["android.view.View tree (Android)"]
+    Hermes -->|"JSI"| Modules["Native modules: camera, storage, sensors"]
+```
+*Figure: React Native at a glance, from source code to native views.*
+
+| | React Native | Cordova / Ionic / Capacitor | Flutter | React (web) |
+|---|---|---|---|---|
+| UI output | Native platform views | HTML/CSS inside a WebView | Own widgets painted by its engine (Impeller/Skia) | DOM nodes |
+| Language | JS/TS + React | JS/TS + any web framework | Dart | JS/TS + React |
+| Look & feel | Platform-native by default (native text input, scroll physics, a11y) | Web look; native feel must be emulated | Pixel-identical across platforms; native feel emulated | Browser |
+| Native access | Native modules via JSI (TurboModules, Expo Modules, Nitro) | Plugins over a JS-native bridge | Platform channels / FFI | Browser APIs only |
+| Layout | Yoga (Flexbox subset) | Browser CSS engine | Flutter layout protocol | Browser CSS engine |
+
+**How it differs from React DOM:** React itself (components, hooks, reconciliation) is identical. The difference is the **renderer** and **host components**: React DOM renders `div`/`span` into the DOM; React Native renders `View`/`Text` into native views. There's no DOM, no CSS cascade, no `window.document`, and layout is Flexbox-only. Knowledge of React transfers; knowledge of CSS partially transfers.
+
+**Trade-offs a senior should name:**
+- **Pros:** native UX and accessibility "for free", one codebase with large code sharing, huge JS ecosystem, OTA updates for JS, web skills reuse, and you can drop to Swift/Kotlin whenever needed.
+- **Cons:** platform differences leak through (shadows, fonts, keyboard behavior), you still need native knowledge for builds, signing and native modules, and upgrades require attention. Flutter gives more pixel-level consistency; RN gives more platform fidelity.
+
+> [!INTERVIEW]
+> What a senior answer includes: "real native views" plus *how* (JS engine, renderer, Yoga), the New Architecture being the only architecture in current versions, and honest trade-offs vs Flutter. Red flags: "RN runs in a WebView" or "RN compiles JS to native code". Likely follow-ups: "What threads are involved?", "What is JSI?" (see [Advanced Q&A](advanced.html) and [The New Architecture](../guides/new-architecture.html)).
+
+### What happens, at a high level, between writing a component in JSX and a native view appearing on screen?
+
+**Short answer:** JSX compiles to `jsx()` calls that create React elements. React renders your components down to **host components** (`View`, `Text`, `Image`), and the **Fabric renderer** creates a C++ **shadow tree** for them via JSI. **Yoga** computes layout on that tree, the renderer diffs it against the previous tree, and the resulting mutations are **mounted** on the UI thread as real `UIView`s / Android `View`s.
+
+The three phases (New Architecture, default since RN 0.76 and the only option since 0.82):
+
+1. **Render** (JS thread): React executes components and reconciles. For host components, Fabric creates immutable C++ shadow nodes holding props.
+2. **Commit** (any thread, usually JS or background): Yoga computes the size and position of each shadow node; the new tree is promoted as the "next tree to mount".
+3. **Mount** (UI/main thread): the renderer diffs old vs new tree and applies a minimal list of mutations (create, update props, insert, remove) to native host views.
+
+```mermaid
+flowchart LR
+    V["View"] --> VI["iOS: RCTViewComponentView (UIView subclass)"]
+    V --> VA["Android: ReactViewGroup (ViewGroup)"]
+    T["Text"] --> TI["iOS: RCTParagraphComponentView (draws text with TextKit)"]
+    T --> TA["Android: ReactTextView (TextView)"]
+    I["Image"] --> II["iOS: RCTImageComponentView (UIImageView inside)"]
+    I --> IA["Android: ReactImageView (Fresco-backed)"]
+```
+*Figure: Each host component maps to a real native view on each platform.*
+
+| RN component | iOS host view (roughly) | Android host view (roughly) |
+|---|---|---|
+| `View` | `UIView` subclass | `ViewGroup` (`ReactViewGroup`) |
+| `Text` | Custom paragraph view drawing an `NSAttributedString` | `TextView` subclass with `Spannable` text |
+| `Image` | `UIImageView` | `ImageView` subclass (Fresco pipeline) |
+| `ScrollView` | `UIScrollView` | `ScrollView` / `HorizontalScrollView` |
+| `TextInput` | `UITextField` / `UITextView` (multiline) | `EditText` subclass |
+
+Two details that show depth:
+- **View flattening:** Fabric removes "layout-only" `View`s (no background, border, events, etc.) from the native hierarchy, so wrapping in extra `View`s is cheaper than it looks.
+- **Nested `Text` is one native view:** `<Text>Hello <Text style={{ fontWeight: 'bold' }}>world</Text></Text>` becomes a single attributed string, not two views.
+
+> [!NOTE]
+> Deep internals (shadow tree cloning, synchronous layout, concurrent rendering, the event loop model) belong in the [Advanced Q&A](advanced.html) and [The New Architecture guide](../guides/new-architecture.html). At this level, the key is naming the three phases and the threads they run on.
+
+### What is Hermes, and why is it the default JavaScript engine?
+
+**Short answer:** Hermes is Meta's JavaScript engine built specifically for React Native. It has been the default since RN 0.70. Its big idea is **compiling JS to bytecode at build time**, so the app doesn't parse and compile JS on launch. That means faster startup (TTI), lower memory use and smaller downloads than JavaScriptCore (JSC) on typical apps.
+
+**How it works:**
+- In release builds, the Metro bundle is compiled by `hermesc` to `.hbc` bytecode that ships in the app. At launch Hermes memory-maps the bytecode and starts interpreting immediately.
+- It has **no JIT** on purpose: JITs trade memory and warm-up time for peak throughput, which is the wrong trade on mobile for UI code. (iOS also doesn't allow third-party JITs.)
+- A concurrent garbage collector (Hades) keeps GC pauses short on the JS thread.
+- It speaks the **Chrome DevTools Protocol**, which is why React Native DevTools can attach straight to it for breakpoints, profiling and memory snapshots.
+
+```ts
+// Quick runtime check, handy when debugging engine-specific behavior
+const isHermes = (): boolean => typeof (globalThis as any).HermesInternal === 'object';
+```
+
+**Things worth knowing:**
+- JSC is no longer bundled with RN; it moved to a community package for teams that still need it.
+- Some rarely used features behave differently: `Function.prototype.toString()` doesn't return source for bytecode functions, and there's no `with` statement. Modern syntax is handled by Babel/Hermes. `Intl` is supported.
+- The next-generation **Hermes V1** (from the Static Hermes work) showed up as an experimental opt-in around RN 0.82. Its goal is more performance, not API changes.
+- In debug builds, JS isn't precompiled (it's loaded from Metro), which is one reason debug builds are slower. **Measure performance in release.**
+
+> [!INTERVIEW]
+> What a senior answer includes: *bytecode precompilation, so no parse at startup*, the no-JIT rationale, the memory/TTI benefits, and CDP-based debugging. Red flag: "Hermes compiles JS to native machine code". That's not true of the default Hermes. Likely follow-up: "How would you measure startup improvements?" (see the [Performance guide](../guides/performance.html)).
+
+### Expo or React Native CLI: which would you choose for a new app, and why does the React Native team now recommend a framework?
+
+**Short answer:** For a new app I'd start with **Expo** (with development builds and Continuous Native Generation) unless there's a concrete reason not to. The React Native docs themselves recommend starting with a framework such as Expo, because a production app needs routing, native module tooling, builds, upgrades and updates, and a framework solves those consistently. The community CLI (`npx @react-native-community/cli init MyApp`) is still valid for "bare" apps where the team wants full, manual ownership of the native projects.
+
+| Concern | Expo (CNG + dev builds) | Bare RN (community CLI) |
+|---|---|---|
+| Native projects | Generated by `npx expo prebuild` from `app.json`/`app.config.ts` + config plugins. Usually not committed. | `ios/` and `android/` committed and hand-edited |
+| Custom native code | Yes: Expo Modules API, config plugins, local modules | Yes: edit native projects directly |
+| Upgrades | Bump SDK, re-run prebuild; most native diffs are handled for you | Apply the Upgrade Helper diff by hand |
+| Routing | Expo Router (file-based, automatic deep links) | Add React Navigation yourself |
+| Builds & updates | EAS Build / Submit / Update (optional; local builds work too) | Fastlane / Gradle / Xcode / your own CI |
+| Libraries | Any RN library with native code works in a dev build | Any RN library |
+
+**Misconceptions to correct:**
+- "Expo can't use native code": outdated. That was the old managed workflow with Expo Go. With **development builds** (`expo-dev-client`), any native library works. Expo Go is only for quick prototyping.
+- "Expo locks you into EAS": EAS is optional and paid at scale; `npx expo run:ios` / `run:android` build locally.
+- "Bare means no Expo": bare apps can install the `expo` package and use Expo modules too.
+
+**When I'd choose bare:** a brownfield integration (RN inside an existing native app), heavy existing native infrastructure the team wants to edit directly, or organizational constraints on tooling. Even then, config-as-code (CNG) is worth considering, because hand-edited native projects drift and make upgrades painful.
+
+> [!INTERVIEW]
+> What a senior answer includes: the distinction between Expo Go and dev builds, CNG/prebuild, config plugins, and the upgrade-cost argument. Red flags: choosing based on 2019-era limitations, or treating "Expo vs CLI" as a permanent choice (you can prebuild and eject at any time). Likely follow-up: "How would you add a native SDK that has no config plugin?" (write a small config plugin or a local Expo module).
+
+### Walk me through the structure of a bare React Native project. What does each top-level file do?
+
+**Short answer:** A bare app is a JS project plus two full native projects. `index.js` registers the root component, `App.tsx` is the root, `ios/` is an Xcode workspace managed by CocoaPods, `android/` is a Gradle project, and `metro.config.js`, `babel.config.js` and `app.json` configure bundling, transpilation and the app's registered name.
+
+```plaintext
+MyApp/
+├── android/                 Gradle project (Android Studio)
+│   ├── app/build.gradle     applicationId, versionCode, signing, flavors
+│   ├── app/src/main/AndroidManifest.xml
+│   ├── app/src/main/java/com/myapp/MainActivity.kt, MainApplication.kt
+│   ├── build.gradle         SDK versions, Kotlin version
+│   └── gradle.properties    newArchEnabled, hermesEnabled, JVM args
+├── ios/                     Xcode project
+│   ├── MyApp.xcworkspace    open THIS, not .xcodeproj
+│   ├── MyApp/AppDelegate.swift, Info.plist, LaunchScreen.storyboard
+│   ├── Podfile / Podfile.lock
+├── index.js                 entry point: AppRegistry.registerComponent
+├── App.tsx                  root component
+├── app.json                 name + displayName
+├── metro.config.js          bundler config
+├── babel.config.js          transpiler config
+├── package.json, tsconfig.json, jest.config.js
+└── Gemfile                  pins CocoaPods/Ruby gem versions
+```
+
+```js title="index.js"
+import { AppRegistry } from 'react-native';
+import App from './App';
+import { name as appName } from './app.json';
+
+AppRegistry.registerComponent(appName, () => App);
+```
+
+```js title="metro.config.js"
+const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
+
+/** @type {import('metro-config').MetroConfig} */
+const config = {};
+
+module.exports = mergeConfig(getDefaultConfig(__dirname), config);
+```
+
+```js title="babel.config.js"
+module.exports = {
+  presets: ['module:@react-native/babel-preset'],
+  // Plugins such as the Reanimated/worklets plugin go here (and it must be listed last).
+};
+```
+
+**Details that matter in practice:**
+- The `name` in `app.json` must match the module name the native side launches (`getMainComponentName()` in `MainActivity.kt` and the module name in `AppDelegate.swift`). If they don't match, you get "Application MyApp has not been registered".
+- Open `ios/MyApp.xcworkspace`, not `.xcodeproj`. Pods aren't linked in the project file alone.
+- `Podfile.lock` and `Gemfile.lock` should be committed so builds are reproducible.
+- `gradle.properties` holds `hermesEnabled` and `newArchEnabled`. In current RN the New Architecture can't be turned off.
+- In an Expo CNG project, `ios/` and `android/` are generated output; the source of truth is `app.json`/`app.config.ts` + config plugins.
+
+### What does Metro do?
+
+**Short answer:** Metro is React Native's JavaScript bundler and dev server. It **resolves** the module graph starting from `index.js`, **transforms** every file with Babel (TypeScript, JSX, modern syntax), and **serializes** everything into a bundle. In development it serves that bundle over HTTP (port 8081 by default) with incremental rebuilds and Fast Refresh. In release builds, the bundle is generated at build time and embedded in the app.
+
+**Responsibilities:**
+- **Resolution:** Node-style resolution plus RN specifics, such as platform extensions (`Button.ios.tsx` → `Button.native.tsx` → `Button.tsx`), the `react-native` field in `package.json`, and package `exports` in recent versions. Symlinks and monorepos are supported with `watchFolders` configuration.
+- **Transformation:** Babel with `@react-native/babel-preset`, run per file in parallel workers and cached on disk. That cache is why `--reset-cache` fixes "my change isn't showing up" issues.
+- **Assets:** `require('./logo.png')` becomes an asset reference with dimensions and `@2x`/`@3x` variants, and the files are copied into the native bundle at build time.
+- **Dev server:** serves `index.bundle?platform=ios&dev=true`, source maps, symbolication for LogBox stack traces, and the Hot Module Replacement socket used by Fast Refresh.
+- **Release:** the Xcode build phase "Bundle React Native code and images" and the Gradle `createBundleReleaseJsAndAssets` task run Metro and then `hermesc`, producing the embedded bytecode bundle.
+
+**Metro vs webpack/Vite:** Metro is optimized for one big bundle per platform, fast incremental rebuilds and the RN resolution rules. It doesn't do classic code splitting for native (though Expo Router uses Metro for web bundling and async routes experimentally).
+
+**Common configuration needs:** monorepo `watchFolders` and `nodeModulesPaths`, SVG transformer (`react-native-svg-transformer`), custom `resolver.sourceExts`/`assetExts`, and `resolver.blockList` to exclude folders.
+
+### How does Fast Refresh work, and when does it lose component state?
+
+**Short answer:** Fast Refresh is RN's hot reloading. When you save a file, Metro sends the updated module over a socket, and React re-renders the affected components **while preserving hooks state** if the file only exports React components. If a file exports non-component values too, Fast Refresh re-executes that module and the modules that import it, which usually resets state.
+
+**Rules it follows:**
+- Edit a module that exports **only components**: only those components update, and `useState`/`useRef` values survive.
+- Edit a module that exports **other things** (constants, utils, a context object): it and its importers re-run. State in those trees resets.
+- Edit a file **imported by non-React code**: Fast Refresh falls back to a full reload.
+- **Class components** always remount (state lost).
+- Effects and memoized values (`useEffect`, `useMemo`, `useCallback`) **re-run on every edit regardless of dependency arrays**, so effects must be written to handle re-execution (cleanup functions matter).
+- A **syntax error** or a runtime error during the module's initialization shows a redbox/LogBox. Fix it and save, and the app recovers without a full reload.
+- Add `// @refresh reset` anywhere in a file to force remounting components defined in it on every edit (useful for animation setup).
+
+**Gotchas:**
+- Anonymous default exports (`export default () => ...`) and HOC-wrapped components without names can break state preservation. Name your components.
+- Fast Refresh doesn't pick up **native** changes (Swift/Kotlin, `Info.plist`, new native libraries). Those require a rebuild.
+- Long-lived side effects in module scope (e.g. `setInterval` at top level) are duplicated on refresh. Put them inside effects with cleanup.
+
+> [!TIP]
+> If a change "doesn't show up", check whether you edited a file only imported by native code, or whether Metro's transform cache is stale (`npx react-native start --reset-cache`, or `npx expo start -c`).
+
+## Core Components and APIs
+
+### What are the rules around `View` and `Text`? Why must strings be inside `Text`, and how does text style inheritance work?
+
+**Short answer:** `View` is the basic container (a native view that supports Flexbox layout, style, touch handling and accessibility). **All text must be rendered inside `<Text>`**, because only the Text host component knows how to measure and draw strings; a raw string inside a `View` throws "Text strings must be rendered within a `<Text>` component". Text styles are **inherited only by nested `<Text>`**, never through `View`s.
+
+```tsx
+// Crashes: raw string (or a number) directly inside a View
+<View>Hello</View>
+
+// Works: nested Text inherits color and fontSize, and adds bold
+<Text style={{ color: '#333', fontSize: 16 }}>
+  Hello <Text style={{ fontWeight: '700' }}>world</Text>
+</Text>
+
+// Does NOT inherit: the View breaks the chain
+<View style={{ /* color is not a valid View style */ }}>
+  <Text>This text uses default styles</Text>
+</View>
+```
+
+**Why it works this way:** on the native side there's no cascade. A nested `Text` tree is flattened into one attributed string (`NSAttributedString` on iOS, `Spannable` on Android) drawn by one native text view, so style "inheritance" is really span attributes merging. `View` has no text concept at all.
+
+**Practical consequences:**
+- For app-wide typography, build a `<AppText>` component with your default font, color and size (and `maxFontSizeMultiplier`), instead of relying on inheritance.
+- Nested `Text` can't use Flexbox layout internally (it's inline); `View` inside `Text` is supported but has limitations.
+- `numberOfLines` + `ellipsizeMode` truncate; `selectable` enables copy; `onTextLayout` gives line metrics.
+- Custom fonts: the `fontFamily` name must match the font's PostScript name on iOS and the file name on Android. Use `expo-font` or bundle via the native projects. `fontWeight` with custom fonts often requires separate family names per weight on Android.
+- Conditional rendering can accidentally produce raw strings, e.g. `{count && <Badge />}` renders `0` when count is 0, which crashes outside `Text` (covered below).
+
+### How do you work with images: local vs remote sources, sizing, and `resizeMode`?
+
+**Short answer:** Local images use `require('./img.png')`, resolved at build time by Metro, so their dimensions are known and `@2x`/`@3x` variants are picked automatically. Remote images use `{ uri }` and **must be given dimensions** (width/height, or one dimension + `aspectRatio`), because RN can't know their size before download. `resizeMode` (`cover` default, `contain`, `stretch`, `repeat`, `center`) controls how the image fits its box.
+
+```tsx
+import { Image } from 'react-native';
+
+// Local: size inferred from the file, density variants chosen automatically
+<Image source={require('../assets/logo.png')} />
+
+// Remote: must be sized, otherwise it renders as 0x0
+<Image
+  source={{ uri: 'https://cdn.example.com/avatar/42.jpg', headers: { Authorization: `Bearer ${token}` } }}
+  style={{ width: 64, height: 64, borderRadius: 32 }}
+  resizeMode="cover"
+  onError={(e) => console.warn('image failed', e.nativeEvent.error)}
+/>
+
+// Responsive banner: full width, fixed ratio
+<Image source={{ uri: bannerUrl }} style={{ width: '100%', aspectRatio: 16 / 9 }} />
+```
+
+**Senior-level details:**
+- `require` paths must be **static strings**. `require('./icons/' + name + '.png')` doesn't work because Metro resolves requires at bundle time. Build a static map instead.
+- Request appropriately sized images from your CDN using `PixelRatio.getPixelSizeForLayoutSize(64)`. Downloading a 4000px image into a 64pt avatar wastes memory and can cause out-of-memory crashes on Android.
+- Caching differs by platform (iOS uses `NSURLCache` rules, Android uses Fresco's caches) and isn't controllable enough for image-heavy apps. Teams typically use **`expo-image`** (works in bare apps too), which adds disk/memory caching control, placeholders (blurhash/thumbhash), transitions and better format support. The original `react-native-fast-image` is unmaintained, though forks exist.
+- `Image.prefetch(url)` warms the cache; `Image.getSize(url, ...)` fetches dimensions if you really need natural size.
+- `ImageBackground` is just an `Image` positioned absolutely behind children. It's fine for simple cases.
+- The core `Image` component can't render SVG on either platform. Use `react-native-svg` (plus a Metro transformer to import `.svg` files as components), or `expo-image`, which supports SVG sources.
+
+### How does `TextInput` work, and should it be controlled or uncontrolled?
+
+**Short answer:** `TextInput` wraps the native text field (`UITextField`/`UITextView`, `EditText`). The usual pattern is **controlled**: `value` + `onChangeText` store the text in state, which enables validation, formatting and derived UI. For large forms or performance-sensitive inputs, **uncontrolled** (`defaultValue` + a ref, or a form library like React Hook Form) avoids re-rendering on every keystroke.
+
+```tsx
+import { useRef, useState } from 'react';
+import { TextInput, View, Text } from 'react-native';
+
+export function LoginForm({ onSubmit }: { onSubmit: (email: string, password: string) => void }) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const passwordRef = useRef<TextInput>(null);
+  const emailInvalid = email.length > 0 && !email.includes('@');
+
+  return (
+    <View>
+      <TextInput
+        value={email}
+        onChangeText={setEmail}
+        placeholder="Email"
+        keyboardType="email-address"
+        autoCapitalize="none"
+        autoCorrect={false}
+        autoComplete="email"
+        textContentType="emailAddress"
+        returnKeyType="next"
+        onSubmitEditing={() => passwordRef.current?.focus()}
+        accessibilityLabel="Email address"
+      />
+      {emailInvalid ? <Text>Enter a valid email</Text> : null}
+      <TextInput
+        ref={passwordRef}
+        value={password}
+        onChangeText={setPassword}
+        placeholder="Password"
+        secureTextEntry
+        autoComplete="current-password"
+        textContentType="password"
+        returnKeyType="done"
+        onSubmitEditing={() => onSubmit(email, password)}
+      />
+    </View>
+  );
+}
+```
+
+**Props worth knowing:** `keyboardType`/`inputMode`, `returnKeyType`/`enterKeyHint`, `autoComplete` (drives Android autofill and iOS suggestions), `textContentType` (iOS autofill, including `oneTimeCode` for SMS codes), `multiline`, `maxLength`, `editable`, `selection`, `onFocus`/`onBlur`, `onChange` (native event) vs `onChangeText` (just the string).
+
+**Gotchas:**
+- Transforming text in `onChangeText` (e.g. formatting a phone number) and writing it back can cause cursor jumps. Test on both platforms, or use a masking library.
+- `TextInput` has no default border on iOS and has an underline on Android. Style explicitly for consistency.
+- Inside a `ScrollView`, set `keyboardShouldPersistTaps="handled"` or the first tap on a button only dismisses the keyboard.
+- `Keyboard.dismiss()` hides the keyboard; wrap screens in a `Pressable` that calls it for "tap outside to dismiss".
+
+### `Pressable`, `TouchableOpacity`, or `Button`: which do you use and why?
+
+**Short answer:** **`Pressable`** is the modern, recommended primitive. It exposes the press state (`pressed`) to styles and children, supports `android_ripple`, `hitSlop`, `pressRetentionOffset`, long press and press-in/out, and doesn't impose a visual effect. `TouchableOpacity` and friends are older, still work, and hard-code one feedback style. `Button` is a thin wrapper with very limited styling (`title`, `color`), so it's only suitable for prototypes.
+
+```tsx
+import { Pressable, Text, StyleSheet } from 'react-native';
+
+type Props = { label: string; onPress: () => void; disabled?: boolean };
+
+export function PrimaryButton({ label, onPress, disabled }: Props) {
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      hitSlop={8}
+      android_ripple={{ color: 'rgba(255,255,255,0.2)' }}
+      accessibilityRole="button"
+      accessibilityState={{ disabled }}
+      style={({ pressed }) => [styles.button, pressed && styles.pressed, disabled && styles.disabled]}
+    >
+      <Text style={styles.label}>{label}</Text>
+    </Pressable>
+  );
+}
+
+const styles = StyleSheet.create({
+  button: { backgroundColor: '#2563eb', paddingVertical: 12, paddingHorizontal: 20, borderRadius: 10, alignItems: 'center' },
+  pressed: { opacity: 0.85 },
+  disabled: { opacity: 0.5 },
+  label: { color: '#fff', fontWeight: '600', fontSize: 16 },
+});
+```
+
+| | `Pressable` | `TouchableOpacity` | `Button` |
+|---|---|---|---|
+| Feedback | Whatever you build from `pressed` + ripple | Fades opacity (Animated) | Native-ish button |
+| Styling | Full | Full | Only `color`/`title` |
+| Android ripple | Yes (`android_ripple`) | No (`TouchableNativeFeedback` separately) | Yes |
+| Recommended for new code | Yes | Legacy | Prototypes only |
+
+**Depth:** all of these use RN's JS responder system. Inside gesture-heavy UIs (swipeable rows, bottom sheets, draggable lists), use `react-native-gesture-handler`'s buttons/`Pressable` so touches are coordinated natively with other gestures. Always wrap reusable press behavior in a design-system component so accessibility role/state, haptics and analytics are consistent.
+
+### How do `Modal`, `Alert`, `ActivityIndicator`, and `StatusBar` work, and what are their platform quirks?
+
+**Short answer:** `Modal` presents content above everything in a separate native window/controller. `Alert.alert` shows the platform's native dialog. `ActivityIndicator` is the native spinner. `StatusBar` controls the system status bar's style and visibility, either as a component or imperatively. Each has platform differences you need to know.
+
+```tsx
+import { Alert, Modal, View, Text, ActivityIndicator, StatusBar, Pressable } from 'react-native';
+
+function confirmDelete(onConfirm: () => void) {
+  Alert.alert('Delete item?', 'This cannot be undone.', [
+    { text: 'Cancel', style: 'cancel' },
+    { text: 'Delete', style: 'destructive', onPress: onConfirm },
+  ]);
+}
+
+function LoadingOverlay({ visible, onClose }: { visible: boolean; onClose: () => void }) {
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <StatusBar barStyle="light-content" />
+      <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' }}>
+        <ActivityIndicator size="large" color="#fff" />
+        <Pressable onPress={onClose} accessibilityRole="button"><Text style={{ color: '#fff' }}>Cancel</Text></Pressable>
+      </View>
+    </Modal>
+  );
+}
+```
+
+| API | iOS | Android |
+|---|---|---|
+| `Modal` | `presentationStyle` (`fullScreen`, `pageSheet`, `formSheet`, `overFullScreen`); swipe-to-dismiss on sheets | `onRequestClose` fires on the hardware back button; `statusBarTranslucent`/`navigationBarTranslucent` for edge-to-edge |
+| `Alert.alert` | Any number of buttons; `Alert.prompt` for text input (iOS only) | Max 3 buttons (neutral, negative, positive); `cancelable` option for tap-outside dismiss |
+| `ActivityIndicator` | `size`: `small`/`large` | Also accepts a numeric size |
+| `StatusBar` | `barStyle` | `backgroundColor`/`translucent` have little or no effect under enforced edge-to-edge (Android 15+ targets) |
+
+**Gotchas:**
+- Presenting a second `Modal` while one is open or still animating out is unreliable on iOS (UIKit allows one presentation per controller at a time). Prefer **navigation-based modals** (`presentation: 'modal'` in React Navigation, or a modal route in Expo Router) or a bottom-sheet library for complex flows.
+- Always implement `onRequestClose`, otherwise Android's back button does nothing inside the modal.
+- Multiple `<StatusBar>` components stack; the most recently mounted wins. With navigation, screens that stay mounted in the stack can fight over it. Set it per screen on focus, or use `expo-status-bar`'s `style="auto"`.
+- `Alert` is blocking UI with platform styling. For branded confirmation dialogs use a custom modal, but keep `Alert` for destructive confirmations because users recognize it.
+
+### How do you stop the keyboard from covering inputs?
+
+**Short answer:** Use `KeyboardAvoidingView` with the right `behavior` per platform (usually `padding` on iOS) and a `keyboardVerticalOffset` equal to any header height above it. Put forms inside a `ScrollView` with `keyboardShouldPersistTaps="handled"`. On Android, the window's `windowSoftInputMode` (typically `adjustResize`) matters too. For consistent, animated behavior across platforms, many teams use **`react-native-keyboard-controller`**.
+
+```tsx
+import { KeyboardAvoidingView, Platform, ScrollView } from 'react-native';
+import { useHeaderHeight } from '@react-navigation/elements';
+
+export function FormScreen({ children }: { children: React.ReactNode }) {
+  const headerHeight = useHeaderHeight();
+  return (
+    <KeyboardAvoidingView
+      style={{ flex: 1 }}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      keyboardVerticalOffset={headerHeight}
+    >
+      <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: 16 }}>
+        {children}
+      </ScrollView>
+    </KeyboardAvoidingView>
+  );
+}
+```
+
+**Why it's tricky:**
+- iOS never resizes your view for the keyboard. You must add padding or translate content yourself, and `KeyboardAvoidingView` does that based on keyboard events.
+- Android historically resized the window (`adjustResize` in `AndroidManifest.xml`), so adding `KeyboardAvoidingView` behavior on top caused double offsets. With **edge-to-edge enforced for Android 15+ targets**, the app draws behind system bars and the IME. Keyboard insets must then be handled explicitly, which is another reason libraries like `react-native-keyboard-controller` became popular.
+- `behavior="height"` changes the view's height and can fight with `flex` layouts. `position` moves the whole view. Test each on real devices.
+- Wrong `keyboardVerticalOffset` (forgetting the navigation header or safe-area inset) is the most common cause of "the input is still half-hidden".
+
+> [!TIP]
+> For chat screens, invert the message list and pin the composer to the keyboard with keyboard-controller's sticky/animated views. This is a common senior take-home task.
+
+### How do you handle safe areas like notches, the home indicator, and Android edge-to-edge?
+
+**Short answer:** Use **`react-native-safe-area-context`**: wrap the app in `SafeAreaProvider`, then use its `SafeAreaView` with explicit `edges`, or the `useSafeAreaInsets()` hook for precise padding. The core `SafeAreaView` from `react-native` is **deprecated**. It was iOS-only and can't handle Android edge-to-edge, which is now enforced for apps targeting Android 15+.
+
+```tsx
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { View } from 'react-native';
+
+export default function App() {
+  return (
+    <SafeAreaProvider>
+      <HomeScreen />
+    </SafeAreaProvider>
+  );
+}
+
+function HomeScreen() {
+  return (
+    <SafeAreaView style={{ flex: 1 }} edges={['top', 'left', 'right']}>
+      {/* content */}
+      <BottomBar />
+    </SafeAreaView>
+  );
+}
+
+function BottomBar() {
+  const insets = useSafeAreaInsets();
+  // Extend the bar's background under the home indicator, but keep buttons above it
+  return <View style={{ paddingBottom: Math.max(insets.bottom, 12), backgroundColor: '#fff' }} />;
+}
+```
+
+**Senior details:**
+- Choose `edges` deliberately. A screen with a navigation header doesn't need the `top` inset (the header handles it); a screen with a tab bar doesn't need `bottom`.
+- Prefer insets as **padding** so backgrounds extend edge-to-edge while content stays safe. That looks more native than letterboxing.
+- Insets change on rotation, split screen and foldables. The hook re-renders; hard-coded values (like "44 for the notch") are wrong on newer devices.
+- React Navigation and Expo Router already depend on `react-native-safe-area-context`, so their headers and tab bars apply insets for you.
+- On Android, edge-to-edge means the status and navigation bars are transparent overlays. Test gesture navigation and 3-button navigation, because the bottom inset differs.
+
+### What's the difference between `Dimensions` and `useWindowDimensions`, and what is `PixelRatio` for?
+
+**Short answer:** `Dimensions.get('window')` returns a **snapshot** that doesn't update your UI when the window changes (rotation, split screen, foldables, iPad multitasking) unless you subscribe manually. **`useWindowDimensions()`** is a hook that re-renders the component on change, so it's the right default. `PixelRatio` converts between layout units (dp/pt) and physical pixels, and exposes the user's font scale.
+
+```tsx
+import { useWindowDimensions, PixelRatio } from 'react-native';
+
+function ProductGrid() {
+  const { width, fontScale } = useWindowDimensions();
+  const columns = width >= 900 ? 4 : width >= 600 ? 3 : 2;
+  const tileWidth = (width - 16 * (columns + 1)) / columns;
+  const imagePx = PixelRatio.getPixelSizeForLayoutSize(tileWidth); // request the right size from the CDN
+  // ...
+}
+```
+
+| API | Use for |
+|---|---|
+| `useWindowDimensions()` | Responsive layout decisions in components (re-renders on change) |
+| `Dimensions.get('window' / 'screen')` | Non-React code, one-off reads. `screen` is the whole display, `window` is the app's area. |
+| `onLayout` | The actual size of a specific component (better than window math for nested layouts) |
+| `PixelRatio.get()` | Device density (e.g. 2 or 3 on iPhones; roughly 1 to 4 on Android) |
+| `PixelRatio.getFontScale()` | The user's accessibility text size multiplier |
+| `PixelRatio.roundToNearestPixel(n)` | Avoid blurry hairlines and subpixel gaps |
+| `StyleSheet.hairlineWidth` | The thinnest visible line on the device |
+
+**Gotcha:** don't store `Dimensions.get()` in a module-level constant (`const { width } = Dimensions.get('window')` at the top of a file). It's evaluated once at import, so rotation and foldables silently break the layout.
+
+### How do you write platform-specific code?
+
+**Short answer:** Three tools, from smallest to largest scope. `Platform.OS` checks for small inline differences. `Platform.select()` picks values (often styles). **Platform-specific files** (`Component.ios.tsx` / `Component.android.tsx`) are for substantially different implementations, and Metro picks the right one automatically when you import `./Component`.
+
+```tsx
+import { Platform, StyleSheet } from 'react-native';
+
+const styles = StyleSheet.create({
+  card: {
+    borderRadius: 12,
+    backgroundColor: '#fff',
+    ...Platform.select({
+      ios: { shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 8, shadowOffset: { width: 0, height: 4 } },
+      android: { elevation: 4 },
+      default: {},
+    }),
+  },
+});
+
+const isOldAndroid = Platform.OS === 'android' && Platform.Version < 33; // Version is the API level (number) on Android
+const isIOS17Plus = Platform.OS === 'ios' && parseInt(String(Platform.Version), 10) >= 17; // a string like '17.4' on iOS
+```
+
+```plaintext
+components/
+  DatePicker.ios.tsx      native iOS picker implementation
+  DatePicker.android.tsx  dialog-based implementation
+  DatePicker.tsx          optional fallback (web, tests, or shared types)
+
+import { DatePicker } from './components/DatePicker';  // no extension
+```
+
+**Details and gotchas:**
+- Resolution order is roughly `.ios.tsx`/`.android.tsx`, then `.native.tsx` (any native platform), then `.tsx`. Use `.native.tsx` + `.tsx` to share code between native and web (React Native Web).
+- **TypeScript** doesn't know about platform extensions by default. Either keep a base `DatePicker.tsx` (or `DatePicker.d.ts`) exporting the shared type, or configure `"moduleSuffixes": [".ios", ".android", ".native", ""]` in `tsconfig.json`. Make sure both implementations export the **same props interface**, or one platform will break at runtime.
+- `Platform.select` also accepts `native` and `default` keys; `Platform.isPad` and `Platform.isTV` exist for device-class checks.
+- Prefer **capability checks** over version checks where possible, and keep platform branches at the edges (in components or services), not scattered through business logic.
+- Shadows are the classic example: iOS uses `shadow*` props, Android uses `elevation`. Recent RN versions add a cross-platform `boxShadow` style on the New Architecture, which reduces this branching.
+
+## Styling and Layout
+
+### How is styling in React Native different from CSS on the web?
+
+**Short answer:** Styles are plain JavaScript objects with camelCased properties and unitless numbers, applied through the `style` prop. There are **no selectors, no cascade, no specificity, and no inheritance** (except text styles within nested `Text`). `StyleSheet.create` is the convention for defining them, and you compose styles with **arrays**, where later entries win.
+
+```tsx
+import { StyleSheet, View, Text } from 'react-native';
+
+function Tag({ label, active }: { label: string; active?: boolean }) {
+  return (
+    <View style={[styles.tag, active && styles.tagActive]}>
+      <Text style={[styles.label, active && { color: '#fff' }]}>{label}</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  tag: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 999, backgroundColor: '#eef2ff' },
+  tagActive: { backgroundColor: '#4f46e5' },
+  label: { fontSize: 14, fontWeight: '600', color: '#3730a3' },
+});
+```
+
+**Key differences from CSS:**
+- Style arrays can contain `false`/`null`/`undefined`, which makes conditional styles easy. The array is flattened at render time.
+- There's no shorthand string syntax like `margin: '8px 16px'`. Use `marginVertical`/`marginHorizontal`, `paddingStart`/`paddingEnd` (RTL-aware), and so on.
+- There are **no pseudo-classes or media queries**. `:pressed` becomes `Pressable`'s `pressed` state; media queries become `useWindowDimensions()`; `:focus` becomes `onFocus` state.
+- Not every CSS property exists, and some are platform-specific (`elevation` on Android, `shadow*` historically on iOS). Recent versions (New Architecture) added web-aligned props such as `boxShadow`, `filter`, `mixBlendMode`, `outline*`, `gap`, and `display: 'contents'`.
+- There's **no global stylesheet**. Theming is done with context, design tokens or a styling library.
+
+**About `StyleSheet.create`:** it used to register styles natively and pass numeric IDs. Today it essentially returns your object. The value is type-checking, a clear convention, and keeping style objects **stable across renders** (inline object literals are re-created every render, which can defeat `React.memo` on children). Inline styles for truly dynamic values (e.g. an animated or computed width) are fine.
+
+**Styling libraries (know they exist, choose deliberately):** NativeWind (Tailwind classes compiled to RN styles), Tamagui, Unistyles (theme and breakpoint-aware `StyleSheet` replacement), Restyle, styled-components. Seniors should discuss runtime cost, theming and team familiarity rather than personal taste.
+
+### How does Flexbox in React Native differ from Flexbox on the web?
+
+**Short answer:** Every `View` is a flex container by default (there's no `display: block`), laid out by **Yoga**. The defaults differ from the web: **`flexDirection` defaults to `column`**, **`flexShrink` defaults to `0`**, **`alignContent` defaults to `flex-start`**, and `flex` takes a **single number**. `flex: 1` means "grow to fill the available space, sharing it proportionally with siblings", roughly `flexGrow: 1` with `flexBasis: 0`.
+
+```mermaid
+flowchart TD
+    Parent["Parent View<br/>flexDirection: column (RN default)"]
+    Parent -->|"main axis: vertical"| Main["justifyContent positions children<br/>top to bottom"]
+    Parent -->|"cross axis: horizontal"| Cross["alignItems aligns children<br/>default stretch = full width"]
+    Parent -.->|"flexDirection: row"| Row["Axes swap: justifyContent is horizontal,<br/>alignItems is vertical"]
+```
+*Figure: Main and cross axes with React Native's default column direction.*
+
+| Property | Web default | React Native default |
+|---|---|---|
+| `display` | `block` / `inline` (flex is opt-in) | Every view is `flex` |
+| `flexDirection` | `row` | `column` |
+| `flexShrink` | `1` | `0` |
+| `alignContent` | `normal` (stretch-like) | `flex-start` |
+| `flex` | Shorthand `grow shrink basis` | Single number (`flex: 1`, `flex: 0`, `flex: -1`) |
+| `position` | `static` | `relative` |
+| `minWidth`/`minHeight` for flex items | `auto` | `0` |
+
+```tsx
+// Classic screen layout: header, flexible content, footer
+<View style={{ flex: 1 }}>
+  <Header />
+  <View style={{ flex: 1 }}>{/* takes all remaining height */}</View>
+  <Footer />
+</View>
+
+// Row with a truncating title and a fixed-size button
+<View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+  <Text style={{ flex: 1 }} numberOfLines={1}>{title}</Text>
+  <Button title="Follow" onPress={follow} />
+</View>
+```
+
+**Gotchas that trip people up:**
+- **"My screen is blank / my ScrollView doesn't scroll."** A parent without `flex: 1` (or a fixed height) has zero height. `flex: 1` only works if every ancestor also has a bounded size.
+- **Text overflowing a row:** because `flexShrink` is `0`, long text won't shrink by default. Give it `flex: 1` or `flexShrink: 1`.
+- **`gap`, `rowGap`, `columnGap`** are supported (since RN 0.71). Prefer them over margin hacks on children.
+- `flexWrap: 'wrap'` works; combine it with `alignContent` to control wrapped lines.
+- `flex: -1` is RN-specific: the item is sized by width/height but can shrink down to its min size if space runs out.
+
+> [!INTERVIEW]
+> What a senior answer includes: the default differences in the table, what `flex: 1` actually resolves to, and debugging zero-height parents. Likely follow-up: "Build a two-column card grid that adapts to tablets", which leads into responsive layout.
+
+### What units does React Native use, and how do percentages and absolute positioning work?
+
+**Short answer:** Numbers are **density-independent pixels**: points on iOS and dp on Android. A `width: 100` looks physically about the same size on any screen density. There are no `px`, `em`, `rem`, `vh` or `vw`. Percentages are strings (`'50%'`) relative to the parent's size. `position: 'absolute'` positions an element relative to its parent (every view is `relative` by default) and takes it out of the flex flow.
+
+```tsx
+// Badge pinned to the top-right corner of an avatar
+<View style={{ width: 56, height: 56 }}>
+  <Image source={{ uri: avatarUrl }} style={{ width: '100%', height: '100%', borderRadius: 28 }} />
+  <View style={{ position: 'absolute', top: -4, right: -4, minWidth: 20, height: 20, borderRadius: 10, backgroundColor: 'red' }} />
+</View>
+
+// Full-bleed overlay
+<View style={StyleSheet.absoluteFill} />
+```
+
+**Details:**
+- 1 unit = `PixelRatio.get()` physical pixels. On a 3x iPhone, `width: 100` is 300 physical pixels.
+- **Font sizes** also scale with the user's accessibility text size setting. Use `maxFontSizeMultiplier` on critical UI instead of disabling `allowFontScaling` globally, which is an accessibility failure.
+- Percentages work for `width`, `height`, margins, padding, `top`/`left`/etc. and `flexBasis`. Percentage padding and margins are relative to the parent's **width** (as on the web).
+- `StyleSheet.absoluteFill` (a style object) and `StyleSheet.absoluteFillObject` (for spreading) are shorthand for `position: 'absolute'` with all edges at 0.
+- `zIndex` works among siblings. On Android, `elevation` also affects drawing order, so a view with higher elevation can draw above one with a higher `zIndex`.
+- `overflow: 'hidden'` is needed to clip children (e.g. images to a rounded card's corners), and it clips shadows on iOS. The usual fix is an outer view for the shadow and an inner view for clipping.
+- Absolutely positioned children can't receive touches outside the parent's bounds on Android. Keep touch targets inside their parent.
+
+### How do you build responsive layouts that work on small phones, large phones, tablets, and foldables?
+
+**Short answer:** Use Flexbox and relative sizing first (`flex`, percentages, `aspectRatio`, `gap`, max widths). Then use `useWindowDimensions()` for **breakpoint** decisions like column counts and side-by-side panes, and `onLayout` when a component needs its own size. Avoid scaling everything proportionally to screen width, and always test with large accessibility font sizes.
+
+```tsx title="src/ui/useBreakpoint.ts"
+import { useWindowDimensions } from 'react-native';
+
+export type Breakpoint = 'compact' | 'medium' | 'expanded';
+
+// Aligned with Android's window size classes: < 600dp, 600-839dp, >= 840dp
+export function useBreakpoint(): Breakpoint {
+  const { width } = useWindowDimensions();
+  if (width >= 840) return 'expanded';
+  if (width >= 600) return 'medium';
+  return 'compact';
+}
+```
+
+```tsx
+function InboxScreen() {
+  const bp = useBreakpoint();
+  return bp === 'expanded' ? (
+    <View style={{ flex: 1, flexDirection: 'row' }}>
+      <View style={{ width: 360 }}><MessageList /></View>
+      <View style={{ flex: 1 }}><MessageDetail /></View>
+    </View>
+  ) : (
+    <MessageList />
+  );
+}
+```
+
+**Senior considerations:**
+- **Window, not device:** on iPad multitasking, Android split screen and foldables, the window can be phone-sized on a tablet. Branch on window width, never on "is this a tablet".
+- **Constrain reading width** on large screens (`maxWidth: 600, alignSelf: 'center', width: '100%'`) instead of stretching forms edge to edge.
+- **Orientation:** decide whether you support landscape (`orientation` in `app.json`, `UISupportedInterfaceOrientations` in `Info.plist`, `android:screenOrientation`). On large screens, recent Android versions ignore orientation locks for apps targeting new SDKs, so plan for it.
+- **Scaling helpers** (like "scale font size by screen width") usually fight the OS's accessibility scaling. Use them sparingly.
+- **Font scaling:** layouts must survive 200%+ text sizes. Rows need `flexWrap` or should stack vertically, and fixed heights on text containers are a smell.
+
+### How do you implement dark mode?
+
+**Short answer:** Read the system scheme with **`useColorScheme()`** (it re-renders when the user changes it), map it to a theme object of semantic color tokens, and provide the theme through context. Components consume tokens (`colors.background`, `colors.textPrimary`), never raw hex values. The native config must allow automatic switching: `userInterfaceStyle: "automatic"` in Expo's `app.json`; on bare iOS, don't force `UIUserInterfaceStyle` in `Info.plist`.
+
+```tsx title="src/theme/ThemeProvider.tsx"
+import { createContext, useContext, useMemo, useState, type ReactNode } from 'react';
+import { useColorScheme } from 'react-native';
+
+const light = { background: '#ffffff', surface: '#f4f4f5', textPrimary: '#18181b', textMuted: '#52525b', accent: '#2563eb' };
+const dark: typeof light = { background: '#09090b', surface: '#18181b', textPrimary: '#fafafa', textMuted: '#a1a1aa', accent: '#60a5fa' };
+
+type Preference = 'system' | 'light' | 'dark';
+type Theme = { colors: typeof light; isDark: boolean; preference: Preference; setPreference: (p: Preference) => void };
+
+const ThemeContext = createContext<Theme | null>(null);
+
+export function ThemeProvider({ children }: { children: ReactNode }) {
+  const system = useColorScheme(); // 'light' | 'dark', or null/unspecified if unknown
+  const [preference, setPreference] = useState<Preference>('system'); // persist this in storage in a real app
+  const isDark = preference === 'system' ? system === 'dark' : preference === 'dark';
+  const value = useMemo(() => ({ colors: isDark ? dark : light, isDark, preference, setPreference }), [isDark, preference]);
+  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
+}
+
+export function useTheme(): Theme {
+  const ctx = useContext(ThemeContext);
+  if (!ctx) throw new Error('useTheme must be used inside ThemeProvider');
+  return ctx;
+}
+```
+
+**Details that show depth:**
+- Pass the theme to React Navigation (`<NavigationContainer theme={isDark ? DarkTheme : DefaultTheme}>`, or your own theme) so headers and tab bars match.
+- Update the status bar style with the theme (`expo-status-bar`'s `style="auto"` does this).
+- `Appearance.setColorScheme()` can override the scheme app-wide (including native dialogs); `Appearance.addChangeListener` is the non-hook API.
+- `PlatformColor('systemBackground')` (iOS) or `PlatformColor('?attr/colorSurface')` (Android), plus `DynamicColorIOS`, let you use native semantic colors that adapt automatically.
+- Avoid pure black/white pairs for large surfaces; check contrast ratios for both themes; and swap or tint images and illustrations that look wrong on dark backgrounds.
+- Persist the user's override (`system`/`light`/`dark`) and apply it **before the first render** to avoid a flash of the wrong theme.
+
+## Components, Props, and State
+
+### What's the difference between props and state?
+
+**Short answer:** **Props** are inputs passed from a parent. They're read-only for the receiving component and change only when the parent re-renders with new values. **State** is data a component owns and changes over time (via `useState`/`useReducer`); updating it schedules a re-render of that component and its children. A good rule: *if it can be derived from props or other state, it isn't state*.
+
+```tsx
+type CounterProps = { label: string; step?: number; onChange?: (value: number) => void };
+
+function Counter({ label, step = 1, onChange }: CounterProps) {
+  const [count, setCount] = useState(0);            // owned, changes over time
+  const isEven = count % 2 === 0;                    // derived: compute, don't store
+
+  const increment = () => {
+    setCount((c) => {
+      const next = c + step;
+      onChange?.(next);
+      return next;
+    });
+  };
+
+  return (
+    <Pressable onPress={increment} accessibilityRole="button">
+      <Text>{label}: {count} {isEven ? '(even)' : '(odd)'}</Text>
+    </Pressable>
+  );
+}
+```
+
+**What a senior adds:**
+- **Derived state anti-pattern:** copying props into state (`useState(props.value)`) freezes the initial value and drifts out of sync. Compute during render, or key the component (`<Editor key={item.id} />`) to reset its state intentionally.
+- **Where state lives matters for performance:** state high in the tree re-renders large subtrees. Keep state as close as possible to where it's used, and split contexts by update frequency.
+- **Kinds of state:** UI state (local), app/client state (Zustand, Redux Toolkit, Jotai), **server state** (TanStack Query, RTK Query, which handle caching, refetching and invalidation), navigation state, form state, and persisted state. Mixing server cache into Redux by hand is a common source of bugs.
+- Calling `onChange` inside the updater, as above, is a side effect in an updater (which should be pure). In StrictMode, React may call updaters twice. A cleaner version computes `next` from current state outside and calls both `setCount(next)` and `onChange(next)`. Mentioning this is a strong signal.
+
+### What are the basics of `useState` and `useEffect`, and what mistakes do people commonly make with them?
+
+**Short answer:** `useState` holds a value across renders and returns a setter that schedules a re-render. `useEffect` runs side effects **after** render (subscriptions, timers, fetching, syncing with native APIs), re-running when its dependencies change, and its cleanup runs before the next run and on unmount. The common mistakes are wrong dependency arrays, stale closures, missing cleanup, race conditions in fetches, and using effects for things that should be computed during render.
+
+```tsx
+import { useEffect, useState } from 'react';
+import { AppState } from 'react-native';
+
+type User = { id: string; name: string };
+
+function useUser(userId: string) {
+  const [user, setUser] = useState<User | null>(null);
+  const [error, setError] = useState<Error | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();           // cancel on unmount or userId change
+    setError(null);
+    fetch(`https://api.example.com/users/${userId}`, { signal: controller.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json() as Promise<User>;
+      })
+      .then(setUser)
+      .catch((e: unknown) => {
+        if ((e as Error).name !== 'AbortError') setError(e as Error);
+      });
+    return () => controller.abort();                    // prevents stale responses overwriting newer ones
+  }, [userId]);
+
+  return { user, error };
+}
+
+function useAppStateLogger() {
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (s) => console.log('AppState', s));
+    return () => sub.remove();                          // cleanup: no leaked listeners
+  }, []);
+}
+```
+
+**Common mistakes and fixes:**
+
+| Mistake | Symptom | Fix |
+|---|---|---|
+| Missing dependencies | Effect uses stale props/state | Include all deps (enable `react-hooks/exhaustive-deps`) |
+| Object/function deps re-created every render | Effect runs every render, or infinite loops | Move them inside the effect, memoize, or depend on primitives |
+| `setCount(count + 1)` in intervals/closures | Counter stuck at 1 | Functional update: `setCount((c) => c + 1)` |
+| No cleanup | Duplicate listeners, "state update on unmounted component" style bugs, leaks | Return a cleanup function |
+| Fetch without cancellation | Older response overwrites newer | `AbortController` or an ignore flag; better, TanStack Query |
+| Effect to compute derived data | Extra render, flicker | Compute during render; `useMemo` only if expensive |
+| `async` function passed directly to `useEffect` | Returns a Promise instead of cleanup | Define an async function inside and call it |
+
+**Also worth saying:**
+- Setters are **batched**. Multiple `setX` calls in one event handler or async callback produce one render (automatic batching since React 18).
+- In development under **StrictMode**, React mounts, unmounts and re-mounts components to surface missing cleanups. Effects that break under that are buggy.
+- `useLayoutEffect` runs before paint. In RN it's used for measuring layout to avoid visual jumps; with the New Architecture it's synchronous and reliable for this.
+- With the **React Compiler** (stable, enabled in Expo templates), manual `useMemo`/`useCallback` is largely unnecessary. Effects still need correct dependencies.
+
+### How do you share state between sibling components, and how do you use composition with `children`?
+
+**Short answer:** **Lift state up** to the nearest common parent, which passes the value down as props and passes callbacks to change it. Use **composition** (passing `children` or elements as props) to avoid prop drilling and to build flexible layout components. Reach for context or a store only when state is needed by many distant components.
+
+```tsx
+// Lifting state up: the parent owns the selection, and the children are controlled
+function FilterScreen() {
+  const [category, setCategory] = useState<'all' | 'shoes' | 'bags'>('all');
+  return (
+    <>
+      <CategoryTabs value={category} onChange={setCategory} />
+      <ProductList category={category} />
+    </>
+  );
+}
+
+// Composition: Card doesn't need to know what it renders
+function Card({ title, children, footer }: { title: string; children: React.ReactNode; footer?: React.ReactNode }) {
+  return (
+    <View style={styles.card}>
+      <Text style={styles.title}>{title}</Text>
+      <View style={styles.body}>{children}</View>
+      {footer ? <View style={styles.footer}>{footer}</View> : null}
+    </View>
+  );
+}
+
+<Card title="Order #1042" footer={<PrimaryButton label="Track" onPress={track} />}>
+  <OrderSummary order={order} />
+</Card>
+```
+
+**Senior perspective:**
+- **Composition before context.** Passing `children` or elements from above often removes three levels of prop drilling without introducing a global dependency.
+- **Composition is a performance tool:** elements passed as `children` are created by the parent. When the wrapper's own state changes, `children` keep the same identity, so they don't re-render just because the wrapper did.
+- **Context** re-renders every consumer when its value changes. Split contexts (state vs actions), memoize values, or use a store with selectors (Zustand, Redux, Jotai) for frequently changing shared state.
+- **Compound components** (`<Tabs><Tabs.Tab /></Tabs>`) and "render props" are composition patterns worth knowing for design systems.
+- Don't lift state higher than necessary. Global state for a single screen's form is a common over-engineering smell.
+
+### What are the common patterns and pitfalls for conditional rendering in React Native?
+
+**Short answer:** Use ternaries, early returns, or `&&` with a **real boolean**. The RN-specific pitfall: `{count && <Badge />}` renders `0` when `count` is `0`. On the web that shows a stray "0", but in React Native a raw number outside `<Text>` **crashes** with "Text strings must be rendered within a `<Text>` component". `NaN` (e.g. from a failed `parseInt`) crashes the same way. Empty strings are skipped by React, so they're harmless, but any non-empty string outside `Text` crashes too.
+
+```tsx
+// Bug: renders 0 (crash) when count === 0
+{count && <Badge value={count} />}
+
+// Correct
+{count > 0 && <Badge value={count} />}
+{!!title && <Text>{title}</Text>}
+{isLoading ? <ActivityIndicator /> : <Content />}
+
+// Early returns keep complex screens readable
+function OrderScreen({ orderId }: { orderId: string }) {
+  const { data, error, isLoading } = useOrder(orderId);
+  if (isLoading) return <FullScreenSpinner />;
+  if (error) return <ErrorState error={error} onRetry={() => {}} />;
+  if (!data) return <EmptyState message="Order not found" />;
+  return <OrderDetails order={data} />;
+}
+```
+
+**Other considerations:**
+- **Unmounting vs hiding:** conditionally rendering a subtree unmounts it, losing its state (scroll position, input text) and paying mount cost again. For tab-like toggles where state should persist, keep it mounted and hide it (`display: 'none'`), or let the navigator manage it.
+- **Hooks can't be conditional.** Early returns must come *after* all hook calls in the component.
+- Model mutually exclusive UI states as a **discriminated union** (`{ status: 'loading' } | { status: 'error'; error } | { status: 'success'; data }`) rather than several booleans that can contradict each other (`isLoading && isError`).
+- A lint rule such as `react-native/no-raw-text`, or a TypeScript convention of `!!`/`> 0`, prevents the zero bug in code review.
+
+### What are keys, and why are array indexes bad keys?
+
+**Short answer:** Keys tell React which item in a list is which **between renders**, so it can preserve, move or remove the right component instances (and their state) instead of re-creating them. Index keys break when items are inserted, removed or reordered: the *position* keeps its state while the *data* moves, so input text, checkbox state, animations or images end up attached to the wrong row.
+
+```tsx
+// Bad: delete the first todo, and the second row inherits the first row's TextInput state
+{todos.map((todo, index) => <TodoRow key={index} todo={todo} />)}
+
+// Good: stable, unique ID from the data
+{todos.map((todo) => <TodoRow key={todo.id} todo={todo} />)}
+
+// FlatList equivalent
+<FlatList data={todos} keyExtractor={(t) => t.id} renderItem={({ item }) => <TodoRow todo={item} />} />
+```
+
+**Depth:**
+- Keys must be **stable** (same item, same key across renders), **unique among siblings**, and **not random**. `key={Math.random()}` remounts every row on every render, destroying performance and state.
+- Index keys are acceptable only for static lists that never reorder, filter or have local state.
+- Items created client-side before the server assigns an ID need a client-generated ID (e.g. a UUID) kept after sync. Swapping the key when the server ID arrives causes a remount flicker.
+- **Changing a key deliberately resets a component**: `<ProfileForm key={userId} />` gives a fresh form per user. That's a legitimate technique.
+- In `FlatList`, a bad `keyExtractor` also confuses virtualization and `onViewableItemsChanged`. In FlashList, keys interact with recycling.
+
+> [!INTERVIEW]
+> Red flag: "Keys are for performance so React doesn't warn." A senior explains identity and state preservation, and gives a concrete bug caused by index keys.
+
+## Lists
+
+### When do you use `ScrollView` vs `FlatList` vs `SectionList`?
+
+**Short answer:** `ScrollView` renders **all** its children at once. It's fine for short, bounded content (a settings page, a form, a detail screen). `FlatList` **virtualizes**: it renders only a window of items around the viewport and unmounts the rest, so it's the default for long or unbounded data. `SectionList` is the same virtualized list with grouped data and section headers (contacts A–Z, transactions by date).
+
+```mermaid
+flowchart TD
+    Data["data: 10,000 items"] --> VL["VirtualizedList measures scroll offset + item sizes"]
+    VL --> Above["Rendered buffer above<br/>up to ~10 screen heights"]
+    VL --> Visible["Visible viewport<br/>what the user sees"]
+    VL --> Below["Rendered buffer below<br/>up to ~10 screen heights"]
+    VL -.->|"outside the window"| Gone["Unmounted, replaced by spacer<br/>local state is lost"]
+    Visible -->|"user scrolls"| VL
+```
+*Figure: FlatList keeps a window of rendered items (windowSize 21 by default: the visible screen plus 10 above and 10 below).*
+
+| | `ScrollView` | `FlatList` | `SectionList` |
+|---|---|---|---|
+| Renders | Everything, immediately | A window around the viewport | A window, with section headers |
+| Memory with 5,000 items | Grows with item count (can crash) | Roughly constant | Roughly constant |
+| Data shape | Arbitrary JSX children | `data` array + `renderItem` | `sections: { title, data }[]` + `renderSectionHeader` |
+| Extras | `stickyHeaderIndices`, paging | Columns (`numColumns`), infinite scroll, pull-to-refresh | Sticky section headers (default on iOS) |
+| Use when | Content is short and bounded | Long or unknown-length lists | Grouped long lists |
+
+**How virtualization works (worth explaining):** `FlatList` is built on `VirtualizedList`, which is built on `ScrollView`. As you scroll, it measures item layouts, renders items within `windowSize` viewport-lengths (default 21), renders in batches (`initialNumToRender` 10, `maxToRenderPerBatch` 10) to keep the JS thread responsive, and replaces far-away items with blank spacers.
+
+**Consequences:**
+- Items outside the window **unmount**, so local state in a row (expanded state, input text) is lost. Keep that state in the parent or a store, keyed by item ID.
+- Fast scrolling can show **blank areas** when rendering can't keep up. Mitigate with cheaper rows, memoization, `getItemLayout` for fixed sizes, or FlashList.
+- Don't nest a vertical `FlatList` inside a vertical `ScrollView`. Virtualization breaks (the inner list gets unbounded height and renders everything), and RN warns about it. Use `ListHeaderComponent`/`ListFooterComponent` for the surrounding content instead.
+- `ScrollView` with `.map()` over a server response is a classic production memory bug: fine with 20 items in testing, slow with 2,000 in production.
+
+### How do you set up a `FlatList` properly for a real screen?
+
+**Short answer:** Provide a stable **`keyExtractor`**, a **memoized item component**, and a stable `renderItem`. Handle empty, loading and error states with **`ListEmptyComponent`**, **`ListHeaderComponent`** and **`ListFooterComponent`**. Add `getItemLayout` when rows have a fixed height, and pass **`extraData`** when rows depend on something outside `data`.
+
+```tsx title="src/features/orders/OrderList.tsx"
+import { memo, useCallback } from 'react';
+import { FlatList, Text, View, ActivityIndicator, Pressable, type ListRenderItem } from 'react-native';
+
+type Order = { id: string; title: string; total: string };
+const ROW_HEIGHT = 72;
+
+const OrderRow = memo(function OrderRow({ order, selected, onPress }: { order: Order; selected: boolean; onPress: (id: string) => void }) {
+  return (
+    <Pressable onPress={() => onPress(order.id)} style={{ height: ROW_HEIGHT, justifyContent: 'center', paddingHorizontal: 16, backgroundColor: selected ? '#eef2ff' : undefined }}>
+      <Text numberOfLines={1}>{order.title}</Text>
+      <Text>{order.total}</Text>
+    </Pressable>
+  );
+});
+
+type Props = { orders: Order[]; selectedId: string | null; onSelect: (id: string) => void; isLoading: boolean };
+
+export function OrderList({ orders, selectedId, onSelect, isLoading }: Props) {
+  const renderItem = useCallback<ListRenderItem<Order>>(
+    ({ item }) => <OrderRow order={item} selected={item.id === selectedId} onPress={onSelect} />,
+    [selectedId, onSelect],
+  );
+
+  return (
+    <FlatList
+      data={orders}
+      keyExtractor={(item) => item.id}
+      renderItem={renderItem}
+      extraData={selectedId}
+      getItemLayout={(_, index) => ({ length: ROW_HEIGHT, offset: ROW_HEIGHT * index, index })}
+      ListHeaderComponent={<Text style={{ padding: 16, fontSize: 22, fontWeight: '700' }}>Orders</Text>}
+      ListEmptyComponent={isLoading ? <ActivityIndicator style={{ marginTop: 32 }} /> : <Text style={{ padding: 16 }}>No orders yet</Text>}
+      ItemSeparatorComponent={() => <View style={{ height: 1, backgroundColor: '#e5e7eb' }} />}
+      contentContainerStyle={orders.length === 0 ? { flexGrow: 1 } : undefined}
+    />
+  );
+}
+```
+
+**Why each piece matters:**
+- **`keyExtractor`**: without it, FlatList uses `item.key` and then falls back to the index, with all the index-key problems.
+- **`memo` + stable callbacks**: FlatList re-renders visible rows when its props change. A memoized row with stable props skips work. (The React Compiler can do much of this memoization automatically.)
+- **`extraData`**: FlatList is a `PureComponent`-style list. If rows depend on `selectedId` but `data` didn't change, rows won't update without `extraData`.
+- **`getItemLayout`**: skips measurement, makes `scrollToIndex` reliable, and reduces blank areas. Only use it when heights are truly fixed.
+- **`contentContainerStyle={{ flexGrow: 1 }}`** lets the empty component center itself in the full height.
+- Also useful: `numColumns` (requires a `key` change if it changes dynamically), `initialScrollIndex`, `onViewableItemsChanged` (for analytics impressions and autoplay video), `inverted` (chat), `maintainVisibleContentPosition` (prepending items without jumping).
+
+### How do you implement infinite scroll and pull-to-refresh?
+
+**Short answer:** Use `onEndReached` with an `onEndReachedThreshold` to load the next page, guarded so it doesn't fire duplicate requests, and render a loading footer. For pull-to-refresh, pass `refreshing` and `onRefresh` directly to `FlatList` (or a `RefreshControl` to a `ScrollView`). In production, TanStack Query's `useInfiniteQuery` handles pagination state, deduplication and caching for you.
+
+```tsx title="src/features/feed/FeedScreen.tsx"
+import { FlatList, ActivityIndicator, Text } from 'react-native';
+import { useInfiniteQuery } from '@tanstack/react-query';
+
+type Post = { id: string; body: string };
+type Page = { items: Post[]; nextCursor: string | null };
+
+async function fetchFeed(cursor: string | null): Promise<Page> {
+  const res = await fetch(`https://api.example.com/feed?cursor=${cursor ?? ''}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export function FeedScreen() {
+  const { data, fetchNextPage, hasNextPage, isFetchingNextPage, refetch, isRefetching, isLoading, error } =
+    useInfiniteQuery({
+      queryKey: ['feed'],
+      queryFn: ({ pageParam }) => fetchFeed(pageParam),
+      initialPageParam: null as string | null,
+      getNextPageParam: (last) => last.nextCursor,
+    });
+
+  const posts = data?.pages.flatMap((p) => p.items) ?? [];
+
+  return (
+    <FlatList
+      data={posts}
+      keyExtractor={(p) => p.id}
+      renderItem={({ item }) => <Text style={{ padding: 16 }}>{item.body}</Text>}
+      onEndReached={() => {
+        if (hasNextPage && !isFetchingNextPage) fetchNextPage(); // guard against duplicate calls
+      }}
+      onEndReachedThreshold={0.5} // start loading when half a screen from the end
+      ListFooterComponent={isFetchingNextPage ? <ActivityIndicator style={{ margin: 16 }} /> : null}
+      ListEmptyComponent={isLoading ? <ActivityIndicator /> : error ? <Text>Could not load feed</Text> : <Text>Nothing here</Text>}
+      refreshing={isRefetching}
+      onRefresh={refetch}
+    />
+  );
+}
+```
+
+**Gotchas:**
+- `onEndReached` can fire **multiple times** (momentum scrolling, re-renders) and can fire **on mount** if the first page doesn't fill the screen. Always guard with an in-flight flag and `hasNextPage`.
+- `onEndReachedThreshold` is measured in **visible lengths** (0.5 = half a screen), not pixels or items.
+- Use **cursor-based pagination** from the API. Offset pagination duplicates or skips items when new items are inserted at the top.
+- **Pull-to-refresh on `ScrollView`:** `refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#666" colors={['#2563eb']} />}`. `tintColor` is iOS; `colors` is Android.
+- `refreshing` must be set to `false` when done, otherwise the spinner never goes away. Deriving it from the query state avoids that bug.
+- Deduplicate items by ID when merging pages if the backend can return overlaps.
+
+### When would you reach for FlashList instead of FlatList?
+
+**Short answer:** When a list is long and complex enough that FlatList shows blank cells, dropped frames or high memory use: feeds, chat, product grids, mixed item types. **FlashList** (Shopify) **recycles** cell views instead of unmounting and remounting them, which is much cheaper. Version 2 is built for the New Architecture and no longer needs `estimatedItemSize`. It's nearly a drop-in API replacement for FlatList.
+
+```tsx
+import { FlashList } from '@shopify/flash-list';
+
+<FlashList
+  data={messages}
+  keyExtractor={(m) => m.id}
+  renderItem={({ item }) => (item.type === 'image' ? <ImageMessage message={item} /> : <TextMessage message={item} />)}
+  getItemType={(item) => item.type} // separate recycling pools per item type
+/>
+```
+
+| | FlatList | FlashList v2 |
+|---|---|---|
+| Strategy | Virtualize: unmount off-screen rows, mount new ones | Recycle: reuse off-screen row components with new data |
+| Blank cells on fast scroll | Common for heavy rows | Much rarer |
+| Row local state | Lost when unmounted | **Leaks between items** when recycled unless handled |
+| Setup | Built into RN | Extra dependency; v2 requires the New Architecture |
+
+**The recycling gotcha (a senior-level point):** because a row component instance is reused for a different item, `useState` inside a row keeps the previous item's value. Derive state from props, reset it when the item ID changes, or use FlashList's recycling-aware state helpers. Images may briefly show the previous item's picture unless the image component handles source changes correctly.
+
+**Decision guidance:** start with FlatList for simple lists. Switch to FlashList (or evaluate **LegendList**, another high-performance alternative) when profiling in a **release build** shows list performance problems, or up front for known heavy screens such as feeds and chat. Also fix the basics first: row render cost, image sizes and unnecessary re-renders often matter more than the list component. See the [Performance guide](../guides/performance.html).
+
+## Navigation
+
+### How does navigation work in React Native, and what are stack, tab, and drawer navigators?
+
+**Short answer:** RN has no built-in router. The standard is **React Navigation** (version 7), and **Expo Router** is built on top of it. Navigators are components that manage a navigation state and render screens. A **stack** pushes and pops screens with platform transitions. **Tabs** switch between sibling screens that stay mounted. A **drawer** slides in a side menu. Real apps nest them, e.g. an auth stack, then a tab navigator, each tab with its own stack.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant H as Home screen
+    participant S as Stack navigator
+    participant D as Details screen
+    U->>H: taps an item
+    H->>S: navigate to Details with id 42
+    S->>D: mount and push (slide in)
+    Note over H: stays mounted, receives blur
+    U->>D: back button or swipe back
+    D->>S: goBack()
+    S->>D: pop and unmount
+    S->>H: focus event (state preserved)
+```
+*Figure: Stack push and pop. Screens underneath stay mounted, which matters for effects and memory.*
+
+```tsx title="src/navigation/RootNavigator.tsx"
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+
+export type RootStackParamList = { Tabs: undefined; ProductDetails: { productId: string } };
+type TabParamList = { Home: undefined; Cart: undefined; Profile: undefined };
+
+const Stack = createNativeStackNavigator<RootStackParamList>();
+const Tab = createBottomTabNavigator<TabParamList>();
+
+function Tabs() {
+  return (
+    <Tab.Navigator>
+      <Tab.Screen name="Home" component={HomeScreen} />
+      <Tab.Screen name="Cart" component={CartScreen} />
+      <Tab.Screen name="Profile" component={ProfileScreen} />
+    </Tab.Navigator>
+  );
+}
+
+export function RootNavigator() {
+  return (
+    <NavigationContainer>
+      <Stack.Navigator>
+        <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
+        <Stack.Screen name="ProductDetails" component={ProductDetailsScreen} options={{ title: 'Product' }} />
+      </Stack.Navigator>
+    </NavigationContainer>
+  );
+}
+```
+
+**Senior details:**
+- **Native stack vs JS stack:** `@react-navigation/native-stack` uses native primitives via `react-native-screens` (`UINavigationController` on iOS, fragments on Android), so it gets native transitions, gestures and large titles with better performance. `@react-navigation/stack` is JS-driven and more customizable. Default to native stack.
+- React Navigation 7 offers a **static API** (`createStaticNavigation`, config objects with automatic TypeScript types and deep-link config) alongside the dynamic, component-based API shown above.
+- **Screens stay mounted** in a stack and in visited tabs, so effects keep running. Use `useFocusEffect`/`useIsFocused` for work that should only happen while focused (polling, camera, status bar changes).
+- **Auth flows:** render different screen sets based on auth state (conditional screens) instead of navigating imperatively after login. This prevents "back to login" bugs.
+- The drawer navigator needs Reanimated and Gesture Handler.
+
+### What are the `navigation` and `route` objects, and how do you pass params and go back?
+
+**Short answer:** `navigation` is the API to *act* (`navigate`, `push`, `goBack`, `popTo`, `replace`, `reset`, `setOptions`, `setParams`). `route` describes *the current screen* (`route.name`, `route.params`, `route.key`). Pass params as the second argument to `navigate`/`push`, read them from `route.params`, and keep them **small and serializable**, such as IDs rather than whole objects or functions.
+
+```tsx
+import { useEffect } from 'react';
+import { Pressable } from 'react-native';
+import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { useNavigation } from '@react-navigation/native';
+import type { RootStackParamList } from './RootNavigator';
+
+type Props = NativeStackScreenProps<RootStackParamList, 'ProductDetails'>;
+
+export function ProductDetailsScreen({ route, navigation }: Props) {
+  const { productId } = route.params;              // typed: string
+  const { data: product } = useProduct(productId); // fetch by ID; don't pass the whole object
+
+  useEffect(() => {
+    if (product) navigation.setOptions({ title: product.name });
+  }, [navigation, product]);
+
+  return <ProductView product={product} onClose={() => navigation.goBack()} />;
+}
+
+// Anywhere deeper in the tree:
+function RelatedItem({ id }: { id: string }) {
+  const navigation = useNavigation();
+  return <Pressable onPress={() => navigation.navigate('ProductDetails', { productId: id })} />;
+}
+
+// Make useNavigation() typed globally
+declare global {
+  namespace ReactNavigation {
+    interface RootParamList extends RootStackParamList {}
+  }
+}
+```
+
+| Method | Behavior |
+|---|---|
+| `navigate(name, params)` | Go to a screen; if it's already the focused route, update its params |
+| `push(name, params)` | Always add a new instance (e.g. product → related product → related product) |
+| `goBack()` | Pop the current screen (same as the back button or gesture) |
+| `popTo(name, params)` | Go back to an existing screen in the stack (React Navigation 7) |
+| `popToTop()` | Back to the first screen of the stack |
+| `replace(name, params)` | Swap the current screen (e.g. after onboarding) |
+| `reset(state)` | Replace the whole navigation state (e.g. after logout) |
+
+**Gotchas and senior points:**
+- **React Navigation 7 changed `navigate`:** it no longer jumps back to an earlier instance of the route in the stack. Use `popTo` for that (or `navigate(name, params, { pop: true })`). `navigateDeprecated` exists as a migration aid.
+- **Why serializable params:** navigation state can be persisted and restored, and deep links produce params from URL strings. Objects go stale (the product changes on another screen) and functions trigger a "non-serializable values" warning. Pass IDs and read fresh data from your cache (TanStack Query, store).
+- **Returning data to a previous screen:** use `popTo('Previous', { selected })` or navigate with params back to it, or better, write the result to shared state.
+- For navigation outside components (e.g. from a push notification handler), use a navigation ref (`createNavigationContainerRef`) and wait until the container is ready.
+
+### What is Expo Router, and how does it compare to React Navigation?
+
+**Short answer:** Expo Router is a **file-based router** built on React Navigation. Files in the `app/` directory become routes, `_layout.tsx` files define which navigator (Stack, Tabs, Drawer) wraps a folder, and every screen automatically gets a **URL**, so deep links, universal links and web work without manual linking config. You get React Navigation's native navigators with less wiring and typed routes.
+
+```plaintext
+app/
+  _layout.tsx            root Stack (providers go here)
+  (tabs)/                route group: doesn't appear in the URL
+    _layout.tsx          Tabs navigator
+    index.tsx            "/"          Home tab
+    cart.tsx             "/cart"
+  product/[id].tsx       "/product/42"   dynamic segment
+  settings/index.tsx     "/settings"
+  +not-found.tsx         unmatched routes
+```
+
+```tsx title="app/product/[id].tsx"
+import { Stack, useLocalSearchParams, router } from 'expo-router';
+import { Text, Pressable } from 'react-native';
+
+export default function ProductScreen() {
+  const { id } = useLocalSearchParams<{ id: string }>();
+  return (
+    <>
+      <Stack.Screen options={{ title: `Product ${id}` }} />
+      <Text>Product {id}</Text>
+      <Pressable onPress={() => router.push('/cart')}><Text>Go to cart</Text></Pressable>
+    </>
+  );
+}
+```
+
+| | React Navigation | Expo Router |
+|---|---|---|
+| Route definition | Components/config in code | Files and folders in `app/` |
+| Deep links | Manual `linking` config (automatic with the static API) | Automatic: every screen has a URL |
+| Navigation calls | `navigation.navigate('Product', { id })` | `router.push('/product/42')` or `<Link href="/product/42">` |
+| Web | Possible | First-class (including static rendering and API routes) |
+| Flexibility | Maximum | Conventions; drop down to React Navigation APIs when needed |
+| Requires Expo | No | Uses Expo tooling (works in any Expo/CNG project) |
+
+**Senior points:** protected routes (redirect-based auth guards, or `Stack.Protected` in recent versions), typed routes generated from the file tree, and the fact that URL-first thinking forces you to keep params serializable, which is good practice anyway. See the [Deep Linking & Universal Links guide](../guides/deep-linking.html) for the native side.
+
+## Networking and Data Basics
+
+### `fetch` or axios? How do you structure a request with loading and error states?
+
+**Short answer:** `fetch` is built in (RN implements it on top of the native networking stacks, `NSURLSession` and OkHttp), so it's a fine default. Axios adds conveniences: interceptors (auth headers, token refresh), automatic JSON, timeouts, and **rejecting on non-2xx responses**. Either way, wrap it in a small typed API client, always handle loading, error and empty states, check `response.ok` with `fetch`, and cancel requests that are no longer needed. For server state in screens, use **TanStack Query** (or RTK Query) rather than hand-rolled `useEffect` fetching.
+
+```ts title="src/api/client.ts"
+export class ApiError extends Error {
+  constructor(public status: number, message: string, public body?: unknown) {
+    super(message);
+  }
+}
+
+const BASE_URL = process.env.EXPO_PUBLIC_API_URL ?? 'https://api.example.com';
+
+export async function apiGet<T>(path: string, opts: { token?: string; signal?: AbortSignal; timeoutMs?: number } = {}): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), opts.timeoutMs ?? 15_000);
+  opts.signal?.addEventListener('abort', () => controller.abort());
+
+  try {
+    const res = await fetch(`${BASE_URL}${path}`, {
+      headers: { Accept: 'application/json', ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}) },
+      signal: controller.signal,
+    });
+    const body = res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) throw new ApiError(res.status, `Request failed: ${res.status}`, body); // fetch does NOT throw on 4xx/5xx
+    return body as T;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+```
+
+```tsx
+import { useQuery } from '@tanstack/react-query';
+
+function ProfileScreen() {
+  const { data, isLoading, error, refetch } = useQuery({
+    queryKey: ['me'],
+    queryFn: ({ signal }) => apiGet<{ name: string }>('/me', { signal }),
+  });
+  if (isLoading) return <ActivityIndicator />;
+  if (error) return <ErrorState message="Couldn't load your profile" onRetry={refetch} />;
+  return <Text>{data?.name}</Text>;
+}
+```
+
+| | `fetch` | axios |
+|---|---|---|
+| Dependency | None | Extra package (uses XMLHttpRequest in RN) |
+| HTTP errors | Resolves; check `res.ok` | Rejects on non-2xx by default |
+| JSON | `await res.json()` | Automatic |
+| Timeouts | Via `AbortController` | `timeout` option |
+| Interceptors | Write a wrapper | Built in (handy for token refresh) |
+| Upload progress | Not supported | `onUploadProgress` (XHR-based) |
+
+**Mobile-specific gotchas:**
+- **Plain HTTP is blocked** by default: iOS App Transport Security and Android's cleartext policy (API 28+). The debug config allows local Metro traffic, which is why "works in debug, fails in release" with `http://` URLs happens.
+- **Android emulator** reaches your machine's localhost at `10.0.2.2`; physical devices need your LAN IP or `adb reverse tcp:3000 tcp:3000`.
+- Networks are flaky: add timeouts, retries with backoff for idempotent requests, and offline handling (`@react-native-community/netinfo`, TanStack Query's `onlineManager`).
+- Token refresh must be **single-flight**: when several requests get a 401 at once, refresh once and replay them. See the [Authentication & Sessions guide](../guides/authentication.html).
+
+### What is AsyncStorage, and what should you never store in it?
+
+**Short answer:** `@react-native-async-storage/async-storage` is a simple, **asynchronous, unencrypted, string-only key-value store**. It's fine for small non-sensitive data such as preferences, onboarding flags or a cached filter. **Never store secrets** in it (auth tokens, refresh tokens, passwords, PII, API keys): it's plain data on disk, readable on rooted or jailbroken devices and potentially included in backups. Use the Keychain/Keystore via `react-native-keychain` or `expo-secure-store` for secrets.
+
+```ts title="src/storage/preferences.ts"
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+type Preferences = { theme: 'system' | 'light' | 'dark'; hasSeenOnboarding: boolean };
+const KEY = 'prefs:v1'; // version keys so you can migrate the shape later
+const DEFAULTS: Preferences = { theme: 'system', hasSeenOnboarding: false };
+
+export async function loadPreferences(): Promise<Preferences> {
+  try {
+    const raw = await AsyncStorage.getItem(KEY);
+    return raw ? { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Preferences>) } : DEFAULTS;
+  } catch {
+    return DEFAULTS; // corrupted JSON or storage error: fail safe
+  }
+}
+
+export async function savePreferences(prefs: Preferences): Promise<void> {
+  await AsyncStorage.setItem(KEY, JSON.stringify(prefs));
+}
+```
+
+| Store | Sync? | Encrypted? | Good for |
+|---|---|---|---|
+| AsyncStorage | Async | No | Small preferences and flags |
+| react-native-mmkv | **Sync** (JSI), very fast | Optional (you manage the key) | Preferences, persisted state, caches, anything read at startup |
+| `expo-secure-store` / `react-native-keychain` | Async | Yes (Keychain / Android Keystore) | Tokens, credentials, small secrets |
+| SQLite (`expo-sqlite`, `op-sqlite`), WatermelonDB | Varies | Optional (SQLCipher variants) | Structured, queryable, large or offline data |
+
+**Senior details:**
+- Being async means you can't read it synchronously during the first render. Apps that persist theme or auth in AsyncStorage must gate rendering (splash screen) until it's loaded, or they flash the wrong state. MMKV's synchronous reads avoid this.
+- It stores strings only, so JSON-serialize, and treat parsing failures as expected.
+- Android has a total size cap by default (historically 6 MB, configurable). It isn't designed for large datasets or frequent big writes.
+- Keychain items on iOS **survive app uninstall** unless you clear them on first launch. That's a known source of "logged in after reinstall" bugs.
+- Also worth mentioning: nothing shipped in the JS bundle is secret, even with Hermes bytecode. See the [Security guide](../guides/security.html) and the [Offline Storage & Sync guide](../guides/offline-storage.html).
+
+### How do you manage environment configuration (dev, staging, production)?
+
+**Short answer:** Keep per-environment values (API URLs, feature flags, public keys) outside the code and inject them **at build time**. In Expo, use `EXPO_PUBLIC_*` environment variables (inlined into the bundle) and a dynamic `app.config.ts` for native values such as bundle ID and app name per variant, with EAS build profiles and environment variables. In bare apps, use `react-native-config` (values available to both JS and native), backed by Android product flavors and iOS schemes/configurations. And remember: **everything in the JS bundle is public**.
+
+```ts title="app.config.ts"
+import type { ExpoConfig } from 'expo/config';
+
+const variant = process.env.APP_VARIANT ?? 'development'; // set per EAS build profile
+const suffix = variant === 'production' ? '' : `.${variant}`;
+
+const config: ExpoConfig = {
+  name: variant === 'production' ? 'Acme' : `Acme (${variant})`,
+  slug: 'acme',
+  ios: { bundleIdentifier: `com.acme.app${suffix}` },
+  android: { package: `com.acme.app${suffix}` },
+  extra: { variant },
+};
+
+export default config;
+```
+
+```properties title=".env.staging"
+EXPO_PUBLIC_API_URL=https://staging-api.acme.com
+EXPO_PUBLIC_SENTRY_DSN=https://public@sentry.example.com/1
+```
+
+**Practices a senior should mention:**
+- **Different bundle IDs / application IDs per environment** so dev, staging and prod install side by side, each with its own push credentials, deep-link domains and analytics project.
+- **No secrets in the app**: API secrets, database credentials and signing keys stay on the server or in CI secrets. Public identifiers (Sentry DSN, Stripe publishable key) are fine.
+- `EXPO_PUBLIC_*` values are inlined at **bundle time**, so changing them requires a new build or OTA update. Access them as `process.env.EXPO_PUBLIC_API_URL` literally (no destructuring or dynamic keys), or they won't be inlined.
+- Validate config at startup (e.g. with zod) and fail loudly in non-production builds when a value is missing.
+- Runtime-changeable behavior (kill switches, rollouts) belongs in **remote config / feature flags**, not in build-time env vars.
+- Details on build variants, signing and CI live in the [Deployment, Signing & CI/CD guide](../guides/deployment.html).
+
+## Debugging and Tooling
+
+### How do you debug a React Native app today?
+
+**Short answer:** **React Native DevTools** is the default debugger (since RN 0.76). It's a Chrome DevTools-based frontend that connects directly to Hermes, with Console, Sources (breakpoints, stepping), Memory and the React Components/Profiler tabs built in. You open it from the **Dev Menu** or by pressing `j` in the Metro terminal. **LogBox** shows warnings and errors in-app. For native crashes and logs, use Xcode's console and Android Studio's Logcat (`adb logcat`).
+
+| Tool | What it's for | How to open |
+|---|---|---|
+| React Native DevTools | Breakpoints, console, React component tree, profiling, heap snapshots | Dev Menu, then "Open DevTools", or `j` in Metro |
+| Dev Menu | Reload, open DevTools, toggle Perf Monitor, element inspector | iOS Simulator: Cmd+D. Android emulator: Cmd+M / Ctrl+M. Device: shake, or `adb shell input keyevent 82` |
+| LogBox | In-app warnings (yellow) and errors/redboxes with symbolicated stacks | Automatic in debug |
+| Perf Monitor | JS and UI frame rates, RAM | Dev Menu |
+| Element Inspector | Tap a view to see its styles and component hierarchy | Dev Menu |
+| Xcode / Logcat | Native logs, native crashes, memory tools (Instruments, Android Profiler) | Run from Xcode / Android Studio |
+
+```tsx
+import { LogBox } from 'react-native';
+
+// Silence a known, tracked third-party warning (never blanket-ignore everything)
+LogBox.ignoreLogs(['Some library: deprecated prop']);
+```
+
+**Senior details:**
+- **Remote "Debug JS in Chrome" is gone.** It ran JS in the browser's engine rather than on the device, which caused engine-specific bugs and broke synchronous native calls. **Flipper** was removed from the template in 0.74. Answers built around either sound dated.
+- In recent versions (0.77+), `console.log` output doesn't stream to the Metro terminal in the default community CLI setup; read logs in DevTools. Recent DevTools releases also add network and performance inspection.
+- For network debugging, use DevTools where available, a proxy (Charles, Proxyman), or Reactotron. For release-build crashes, use **Sentry/Crashlytics with uploaded source maps and dSYMs** (see the [Monitoring guide](../guides/monitoring.html)).
+- **Debug in debug, measure in release.** Performance profiling of JS should use a release-like build (the React profiler works in profiling builds); dev mode is many times slower.
+- A good debugging approach: reproduce reliably, isolate JS vs native (does it crash with a redbox or a native crash log?), check recent dependency changes, then bisect.
+
+### What are the go-to fixes when the app won't build or run?
+
+**Short answer:** Most "it worked yesterday" failures are stale caches or out-of-sync native dependencies. Reset Metro's cache, reinstall `node_modules`, re-run `pod install` for iOS, clean Gradle for Android, and rebuild the native app (not just reload JS) after adding any library with native code. In Expo CNG projects, `npx expo prebuild --clean` regenerates the native folders.
+
+```bash
+# Metro cache (stale transforms, "change not showing", weird resolution errors)
+npx react-native start --reset-cache
+npx expo start -c                      # Expo equivalent
+
+# JS dependencies
+rm -rf node_modules && npm install     # or yarn / pnpm / bun
+
+# iOS native dependencies
+cd ios && bundle exec pod install && cd ..      # after adding/updating native libraries
+cd ios && pod install --repo-update && cd ..    # when a pod version can't be found
+rm -rf ~/Library/Developer/Xcode/DerivedData    # nuclear option for Xcode build weirdness
+
+# Android
+cd android && ./gradlew clean && cd ..
+adb reverse tcp:8081 tcp:8081          # physical device can't reach Metro over USB
+
+# Health checks
+npx react-native doctor
+npx expo-doctor                        # Expo: checks dependency versions and config
+npx expo install --check               # align library versions with the SDK
+```
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| "Unable to resolve module" after installing a package | Metro cache or a missing install | Reset cache; confirm the package is in `package.json` |
+| Native module is null / "TurboModule not found" | Library added but app not rebuilt | Rebuild the native app (`run-ios` / `run-android` / EAS dev build) |
+| iOS build: "No such module" / pod errors | Pods out of date, or opened `.xcodeproj` | `pod install`; open the `.xcworkspace` |
+| Android build: duplicate classes, Gradle cache errors | Stale build outputs or version conflicts | `./gradlew clean`; check library versions |
+| "Application has not been registered" | Registered name mismatch, or JS crashed before registering | Check `app.json` name vs native; look for earlier errors |
+| App shows old code | Wrong Metro instance, or a release build embedding an old bundle | Kill other Metro processes; rebuild |
+
+> [!TIP]
+> After upgrading React Native, use the official Upgrade Helper diff (bare) or `npx expo install expo@latest` followed by `npx expo install --fix` (Expo) instead of piecemeal fixes. Half-applied upgrades cause most of the hard build errors.
+
+### What are the differences between debug and release builds?
+
+**Short answer:** Debug builds load JS from Metro, run in development mode (`__DEV__` is `true`) with extra checks, warnings, LogBox and Fast Refresh, and are unoptimized. Release builds embed a minified bundle precompiled to Hermes bytecode, set `__DEV__` to `false`, strip dev tooling, enable native optimizations (and R8 on Android if configured), and are signed with release credentials. That's why **performance must be measured in release**, and why some bugs appear only in release.
+
+| Aspect | Debug | Release |
+|---|---|---|
+| JS source | Served by Metro over the network | Embedded in the binary as Hermes bytecode |
+| `__DEV__` | `true` | `false` |
+| Dev tooling | Dev Menu, Fast Refresh, LogBox, DevTools | None |
+| Performance | Slow: dev-mode React checks, no bytecode precompile | Representative of production |
+| Native compilation | Debuggable, unoptimized | Optimized; Android code shrinking with R8 (if enabled) |
+| Signing | Debug keystore / development certificate | Upload keystore / distribution certificate |
+| Cleartext HTTP (Android) | Allowed by the debug manifest (for Metro) | Blocked unless explicitly configured |
+
+```bash
+npx react-native run-android --mode release
+npx react-native run-ios --mode Release
+npx expo run:android --variant release
+npx expo run:ios --configuration Release
+```
+
+**Release-only bugs to anticipate:**
+- **R8/ProGuard** strips or renames classes used via reflection by a native library. Fix with keep rules from the library's docs.
+- **HTTP URLs** fail because cleartext was only allowed in debug.
+- **Code that depends on `__DEV__`** or dev-only polyfills behaves differently.
+- **Timing differences:** release is faster, exposing race conditions hidden by slow debug builds.
+- **Missing env config** or a wrong API URL for the release variant.
+- **Large `console.log` calls** still execute in release and cost performance. Strip them with a Babel plugin (`transform-remove-console`) or a logger that's silenced in production.
+
+Always smoke-test a release build (on a real, ideally low-end, Android device) before shipping. See the [Deployment, Signing & CI/CD guide](../guides/deployment.html).
+
+## Platform Basics
+
+### How do you track whether the app is in the foreground or background?
+
+**Short answer:** Use **`AppState`**. `AppState.currentState` gives the current state, and `AppState.addEventListener('change', ...)` notifies you of transitions between `active`, `background` and, on iOS only, `inactive`. Typical uses: refetch data or re-check permissions when the app returns to the foreground, pause media and timers when it leaves, and hide sensitive content before the iOS app switcher snapshot.
+
+```mermaid
+stateDiagram-v2
+    [*] --> active : app launched
+    active --> inactive : iOS only - app switcher or incoming call
+    inactive --> active : user returns
+    inactive --> background : app hidden
+    active --> background : home button or switching apps
+    background --> active : user reopens the app
+    background --> [*] : OS terminates the process
+```
+*Figure: AppState transitions. `inactive` is an iOS-only transitional state.*
+
+```tsx title="src/hooks/useAppForeground.ts"
+import { useEffect, useRef } from 'react';
+import { AppState, type AppStateStatus } from 'react-native';
+
+export function useOnForeground(callback: () => void) {
+  const appState = useRef<AppStateStatus>(AppState.currentState);
+  const cb = useRef(callback);
+  cb.current = callback;
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (next) => {
+      if (appState.current.match(/inactive|background/) && next === 'active') cb.current();
+      appState.current = next;
+    });
+    return () => sub.remove();
+  }, []);
+}
+
+// Usage: re-check notification permission after the user returns from Settings
+useOnForeground(() => { void refreshPermissionStatus(); });
+```
+
+**Senior details:**
+- **Background doesn't mean running.** iOS suspends your process shortly after it's backgrounded, and Android may freeze or kill it. JS timers stop. Real background work needs OS-sanctioned mechanisms (background fetch, WorkManager, background location, push). See the [Background Tasks guide](../guides/background-tasks.html).
+- **Privacy screen:** iOS takes the app switcher snapshot around the `inactive` transition. Banking apps render a blur overlay on `inactive` and remove it on `active`. On Android, `FLAG_SECURE` (native) is the equivalent and also blocks screenshots.
+- Android also emits `focus`/`blur` events (e.g. when the notification shade is pulled down) without changing `AppState`.
+- TanStack Query can refetch on foreground by wiring `focusManager` to `AppState`.
+- There's a `memoryWarning` event. Use it to clear caches (images, in-memory data).
+
+### How do you handle the Android back button?
+
+**Short answer:** React Navigation already handles the hardware back button and back gesture (it pops the stack, or exits at the root). For custom behavior, register a `BackHandler` `hardwareBackPress` listener that returns `true` to consume the event or `false` to let the default happen, and register it only while the screen is **focused** (`useFocusEffect`). For "unsaved changes" prompts, prefer React Navigation's `usePreventRemove`, which also covers the iOS swipe gesture and header back button.
+
+```tsx
+import { useCallback } from 'react';
+import { Alert, BackHandler } from 'react-native';
+import { useFocusEffect, useNavigation, usePreventRemove } from '@react-navigation/native';
+
+// Custom handling on one screen, e.g. close an in-screen panel first
+export function useCloseOnBack(isPanelOpen: boolean, closePanel: () => void) {
+  useFocusEffect(
+    useCallback(() => {
+      const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+        if (!isPanelOpen) return false; // not handled: let navigation pop the screen
+        closePanel();
+        return true;                    // handled: stop propagation
+      });
+      return () => sub.remove();
+    }, [isPanelOpen, closePanel]),
+  );
+}
+
+// Unsaved changes: covers hardware back, gestures and the header back button
+export function useConfirmDiscard(hasUnsavedChanges: boolean) {
+  const navigation = useNavigation();
+  usePreventRemove(hasUnsavedChanges, ({ data }) => {
+    Alert.alert('Discard changes?', 'You have unsaved changes.', [
+      { text: 'Keep editing', style: 'cancel' },
+      { text: 'Discard', style: 'destructive', onPress: () => navigation.dispatch(data.action) },
+    ]);
+  });
+}
+```
+
+**Details:**
+- Listeners run in **reverse registration order** (last registered first); the first one returning `true` stops the chain.
+- `BackHandler.exitApp()` exists, but exiting on back from the root is already the default. Don't override root behavior without a UX reason ("press back again to exit" is a common but debatable pattern).
+- Use `sub.remove()`; the old `BackHandler.removeEventListener` API was removed.
+- `Modal` has its own `onRequestClose` for the back button.
+- **Predictive back** (the system back animation, default for apps targeting recent Android SDKs) changes how back events are dispatched. Verify that your RN and navigation versions support it, and test the back gesture on current Android versions.
+
+### How do you open external URLs, the dialer, email, or the app's settings?
+
+**Short answer:** Use the **`Linking`** API. `Linking.openURL()` hands a URL to the OS (`https:`, `tel:`, `mailto:`, `sms:`, `geo:`, other apps' schemes), and `Linking.openSettings()` opens your app's settings page (essential after a permission is permanently denied). For checking whether a URL can be handled, both platforms require you to **declare the schemes/intents you query**. For web content that should stay in-app (terms pages, OAuth), use an in-app browser (`expo-web-browser`), which uses `SFSafariViewController` / Chrome Custom Tabs.
+
+```ts title="src/utils/links.ts"
+import { Alert, Linking } from 'react-native';
+
+export async function openExternal(url: string) {
+  try {
+    await Linking.openURL(url); // rejects if no app can handle it
+  } catch {
+    Alert.alert('Cannot open link', url);
+  }
+}
+
+export const callSupport = () => openExternal('tel:+18005551234');
+export const emailSupport = () => openExternal('mailto:support@example.com?subject=Help');
+export const openAppSettings = () => Linking.openSettings();
+```
+
+| Concern | iOS | Android |
+|---|---|---|
+| `canOpenURL` for custom schemes | Declare schemes in `LSApplicationQueriesSchemes` (`Info.plist`), otherwise it returns `false` | Android 11+ package visibility: declare `<queries>` intents in `AndroidManifest.xml` |
+| `tel:` on simulators/emulators | Not supported on the iOS Simulator | Opens the dialer on emulators with a phone app |
+| Settings | `openSettings()` opens your app's page in Settings | Opens your app's details screen; `Linking.sendIntent` for specific screens |
+
+**Related (incoming links):** `Linking.getInitialURL()` returns the URL that cold-started the app, and `Linking.addEventListener('url', ...)` handles links while it's running. Navigation libraries wrap both. The full setup (custom schemes, Universal Links, App Links, deferred deep links) is in the [Deep Linking & Universal Links guide](../guides/deep-linking.html).
+
+> [!TIP]
+> Prefer calling `openURL` in a try/catch over checking `canOpenURL` first. It avoids the query-declaration requirements for the common case and handles failure the same way.
+
+### How do runtime permissions work in React Native, at a high level?
+
+**Short answer:** Both platforms require you to **declare** a permission in native config and **request** it at runtime for sensitive capabilities (camera, location, notifications, contacts). On iOS you add a usage description string to `Info.plist` (e.g. `NSCameraUsageDescription`); the system prompt appears **once**, and after a denial the user can only change it in Settings. On Android you declare `<uses-permission>` in the manifest and request "dangerous" permissions at runtime (Android 6+), which can be denied permanently after repeated refusals. Use `react-native-permissions` or the Expo module's permission APIs for one cross-platform flow.
+
+```tsx
+import { PermissionsAndroid, Platform } from 'react-native';
+import { useCameraPermissions } from 'expo-camera';
+
+// Core API: Android only
+async function requestAndroidCamera(): Promise<boolean> {
+  if (Platform.OS !== 'android') return true;
+  const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA, {
+    title: 'Camera access',
+    message: 'We use the camera to scan receipts.',
+    buttonPositive: 'Continue',
+  });
+  return result === PermissionsAndroid.RESULTS.GRANTED; // other values: DENIED, NEVER_ASK_AGAIN
+}
+
+// Expo module API: both platforms
+function ScanButton() {
+  const [permission, requestPermission] = useCameraPermissions();
+  // permission?.granted, permission?.canAskAgain -> if false, send the user to Linking.openSettings()
+}
+```
+
+**Principles a senior states:**
+- **Ask in context, not at launch.** Ask when the user taps "Scan receipt", optionally after a short in-app explanation ("priming") that improves acceptance and protects your one iOS prompt.
+- **Handle every state:** undetermined, granted, denied (can ask again), blocked/never-ask-again (send the user to Settings), limited (iOS photo library, Android 14 partial media access), and approximate location.
+- **Missing iOS usage strings crash the app** when the API is accessed, and vague strings get rejected in App Store review.
+- Permissions change outside your app. Re-check on foreground (`AppState`), don't cache "granted" forever.
+- Version-specific rules keep changing (Android 13 notification permission and granular media permissions, Android 14 partial photo access). The details live in the [Permissions guide](../guides/permissions.html).
+
+### What are the accessibility basics every React Native screen should get right?
+
+**Short answer:** Give interactive elements an **`accessibilityRole`** and a meaningful **`accessibilityLabel`** (plus `accessibilityHint` when the result isn't obvious), expose state with **`accessibilityState`** (disabled, selected, checked, expanded), make touch targets at least **44×44 pt (iOS) / 48×48 dp (Android)** using padding or `hitSlop`, respect font scaling, and test with **VoiceOver and TalkBack**. RN maps these props to the native accessibility APIs, so doing them right gives real screen-reader support.
+
+```tsx
+import { Pressable, Text, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
+
+function IconButton({ onPress, liked }: { onPress: () => void; liked: boolean }) {
+  return (
+    <Pressable
+      onPress={onPress}
+      hitSlop={12}                                  // 24pt icon + 12pt on each side = 48pt target
+      accessibilityRole="button"
+      accessibilityLabel={liked ? 'Unlike post' : 'Like post'}
+      accessibilityState={{ selected: liked }}
+    >
+      <Ionicons name={liked ? 'heart' : 'heart-outline'} size={24} />
+    </Pressable>
+  );
+}
+
+// Group related text into one focusable element: read as "Order 1042, shipped, 3 items"
+function OrderSummary() {
+  return (
+    <View accessible accessibilityLabel="Order 1042, shipped, 3 items">
+      <Text>Order #1042</Text>
+      <Text>Shipped</Text>
+      <Text>3 items</Text>
+    </View>
+  );
+}
+```
+
+| Prop / API | Purpose |
+|---|---|
+| `accessibilityRole` / `role` | What the element is: `button`, `link`, `header`, `image`, `switch`, `tab`, and so on |
+| `accessibilityLabel` / `aria-label` | What the screen reader says (required for icon-only buttons) |
+| `accessibilityHint` | What happens on activation, when not obvious |
+| `accessibilityState` / `aria-*` | `disabled`, `selected`, `checked`, `busy`, `expanded` |
+| `accessible` | Groups children into one focusable element |
+| `accessibilityElementsHidden` (iOS), `importantForAccessibility` (Android), `aria-hidden` | Hide decorative elements |
+| `AccessibilityInfo` | `isScreenReaderEnabled()`, `isReduceMotionEnabled()`, `announceForAccessibility()` |
+
+**Gotchas:**
+- On Android, `hitSlop` can't extend a touch area **beyond the parent's bounds**. Use padding for reliable targets in tight layouts.
+- Don't disable `allowFontScaling` globally. Use `maxFontSizeMultiplier` for constrained UI and make layouts wrap.
+- Mark section titles with `accessibilityRole="header"` so screen-reader users can jump between them.
+- Respect **reduce motion** for large animations (Reanimated's `useReducedMotion`).
+- ARIA-style props (`role`, `aria-label`, `aria-disabled`, and so on) are supported as aliases in modern RN, which helps code shared with the web.
+- Tests using React Native Testing Library's `getByRole`/`getByLabelText` double as accessibility checks (see the [Testing Strategy guide](../guides/testing.html)).
+
+> [!INTERVIEW]
+> What a senior answer includes: roles, labels and states, target sizes, font scaling, grouping, reduce motion, and actually testing with VoiceOver/TalkBack. Red flag: treating accessibility as "adding testIDs". `testID` is for automation, not screen readers.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

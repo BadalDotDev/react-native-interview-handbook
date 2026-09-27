@@ -1,0 +1,4060 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Coding Challenges · React Native Interview Handbook</title>
+<meta name="description" content="These are the hands-on exercises senior React Native candidates get in live rounds: custom hooks, UI components, data and state logic, &quot;find the bug&quot; reviews and JavaScript…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Live Coding Challenges · React Native Interview Handbook">
+<meta property="og:description" content="These are the hands-on exercises senior React Native candidates get in live rounds: custom hooks, UI components, data and state logic, &quot;find the bug&quot; reviews and JavaScript…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="questions/coding-challenges.html" data-type="qa">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Live Coding Challenges
+
+These are the hands-on exercises senior React Native candidates get in live rounds: custom hooks, UI components, data and state logic, "find the bug" reviews and JavaScript output puzzles. Each card gives the task, what the interviewer is actually scoring, a complete TypeScript solution, a walkthrough of the design decisions and the follow-ups to expect. Say your trade-offs out loud as you code, because that reasoning is much of what gets scored.
+
+## Custom hooks
+
+### Build `useDebounce` for values and `useDebouncedCallback` for functions
+
+**Task:** Implement two hooks. `useDebounce(value, delay)` returns `value` only after it has stopped changing for `delay` ms. `useDebouncedCallback(fn, delay)` returns a **stable** function that postpones calling `fn` until `delay` ms have passed since the last call. It must always call the *latest* `fn` (no stale props), expose `cancel()` and `flush()`, and never fire after the component unmounts unless the caller explicitly asks for a flush on unmount.
+
+#### What the interviewer evaluates
+
+- Effect cleanup: does each value change clear the previous timer?
+- Stale closures: does the debounced function see current props and state *without* being re-created on every render? Re-creating it would reset the timer on every keystroke.
+- Referential stability of the returned function, so it is safe to pass to memoized children or effect deps.
+- Unmount safety and Strict Mode behaviour (in development, effects run mount, unmount, mount).
+- Knowing when to debounce a *value* (a derived query that drives fetching) and when to debounce a *callback* (autosave, analytics, validation).
+
+#### Solution
+
+```ts title="src/hooks/useDebounce.ts"
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+
+export function useDebounce<T>(value: T, delay = 300): T {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(id);
+  }, [value, delay]);
+
+  return debounced;
+}
+
+export interface DebouncedFunction<A extends unknown[]> {
+  (...args: A): void;
+  cancel: () => void;
+  flush: () => void;
+  isPending: () => boolean;
+}
+
+export function useDebouncedCallback<A extends unknown[]>(
+  callback: (...args: A) => void,
+  delay = 300,
+  { flushOnUnmount = false }: { flushOnUnmount?: boolean } = {},
+): DebouncedFunction<A> {
+  const callbackRef = useRef(callback);
+  const flushOnUnmountRef = useRef(flushOnUnmount);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const argsRef = useRef<A | null>(null);
+
+  // Track the latest callback/options after every commit without
+  // changing the identity of the debounced function.
+  useLayoutEffect(() => {
+    callbackRef.current = callback;
+    flushOnUnmountRef.current = flushOnUnmount;
+  });
+
+  const debounced = useMemo(() => {
+    const invoke = () => {
+      const args = argsRef.current;
+      timerRef.current = null;
+      argsRef.current = null;
+      if (args) callbackRef.current(...args);
+    };
+
+    const fn = ((...args: A) => {
+      argsRef.current = args;
+      if (timerRef.current != null) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(invoke, delay);
+    }) as DebouncedFunction<A>;
+
+    fn.cancel = () => {
+      if (timerRef.current != null) clearTimeout(timerRef.current);
+      timerRef.current = null;
+      argsRef.current = null;
+    };
+    fn.flush = () => {
+      if (timerRef.current == null) return;
+      clearTimeout(timerRef.current);
+      invoke();
+    };
+    fn.isPending = () => timerRef.current != null;
+    return fn;
+  }, [delay]);
+
+  // On unmount (or when delay changes): drop or flush the pending call.
+  useEffect(
+    () => () => {
+      if (flushOnUnmountRef.current) debounced.flush();
+      else debounced.cancel();
+    },
+    [debounced],
+  );
+
+  return debounced;
+}
+```
+
+Usage: an autosaving editor that must not lose the last edit when the user navigates away.
+
+```tsx title="src/screens/NoteEditor.tsx"
+import React, { useState } from 'react';
+import { TextInput } from 'react-native';
+import { useDebouncedCallback } from '../hooks/useDebounce';
+import { saveNote } from '../api/notes';
+
+export function NoteEditor({ noteId, initialBody }: { noteId: string; initialBody: string }) {
+  const [body, setBody] = useState(initialBody);
+  const save = useDebouncedCallback((text: string) => saveNote(noteId, text), 800, {
+    flushOnUnmount: true,
+  });
+
+  return (
+    <TextInput
+      multiline
+      value={body}
+      onChangeText={(text) => {
+        setBody(text); // the input stays controlled and instant
+        save(text); // only the network call is debounced
+      }}
+    />
+  );
+}
+```
+
+#### Walkthrough
+
+- **`useDebounce`**: every value change schedules a timer, and the effect cleanup clears the previous one, so only the last value that "survives" `delay` ms is committed. The first render returns the initial value immediately. Changing `delay` restarts the wait.
+- **Why the callback lives in a ref**: if `callback` were a `useMemo` dependency, an inline arrow function would produce a new debounced function on every render, and the cleanup effect would cancel the pending timer each time. The call would either never fire or fire once per keystroke. The ref separates *what to call* (always the latest) from *the timer* (stable).
+- **Why `useLayoutEffect` and not assignment during render**: writing `ref.current` during render is unsafe under concurrent rendering, because a render can be thrown away, and the React Compiler lint flags it. A layout effect runs synchronously after commit, before any user event can call the function.
+- **Unmount ordering gotcha**: effect cleanups run in declaration order. If the hook always cancelled on unmount and the component tried to `flush()` in its own cleanup, the hook's cancel would run first and the flush would find nothing to send. That is why flush-on-unmount is an option *inside* the hook.
+- **Cost**: O(1) per call and one timer at a time. On iOS the JS thread is suspended shortly after the app is backgrounded, so a pending debounce fires on resume. For autosave, also flush on the `AppState` `background` transition.
+
+#### Follow-ups
+
+- **"Add `leading` and `maxWait`."** Leading: invoke immediately if no timer is pending, then suppress until quiet. `maxWait`: record the time of the first call in a burst and force an invoke once it is exceeded. This guarantees progress during continuous typing (lodash semantics).
+- **"Why not `useMemo(() => lodash.debounce(fn, 300), [])`?"** It works only if `fn` never changes. Otherwise it captures stale props. You still need the latest-callback ref and a `cancel()` on unmount.
+- **"Can `useEffectEvent` replace the ref?"** `useEffectEvent` is stable since React 19.2, but Effect Events may only be called from inside effects. They must not be passed to `onChangeText` or other components, so the ref pattern is still correct for event-handler debouncing.
+- **"How do you test it?"** Use `renderHook` from React Native Testing Library with `jest.useFakeTimers()`. Call the function several times, run `act(() => jest.advanceTimersByTime(300))`, then assert a single call with the last arguments. Also unmount and assert no call.
+
+### Build `useThrottle` for a fast-changing value
+
+**Task:** Implement `useThrottle(value, interval)`. The first change must go through immediately (leading edge), then at most one update per `interval` ms, and the final value must always be delivered (trailing edge) so the UI never ends on a stale intermediate value. Typical use is a slider or scroll-derived value that drives an expensive render or a network call. Then give a callback version for event handlers.
+
+#### What the interviewer evaluates
+
+- Can you explain debounce versus throttle, and leading versus trailing edges?
+- Correct remaining-time math, rather than a fixed timer that ignores when the last emission happened.
+- Cleanup, and never dropping the final value.
+- Knowing that animation-grade work (60–120 fps) should not be throttled through React state at all. It belongs on the UI thread with Reanimated shared values.
+
+#### Solution
+
+```ts title="src/hooks/useThrottle.ts"
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { throttle } from '../lib/timing'; // implemented in the "from scratch" challenge below
+
+export function useThrottle<T>(value: T, interval = 200): T {
+  const [throttled, setThrottled] = useState(value);
+  const lastEmit = useRef(0);
+
+  useEffect(() => {
+    const elapsed = Date.now() - lastEmit.current;
+
+    if (elapsed >= interval) {
+      // Leading edge: the window is open, emit now.
+      lastEmit.current = Date.now();
+      setThrottled(value);
+      return;
+    }
+
+    // Trailing edge: emit the latest value when the current window closes.
+    const id = setTimeout(() => {
+      lastEmit.current = Date.now();
+      setThrottled(value);
+    }, interval - elapsed);
+
+    return () => clearTimeout(id);
+  }, [value, interval]);
+
+  return throttled;
+}
+
+export function useThrottledCallback<A extends unknown[]>(
+  callback: (...args: A) => void,
+  interval = 200,
+) {
+  const callbackRef = useRef(callback);
+  useLayoutEffect(() => {
+    callbackRef.current = callback;
+  });
+
+  const throttled = useMemo(
+    () => throttle((...args: A) => callbackRef.current(...args), interval),
+    [interval],
+  );
+
+  useEffect(() => () => throttled.cancel(), [throttled]);
+  return throttled;
+}
+```
+
+Usage: report scroll depth to analytics at most every 500 ms.
+
+```tsx
+const reportDepth = useThrottledCallback((y: number) => analytics.track('feed_scroll', { y }), 500);
+
+<FlatList
+  onScroll={(e) => reportDepth(e.nativeEvent.contentOffset.y)}
+  scrollEventThrottle={16}
+  /* ... */
+/>;
+```
+
+#### Walkthrough
+
+- The effect runs after each committed change of `value`. If a full window has elapsed, it emits immediately. Otherwise it schedules a timer for the **remaining** part of the window. Each newer value cancels that timer (cleanup) and schedules a new one for the same window end. The trailing emission therefore lands exactly when the window closes, carrying the latest value.
+- On mount, `lastEmit` is `0`, so the effect "emits" the initial value. React bails out because the value is identical, and the window starts.
+- **Where throttling actually helps**: `useThrottle` protects *consumers* of the throttled value (an expensive child tree, a request). The component that owns the raw value still re-renders on every change. If the source is `onScroll` firing at 60 fps, throttle the **handler** with `useThrottledCallback` instead of storing every offset in state.
+- For visual scroll-linked effects (headers, parallax), use Reanimated's `useAnimatedScrollHandler` so nothing goes through the JS thread. See the [Performance guide](../guides/performance.html).
+
+#### Follow-ups
+
+- **"Throttle or debounce for search-as-you-type?"** Debounce, because you want the pause. Throttle suits continuous feedback: live location uploads, progress persistence, scroll analytics.
+- **"Throttle to animation frames?"** Coalesce updates with `requestAnimationFrame`, keeping only the latest value per frame. It is still JS-thread work, so it is fine for layout-affecting state and wrong for animations.
+- **"`Date.now()` or `performance.now()`?"** `performance.now()` is monotonic and immune to clock changes, which is preferable for short intervals. Either is acceptable in a throttle, but a clock change could stall a `Date.now()`-based window.
+
+### Implement `useInterval` whose delay can change at runtime
+
+**Task:** Write `useInterval(callback, delay)` where `delay` can change while running (a speed control) and `null` pauses it. The callback must always see fresh state and props, and the interval must **not** reset on every render. This is the Dan Abramov "declarative setInterval" pattern.
+
+#### What the interviewer evaluates
+
+- Can you explain why the naive `setInterval` in `useEffect` is broken (a stale closure, or a reset on every render)?
+- Refs used as mutable instance variables.
+- Separating *what to run* (the latest callback) from *when to run* (the delay).
+- Pausing via `null`, cleanup, and knowing that intervals are not clocks.
+
+#### Solution
+
+```ts title="src/hooks/useInterval.ts"
+import { useEffect, useLayoutEffect, useRef } from 'react';
+
+export function useInterval(callback: () => void, delay: number | null): void {
+  const savedCallback = useRef(callback);
+
+  // Remember the latest callback after every commit.
+  useLayoutEffect(() => {
+    savedCallback.current = callback;
+  }, [callback]);
+
+  // (Re)start the interval only when the delay changes; null pauses.
+  useEffect(() => {
+    if (delay === null) return;
+    const id = setInterval(() => savedCallback.current(), delay);
+    return () => clearInterval(id);
+  }, [delay]);
+}
+```
+
+```tsx title="src/components/AutoCounter.tsx"
+import React, { useState } from 'react';
+import { Button, Text, View } from 'react-native';
+import { useInterval } from '../hooks/useInterval';
+
+export function AutoCounter() {
+  const [count, setCount] = useState(0);
+  const [delay, setDelay] = useState(1000);
+  const [running, setRunning] = useState(true);
+
+  // Reading `count` directly is fine: the hook always calls the latest closure.
+  useInterval(() => setCount(count + 1), running ? delay : null);
+
+  return (
+    <View>
+      <Text accessibilityRole="text">{count}</Text>
+      <Button title="Faster" onPress={() => setDelay((d) => Math.max(100, d / 2))} />
+      <Button title="Slower" onPress={() => setDelay((d) => d * 2)} />
+      <Button title={running ? 'Pause' : 'Resume'} onPress={() => setRunning((r) => !r)} />
+    </View>
+  );
+}
+```
+
+#### Walkthrough
+
+- **Naive version A**: `useEffect(() => { const id = setInterval(() => setCount(count + 1), 1000); return () => clearInterval(id); }, [])`. The callback captured `count = 0` forever, so the counter sticks at 1.
+- **Naive version B**: adding `[count]` to the deps tears down and recreates the interval on every tick. That "works", but any unrelated re-render also resets the timer. With frequent re-renders (typing, animations) the interval may never fire, and the period drifts.
+- **The ref pattern**: the interval subscribes once per `delay`. Each tick calls `savedCallback.current`, which is always the closure from the latest render, so it sees fresh state without resubscribing.
+- Changing the delay restarts the period from zero, so the elapsed partial period is lost. That is usually acceptable, and it is worth mentioning.
+- `setInterval` is a *request*, not a clock. Ticks are delayed by a busy JS thread and paused while the app is suspended in the background. Anything that must show real elapsed time should be computed from timestamps (see `useCountdown` below).
+
+#### Follow-ups
+
+- **"Fire immediately when started?"** Add an `immediate` flag and call `savedCallback.current()` before `setInterval` inside the effect.
+- **"Poll an API every 10 s without overlapping requests?"** Use a recursive `setTimeout` that schedules the next run only after the awaited request settles. Guard it with an `active` flag and an `AbortController` in cleanup. `setInterval` can stack requests when the server is slow.
+- **"`useTimeout`?"** Use the same ref pattern with `setTimeout`, plus `reset()` and `clear()` functions returned from the hook.
+
+### Implement `usePrevious`, and explain its two possible meanings
+
+**Task:** Implement `usePrevious(value)` that returns the value from the previous render. Then explain the difference between "value at the previous render" and "previous *distinct* value", and implement the latter in a way that is safe under concurrent rendering.
+
+#### What the interviewer evaluates
+
+- Render versus commit, and when effects run relative to the returned value.
+- That refs don't trigger renders, and that reading refs during render is discouraged.
+- The React-docs pattern for "storing information from previous renders" (a guarded `setState` during render).
+- Choosing the right semantics for the use case (animations, transition detection).
+
+#### Solution
+
+```ts title="src/hooks/usePrevious.ts"
+import { useEffect, useRef, useState } from 'react';
+
+/** Value from the previous committed render (undefined on the first render). */
+export function usePrevious<T>(value: T): T | undefined {
+  const ref = useRef<T | undefined>(undefined);
+  useEffect(() => {
+    ref.current = value; // runs after commit, so this render still returned the old value
+  });
+  return ref.current;
+}
+
+/** Previous *distinct* value. Survives unrelated re-renders, concurrent-safe. */
+export function usePreviousDistinct<T>(value: T): T | undefined {
+  const [current, setCurrent] = useState<T>(value);
+  const [previous, setPrevious] = useState<T | undefined>(undefined);
+
+  if (!Object.is(current, value)) {
+    // A guarded state update during render is allowed: React discards this
+    // render's output and immediately re-renders with the new state
+    // (no extra commit, no effect, no flicker).
+    setPrevious(current);
+    setCurrent(value);
+  }
+
+  return previous;
+}
+```
+
+Usage: announce a status transition exactly once.
+
+```tsx title="src/components/OrderStatus.tsx"
+import React, { useEffect } from 'react';
+import { AccessibilityInfo, Text } from 'react-native';
+import { usePreviousDistinct } from '../hooks/usePrevious';
+
+type OrderStatus = 'placed' | 'preparing' | 'ready' | 'collected';
+
+export function OrderStatusLabel({ status }: { status: OrderStatus }) {
+  const previous = usePreviousDistinct(status);
+
+  useEffect(() => {
+    if (previous === 'preparing' && status === 'ready') {
+      AccessibilityInfo.announceForAccessibility('Your order is ready for pickup');
+    }
+  }, [previous, status]);
+
+  return <Text>{status}</Text>;
+}
+```
+
+#### Walkthrough
+
+| Render | `value` | `usePrevious` | `usePreviousDistinct` |
+|---|---|---|---|
+| 1 | A | `undefined` | `undefined` |
+| 2 (value changed) | B | A | A |
+| 3 (unrelated re-render) | B | **B** | A |
+| 4 (value changed) | C | B | B |
+
+- The classic ref version returns the value from the *previous render*. After any unrelated re-render it equals the current value, which surprises people who wanted "what was it before it changed".
+- It also reads `ref.current` during render. React's docs discourage that, and the React Compiler lint rules flag it, because the component can render more than once before committing. It is widely used and works in practice, but it is not the idiomatic answer anymore.
+- The state version stores the last seen value in state and compares during render. React explicitly supports a `setState` during render when it is guarded by a condition. It is the same technique React's docs show for adjusting state when a prop changes.
+- It costs one immediate re-render of this component only, and only when the value changes.
+
+#### Follow-ups
+
+- **"Why not compare in an effect and set state there?"** That causes an extra commit, and one frame renders with inconsistent state. The render-phase update avoids both.
+- **"The value is an object recreated every render."** `Object.is` sees a change every time. Compare a stable key (`order.id` + `order.status`) or use a cheap custom equality check.
+- **"Log which props changed (why-did-you-render)?"** In development, keep the previous props object in a ref updated in an effect and diff the keys. Better still, use the React DevTools profiler's "why did this render" option.
+
+### Write `useFetch` with AbortController and race-condition safety
+
+**Task:** Write `useFetch<T>(url)` returning `{ status, data, error, refetch }`. Requirements:
+
+- A typed discriminated-union state.
+- Abort the in-flight request when `url` changes or the component unmounts.
+- Never let a stale response overwrite a newer one.
+- Treat non-2xx responses as errors.
+- Keep previous data while refetching.
+- `refetch()` re-runs the request.
+- `url = null` means "don't fetch yet".
+
+#### What the interviewer evaluates
+
+- Race-condition awareness. This is the core of the question.
+- `AbortController` plus effect cleanup, and knowing that `fetch` does **not** reject on 404 or 500.
+- Discriminated unions that make impossible states unrepresentable.
+- No `isMounted` hacks, no async function passed directly to `useEffect`.
+- The judgement to say "in production I'd use TanStack Query, and here's what it adds".
+
+#### Solution
+
+```ts title="src/hooks/useFetch.ts"
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'HttpError';
+  }
+}
+
+// Optional `data?/error?: undefined` members let `state.data` type-check on every variant.
+export type FetchState<T> =
+  | { status: 'idle'; data?: undefined; error?: undefined }
+  | { status: 'loading'; data?: T; error?: undefined }
+  | { status: 'success'; data: T; error?: undefined }
+  | { status: 'error'; data?: T; error: Error };
+
+const toError = (e: unknown): Error => (e instanceof Error ? e : new Error(String(e)));
+
+export function useFetch<T>(url: string | null, init?: Omit<RequestInit, 'signal'>) {
+  const [state, setState] = useState<FetchState<T>>(() =>
+    url ? { status: 'loading' } : { status: 'idle' },
+  );
+  const [reloadToken, setReloadToken] = useState(0);
+
+  // Callers usually pass an inline `init` object; don't refetch because of its identity.
+  const initRef = useRef(init);
+  useLayoutEffect(() => {
+    initRef.current = init;
+  });
+
+  useEffect(() => {
+    if (!url) {
+      setState({ status: 'idle' });
+      return;
+    }
+
+    const controller = new AbortController();
+    let active = true;
+
+    setState((prev) => ({ status: 'loading', data: prev.data }));
+
+    (async () => {
+      try {
+        const res = await fetch(url, { ...initRef.current, signal: controller.signal });
+        if (!res.ok) throw new HttpError(res.status, `Request failed with status ${res.status}`);
+        const data = (await res.json()) as T;
+        if (active) setState({ status: 'success', data });
+      } catch (e) {
+        if (!active || controller.signal.aborted) return; // superseded or unmounted
+        setState((prev) => ({ status: 'error', data: prev.data, error: toError(e) }));
+      }
+    })();
+
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [url, reloadToken]);
+
+  const refetch = useCallback(() => setReloadToken((n) => n + 1), []);
+
+  return { ...state, refetch };
+}
+```
+
+```tsx title="src/components/UserCard.tsx"
+import React from 'react';
+import { ActivityIndicator, Button, Text, View } from 'react-native';
+import { useFetch } from '../hooks/useFetch';
+
+interface User {
+  id: string;
+  name: string;
+}
+
+export function UserCard({ userId }: { userId: string }) {
+  const result = useFetch<User>(`https://api.example.com/users/${encodeURIComponent(userId)}`);
+
+  if (result.status === 'error' && !result.data) {
+    return (
+      <View>
+        <Text>{result.error.message}</Text>
+        <Button title="Retry" onPress={result.refetch} />
+      </View>
+    );
+  }
+  if (!result.data) return <ActivityIndicator />;
+
+  return (
+    <View>
+      <Text>{result.data.name}</Text>
+      {result.status === 'loading' ? <ActivityIndicator size="small" /> : null}
+    </View>
+  );
+}
+```
+
+#### Walkthrough
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant H as useFetch effect
+    participant API as Server
+    U->>H: userId = 1 (url A)
+    H->>API: GET A with controller A
+    U->>H: userId = 2 (url B)
+    H->>H: cleanup aborts controller A, active = false
+    H->>API: GET B with controller B
+    API-->>H: response B
+    H->>U: render user 2
+    API--xH: late response A is aborted or ignored
+```
+*Figure: Without the cleanup, the slower response A would arrive last and overwrite user 2 with user 1.*
+
+- **Two layers of protection.** `controller.abort()` cancels the request at the network level, saves bandwidth and makes `fetch` reject with an `AbortError`. The `active` flag is the logic-level guard. It also covers work that abort cannot cancel: in React Native's XHR-based `fetch`, the body may already be buffered, so `res.json()` can still resolve after an abort.
+- **HTTP errors.** `fetch` only rejects on network failure. A 404 or 500 resolves normally, so `res.ok` must be checked. JSON parse errors land in the same `catch`.
+- **Stale-while-revalidate.** The loading and error states carry `prev.data`, so a refetch or a URL change doesn't blank the screen.
+- **Strict Mode.** In development the effect runs twice on mount, so you will see one cancelled request in the network inspector. That is expected and proves the cleanup works.
+- **No `isMounted` ref.** React 18 removed the "state update on an unmounted component" warning. The real bug was always the race, not the warning.
+
+> [!INTERVIEW]
+> What a senior answer includes: naming the race before writing code, both abort and ignore guards, `res.ok`, a discriminated union, and a clear "I'd use TanStack Query in production because it adds caching, request dedupe, retries, refetch on focus and reconnect, and garbage collection". Red flag: `useEffect(async () => ...)`, which returns a Promise instead of a cleanup function.
+
+#### Follow-ups
+
+- **"Add a timeout."** Start `setTimeout(() => controller.abort(), 10_000)` next to the request and clear it in `finally`. Set a `timedOut` flag so you can show "took too long" instead of treating it as a cancellation. Don't assume `AbortSignal.timeout()` or `AbortSignal.any()` exist in every RN runtime; check your version.
+- **"Two components request the same URL. Dedupe it."** Keep a module-level `Map<url, Promise>` of in-flight requests, plus a TTL cache. At that point you are rebuilding TanStack Query: `useQuery({ queryKey: ['user', id], queryFn: ({ signal }) => getUser(id, signal) })`. It passes an `AbortSignal` to `queryFn` for you.
+- **"Suspense version?"** React 19's `use(promise)` suspends on a promise. That promise must come from a cache created outside render, or every render creates a new promise and suspends forever.
+
+### Implement `useAppState` and `useOnlineStatus`
+
+**Task:** Implement `useAppState(onChange?)` that returns the current `AppState` (`active`, `background`, `inactive`) and calls `onChange(next, prev)` on transitions, plus a `useOnForeground(callback)` helper. Then implement `useOnlineStatus()` on top of `@react-native-community/netinfo`, and show how to wire both into TanStack Query so queries refetch on foreground and on reconnect.
+
+#### What the interviewer evaluates
+
+- Subscription cleanup with `subscription.remove()`. The old `AppState.removeEventListener` API is gone.
+- Platform nuance: iOS reports `inactive` for the app switcher, Control Center, notification banners, incoming calls and Face ID prompts. Android goes straight from `active` to `background`.
+- Latest-callback refs, so inline callbacks don't resubscribe.
+- NetInfo semantics: `isConnected` (there is a network) versus `isInternetReachable` (it actually reaches the internet, `null` while unknown).
+- Knowing that offline detection is a hint. Requests can still fail and must be handled.
+
+#### Solution
+
+```ts title="src/hooks/useAppState.ts"
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { AppState, type AppStateStatus } from 'react-native';
+
+export function useAppState(onChange?: (next: AppStateStatus, prev: AppStateStatus) => void) {
+  const [appState, setAppState] = useState<AppStateStatus>(AppState.currentState);
+  const prevRef = useRef<AppStateStatus>(AppState.currentState);
+  const onChangeRef = useRef(onChange);
+
+  useLayoutEffect(() => {
+    onChangeRef.current = onChange;
+  });
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (next) => {
+      const prev = prevRef.current;
+      if (next === prev) return;
+      prevRef.current = next;
+      setAppState(next);
+      onChangeRef.current?.(next, prev);
+    });
+    return () => subscription.remove();
+  }, []);
+
+  return appState;
+}
+
+/** Fires when the app returns from the background (not for iOS inactive blips). */
+export function useOnForeground(callback: () => void) {
+  useAppState((next, prev) => {
+    if (next === 'active' && prev === 'background') callback();
+  });
+}
+```
+
+```ts title="src/hooks/useOnlineStatus.ts"
+import { useEffect, useState } from 'react';
+import NetInfo, { type NetInfoStateType } from '@react-native-community/netinfo';
+
+export interface OnlineStatus {
+  /** null until NetInfo has reported at least once */
+  isOnline: boolean | null;
+  type: NetInfoStateType | null;
+}
+
+export function useOnlineStatus(): OnlineStatus {
+  const [status, setStatus] = useState<OnlineStatus>({ isOnline: null, type: null });
+
+  useEffect(() => {
+    // The listener is called with the current state shortly after subscribing.
+    const unsubscribe = NetInfo.addEventListener((state) => {
+      setStatus({
+        // Treat "reachability unknown" (null) as online; only a definite false is offline.
+        isOnline: state.isConnected === true && state.isInternetReachable !== false,
+        type: state.type,
+      });
+    });
+    return unsubscribe;
+  }, []);
+
+  return status;
+}
+```
+
+```ts title="src/lib/queryLifecycle.ts"
+import NetInfo from '@react-native-community/netinfo';
+import { focusManager, onlineManager } from '@tanstack/react-query';
+import { AppState, Platform, type AppStateStatus } from 'react-native';
+
+// Pause/resume queries and mutations with connectivity.
+onlineManager.setEventListener((setOnline) =>
+  NetInfo.addEventListener((state) => {
+    setOnline(!!state.isConnected);
+  }),
+);
+
+// "Window focus" on mobile = app foreground.
+function onAppStateChange(status: AppStateStatus) {
+  if (Platform.OS !== 'web') focusManager.setFocused(status === 'active');
+}
+
+export function subscribeAppFocus(): () => void {
+  const subscription = AppState.addEventListener('change', onAppStateChange);
+  return () => subscription.remove();
+}
+```
+
+#### Walkthrough
+
+- `prevRef` deduplicates identical consecutive events and gives the callback the previous state without waiting for a re-render.
+- `useOnForeground` deliberately ignores `inactive → active`. Otherwise pulling down Control Center on iOS would trigger a refetch, or a security re-lock, every time. Security-sensitive screens *should* react to `inactive`, for example by covering content before iOS takes the app-switcher snapshot.
+- Android also emits `focus` and `blur` AppState events (for example when the notification shade is pulled down). They are useful for pausing video.
+- NetInfo's `isInternetReachable` is determined by pinging a reachability URL. Configure it with `NetInfo.configure({ reachabilityUrl })` to hit your own health endpoint, which also catches captive portals. NetInfo also ships a ready-made `useNetInfo()` hook; building your own shows you understand subscriptions.
+- `useAppState` re-renders its host on every transition. If you only need the side effect (`useOnForeground`), that re-render is wasted. A variant that only keeps the ref and never sets state avoids it.
+
+#### Follow-ups
+
+- **"Show an offline banner without flicker."** Networks flap during handovers such as Wi-Fi to cellular. Debounce the offline state by 1–2 s (`useDebounce(isOnline, 1500)`) before showing the banner, and hide it immediately on reconnect.
+- **"Auto-lock after 5 minutes in the background."** Store `Date.now()` on the `background` transition and compare on `active`. Don't use a timer, because it won't run while the app is suspended.
+- **"Can this use `useSyncExternalStore`?"** Yes, if you keep a module-level cache of the last NetInfo state (a sync `getSnapshot`) and subscribe once. Every component then reads the same value without each creating its own subscription.
+
+### Build `useCountdown` that stays correct when the app is backgrounded
+
+**Task:** Build `useCountdown(endsAt)` for an OTP resend timer, flash sale or auction. It returns the seconds left, an `mm:ss` label and `isDone`, and calls `onFinish` exactly once. It must be correct after the app spends a minute in the background, and when the JS thread is busy.
+
+#### What the interviewer evaluates
+
+- Knowing that JS timers pause while the app is suspended and drift under load, so decrementing a counter every second is wrong.
+- Deriving remaining time from an **absolute deadline** on every tick, and resyncing immediately on foreground.
+- `onFinish` fired once, via a latest-callback ref.
+- Avoiding pointless re-renders (the state changes once per second, not per tick).
+- Awareness of device versus server clock skew.
+
+#### Solution
+
+```ts title="src/hooks/useCountdown.ts"
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { AppState } from 'react-native';
+
+const secondsUntil = (endsAt: number | null) =>
+  endsAt == null ? 0 : Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
+
+export function formatMmSs(totalSeconds: number): string {
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+export function useCountdown(
+  endsAt: number | null,
+  { tickMs = 250, onFinish }: { tickMs?: number; onFinish?: () => void } = {},
+) {
+  const [secondsLeft, setSecondsLeft] = useState(() => secondsUntil(endsAt));
+  const onFinishRef = useRef(onFinish);
+
+  useLayoutEffect(() => {
+    onFinishRef.current = onFinish;
+  });
+
+  useEffect(() => {
+    if (endsAt == null) {
+      setSecondsLeft(0);
+      return;
+    }
+
+    let finished = false;
+    let intervalId: ReturnType<typeof setInterval> | undefined;
+
+    const sync = () => {
+      const left = secondsUntil(endsAt);
+      setSecondsLeft(left); // same value => React bails out, so ~1 render per second
+      if (left === 0 && !finished) {
+        finished = true;
+        if (intervalId !== undefined) clearInterval(intervalId);
+        onFinishRef.current?.();
+      }
+    };
+
+    sync(); // correct immediately (also handles "already expired" on mount)
+    if (!finished) intervalId = setInterval(sync, tickMs);
+
+    // Timers don't run while suspended: resync the moment we're back.
+    const subscription = AppState.addEventListener('change', (s) => {
+      if (s === 'active') sync();
+    });
+
+    return () => {
+      if (intervalId !== undefined) clearInterval(intervalId);
+      subscription.remove();
+    };
+  }, [endsAt, tickMs]);
+
+  return { secondsLeft, label: formatMmSs(secondsLeft), isDone: secondsLeft === 0 };
+}
+```
+
+```tsx title="src/components/ResendCode.tsx"
+import React, { useState } from 'react';
+import { Button, Text } from 'react-native';
+import { useCountdown } from '../hooks/useCountdown';
+
+const COOLDOWN_MS = 30_000;
+
+export function ResendCode({ onResend }: { onResend: () => Promise<void> }) {
+  const [endsAt, setEndsAt] = useState(() => Date.now() + COOLDOWN_MS);
+  const { isDone, label } = useCountdown(endsAt);
+
+  if (!isDone) return <Text>Resend code in {label}</Text>;
+
+  return (
+    <Button
+      title="Resend code"
+      onPress={async () => {
+        await onResend();
+        setEndsAt(Date.now() + COOLDOWN_MS);
+      }}
+    />
+  );
+}
+```
+
+#### Walkthrough
+
+- **Why tick counting fails**: `setSeconds((s) => s - 1)` assumes every tick arrives on time. iOS suspends the JS thread soon after backgrounding and Android throttles it. After 60 s away the counter resumes where it stopped and still shows 25 s. Heavy JS work (a big list render, JSON parsing) also delays ticks, and the error accumulates.
+- **Deadline-based**: each tick recomputes `endsAt - Date.now()`, so the value corrects itself however late the tick is. The `AppState` listener gives the correct value the instant the app returns, instead of up to `tickMs` later.
+- **Tick at 250 ms, render once per second**: a fast tick keeps the display within a quarter-second of the true boundary, while storing *whole seconds* in state means React bails out on the three ticks where nothing visible changed.
+- **`Math.ceil`**: the display shows "00:01" until the final second has actually elapsed. Floor would show "00:00" with 900 ms left.
+- **Accessibility**: don't put `accessibilityLiveRegion` on a ticking label, because TalkBack would announce every second. Announce once when the timer finishes instead.
+
+#### Follow-ups
+
+- **"The auction end time comes from the server."** The device clock can be wrong or deliberately changed. Compute `offset = serverNow - Date.now()` from a response field or header when you fetch, and use `endsAt - (Date.now() + offset)`. `performance.now()` is monotonic, but how it behaves across device sleep varies by platform, so it is a poor fit for long background gaps.
+- **"Notify the user when it ends while the app is in the background."** JS won't reliably run then. Schedule a local notification for `endsAt` when you start, and cancel it if the timer finishes in the foreground. See the [Push Notifications guide](../guides/push-notifications.html) and [Background Tasks](../guides/background-tasks.html).
+- **"Survive an app kill."** Persist `endsAt` (never "seconds remaining") in MMKV and restore it on launch.
+- **"Smooth circular progress."** Drive it with Reanimated, for example `progress.value = withTiming(0, { duration: endsAt - Date.now(), easing: Easing.linear })` on the UI thread, and restart it from the recomputed remaining time on foreground.
+
+## UI components
+
+### Build a debounced search screen with cancellation and loading, empty and error states
+
+**Task:** Build a product search screen. Requirements:
+
+- Search as the user types, but no request per keystroke.
+- Minimum of 2 characters.
+- Cancel outdated requests.
+- Show distinct **idle / loading / results / empty / error** states, with a retry on error.
+- Keep the old results visible while a new query loads.
+- Tapping a result must work on the first tap while the keyboard is open.
+
+#### What the interviewer evaluates
+
+- Debouncing the **query value**, not the controlled `TextInput` value.
+- Cancellation and race safety, the same as `useFetch`.
+- State modelling: a union rather than four booleans that can contradict each other.
+- UX details: no flash of empty list, an inline spinner, an error that doesn't wipe the results, `keyboardShouldPersistTaps`.
+- Knowing what TanStack Query would give you here: a cache, so backspacing to a previous query is instant.
+
+#### Solution
+
+```tsx title="src/screens/SearchScreen.tsx"
+import React, { useEffect, useState } from 'react';
+import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useDebounce } from '../hooks/useDebounce';
+
+interface Product {
+  id: string;
+  title: string;
+  price: number;
+}
+
+type SearchState =
+  | { status: 'idle' }
+  | { status: 'loading'; results: Product[] }
+  | { status: 'success'; results: Product[] }
+  | { status: 'error'; results: Product[]; message: string };
+
+const MIN_CHARS = 2;
+
+async function searchProducts(query: string, signal: AbortSignal): Promise<Product[]> {
+  const res = await fetch(`https://api.example.com/products?q=${encodeURIComponent(query)}`, { signal });
+  if (!res.ok) throw new Error(`Search failed (${res.status})`);
+  const body = (await res.json()) as { items: Product[] };
+  return body.items;
+}
+
+const previousResults = (s: SearchState) => (s.status === 'idle' ? [] : s.results);
+
+export function SearchScreen() {
+  const [query, setQuery] = useState('');
+  const trimmed = query.trim();
+  const debouncedQuery = useDebounce(trimmed, 350);
+  const [state, setState] = useState<SearchState>({ status: 'idle' });
+  const [attempt, setAttempt] = useState(0); // bump to retry the same query
+
+  useEffect(() => {
+    if (debouncedQuery.length < MIN_CHARS) {
+      setState({ status: 'idle' });
+      return;
+    }
+
+    const controller = new AbortController();
+    let active = true;
+
+    // Keep showing the previous results while the new query loads.
+    setState((prev) => ({ status: 'loading', results: previousResults(prev) }));
+
+    searchProducts(debouncedQuery, controller.signal)
+      .then((results) => {
+        if (active) setState({ status: 'success', results });
+      })
+      .catch((e: unknown) => {
+        if (!active || controller.signal.aborted) return;
+        const message = e instanceof Error ? e.message : 'Something went wrong';
+        setState((prev) => ({ status: 'error', message, results: previousResults(prev) }));
+      });
+
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [debouncedQuery, attempt]);
+
+  const isTyping = trimmed !== debouncedQuery;
+  const showSpinner = trimmed.length >= MIN_CHARS && (isTyping || state.status === 'loading');
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.searchRow}>
+        <TextInput
+          value={query}
+          onChangeText={setQuery}
+          placeholder="Search products"
+          autoCorrect={false}
+          autoCapitalize="none"
+          returnKeyType="search"
+          clearButtonMode="while-editing"
+          accessibilityLabel="Search products"
+          style={styles.input}
+        />
+        {showSpinner ? <ActivityIndicator style={styles.spinner} /> : null}
+      </View>
+
+      {state.status === 'error' ? (
+        <View style={styles.banner} accessibilityRole="alert">
+          <Text style={styles.bannerText}>{state.message}</Text>
+          <Pressable onPress={() => setAttempt((n) => n + 1)} accessibilityRole="button" hitSlop={8}>
+            <Text style={styles.retry}>Retry</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
+      <FlatList
+        data={previousResults(state)}
+        keyExtractor={(item) => item.id}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+        renderItem={({ item }) => (
+          <View style={styles.row}>
+            <Text style={styles.title}>{item.title}</Text>
+            <Text>{item.price.toFixed(2)}</Text>
+          </View>
+        )}
+        ListEmptyComponent={<EmptyState state={state} query={debouncedQuery} busy={showSpinner} />}
+      />
+    </View>
+  );
+}
+
+function EmptyState({ state, query, busy }: { state: SearchState; query: string; busy: boolean }) {
+  if (busy || state.status === 'error') return null; // spinner / banner already visible
+  if (state.status === 'idle') {
+    return <Text style={styles.hint}>{`Type at least ${MIN_CHARS} characters to search.`}</Text>;
+  }
+  return <Text style={styles.hint}>{`No results for "${query}".`}</Text>;
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1 },
+  searchRow: { flexDirection: 'row', alignItems: 'center', padding: 12 },
+  input: { flex: 1, height: 44, borderWidth: StyleSheet.hairlineWidth, borderRadius: 8, paddingHorizontal: 12 },
+  spinner: { marginLeft: 8 },
+  banner: { flexDirection: 'row', justifyContent: 'space-between', padding: 12, backgroundColor: '#fdecea' },
+  bannerText: { flex: 1, color: '#8a1c1c' },
+  retry: { fontWeight: '600' },
+  row: { flexDirection: 'row', justifyContent: 'space-between', padding: 16 },
+  title: { flex: 1, marginRight: 12 },
+  hint: { textAlign: 'center', marginTop: 32, opacity: 0.6 },
+});
+```
+
+#### Walkthrough
+
+- **Debounce the derived query, not the input.** The `TextInput` stays controlled by `query` and updates on every keystroke. Debouncing a controlled input's `value` causes lost characters and cursor jumps.
+- **Cancellation**: the effect keyed on `debouncedQuery` aborts the previous request in cleanup, and the `active` flag protects against late resolutions. A retry bumps `attempt`, which re-runs the same effect for the same query.
+- **State union**: `results` only exists where it makes sense, and "loading with previous results" is an explicit, intentional state. That gives stale-while-revalidate without a flash of empty list.
+- **Keyboard**: `keyboardShouldPersistTaps="handled"` makes the first tap on a result register. With the default, the first tap only dismisses the keyboard. `keyboardDismissMode="on-drag"` hides it when the user scrolls the results.
+- **`isTyping` feedback**: the spinner appears as soon as the user types, not 350 ms later, so the app feels responsive during the debounce window.
+- **Performance**: for large result sets, memoize the row component and use FlashList. `encodeURIComponent` prevents broken URLs for queries like `a&b`.
+
+#### Follow-ups
+
+- **"Rewrite it with TanStack Query."**
+
+  ```ts
+  import { keepPreviousData, useQuery } from '@tanstack/react-query';
+
+  const search = useQuery({
+    queryKey: ['products', 'search', debouncedQuery],
+    queryFn: ({ signal }) => searchProducts(debouncedQuery, signal),
+    enabled: debouncedQuery.length >= MIN_CHARS,
+    placeholderData: keepPreviousData,
+    staleTime: 60_000,
+  });
+  ```
+
+  You get a per-query cache (backspacing is instant), deduplication and retries. The `signal` it passes is aborted when a query becomes unused mid-flight.
+- **"Recent searches."** Persist the last N successful queries in MMKV and show them in the idle state.
+- **"Announce results for screen readers."** When results arrive, call `` AccessibilityInfo.announceForAccessibility(`${results.length} results`) ``.
+- **"Offline."** Show cached results with a banner, and disable the request while NetInfo reports offline.
+
+### Build an infinite-scroll list with pull-to-refresh, retry and deduplicated page loads
+
+**Task:** Build a feed that loads 20 posts per page with cursor pagination. Requirements:
+
+- Load the next page as the user nears the end.
+- Pull-to-refresh.
+- Full-screen error with retry when the first page fails, and a footer retry when a later page fails.
+- Never fire duplicate concurrent page requests.
+- Deduplicate items that appear on two pages.
+- Keep existing items if a refresh fails.
+
+#### What the interviewer evaluates
+
+- Knowing that `onEndReached` fires **multiple times**, and guarding with a synchronous ref rather than state.
+- A clear state machine: initial, more, refresh, error, exhausted.
+- Refresh superseding an in-flight page load (abort), with no stale request clearing the new one's flag.
+- Stopping auto-pagination after a page error (otherwise you get a request loop on a bad network).
+- FlatList performance basics: stable `renderItem`, memoized rows, `keyExtractor`.
+
+#### Solution
+
+```ts title="src/hooks/usePaginatedList.ts"
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+
+export interface Page<T> {
+  items: T[];
+  nextCursor: string | null;
+}
+
+export type FetchPage<T> = (cursor: string | null, signal: AbortSignal) => Promise<Page<T>>;
+type LoadMode = 'initial' | 'more' | 'refresh';
+
+interface ListState<T> {
+  items: T[];
+  hasMore: boolean;
+  loading: LoadMode | null;
+  error: { mode: LoadMode; message: string } | null;
+}
+
+function mergeUnique<T extends { id: string }>(existing: T[], incoming: T[]): T[] {
+  const seen = new Set(existing.map((item) => item.id));
+  const merged = existing.slice();
+  for (const item of incoming) {
+    if (!seen.has(item.id)) {
+      seen.add(item.id);
+      merged.push(item);
+    }
+  }
+  return merged;
+}
+
+export function usePaginatedList<T extends { id: string }>(fetchPage: FetchPage<T>) {
+  const [state, setState] = useState<ListState<T>>({
+    items: [],
+    hasMore: true,
+    loading: 'initial',
+    error: null,
+  });
+
+  // Refs are read synchronously, unlike state, which is what makes the dedupe reliable.
+  const fetchRef = useRef(fetchPage);
+  const inFlight = useRef<AbortController | null>(null);
+  const cursorRef = useRef<string | null>(null);
+  const hasMoreRef = useRef(true);
+  const pageErrorRef = useRef(false);
+
+  useLayoutEffect(() => {
+    fetchRef.current = fetchPage;
+  });
+
+  const load = useCallback(async (mode: LoadMode) => {
+    if (mode === 'more') {
+      // onEndReached fires repeatedly: ignore while busy, when exhausted,
+      // or after a page error (wait for an explicit retry).
+      if (inFlight.current || !hasMoreRef.current || pageErrorRef.current) return;
+    } else {
+      inFlight.current?.abort(); // initial/refresh supersede an in-flight page load
+    }
+
+    const controller = new AbortController();
+    inFlight.current = controller;
+    pageErrorRef.current = false;
+    setState((s) => ({ ...s, loading: mode, error: null }));
+
+    try {
+      const cursor = mode === 'more' ? cursorRef.current : null;
+      const page = await fetchRef.current(cursor, controller.signal);
+      if (controller.signal.aborted) return;
+
+      cursorRef.current = page.nextCursor;
+      hasMoreRef.current = page.nextCursor !== null;
+      setState((s) => ({
+        items: mode === 'more' ? mergeUnique(s.items, page.items) : mergeUnique([], page.items),
+        hasMore: hasMoreRef.current,
+        loading: null,
+        error: null,
+      }));
+    } catch (e) {
+      if (controller.signal.aborted) return;
+      if (mode === 'more') pageErrorRef.current = true;
+      const message = e instanceof Error ? e.message : 'Something went wrong';
+      // Existing items are kept, which matters for a failed refresh.
+      setState((s) => ({ ...s, loading: null, error: { mode, message } }));
+    } finally {
+      // Only clear the flag if a newer request hasn't replaced us.
+      if (inFlight.current === controller) inFlight.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    void load('initial');
+    return () => inFlight.current?.abort();
+  }, [load]);
+
+  const loadMore = useCallback(() => void load('more'), [load]);
+  const refresh = useCallback(() => void load('refresh'), [load]);
+  const failedMode = state.error?.mode ?? null;
+  const retry = useCallback(() => {
+    pageErrorRef.current = false;
+    void load(failedMode ?? 'initial');
+  }, [load, failedMode]);
+
+  return { ...state, loadMore, refresh, retry };
+}
+```
+
+```tsx title="src/screens/FeedScreen.tsx"
+import React, { memo, useCallback } from 'react';
+import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { usePaginatedList, type Page } from '../hooks/usePaginatedList';
+
+interface Post {
+  id: string;
+  title: string;
+}
+
+async function fetchPosts(cursor: string | null, signal: AbortSignal): Promise<Page<Post>> {
+  const params = new URLSearchParams({ limit: '20' });
+  if (cursor) params.set('cursor', cursor);
+  const res = await fetch(`https://api.example.com/posts?${params.toString()}`, { signal });
+  if (!res.ok) throw new Error(`Couldn't load posts (${res.status})`);
+  return (await res.json()) as Page<Post>;
+}
+
+const PostRow = memo(function PostRow({ post }: { post: Post }) {
+  return (
+    <View style={styles.row}>
+      <Text>{post.title}</Text>
+    </View>
+  );
+});
+
+export function FeedScreen() {
+  const { items, hasMore, loading, error, loadMore, refresh, retry } = usePaginatedList(fetchPosts);
+  const renderItem = useCallback(({ item }: { item: Post }) => <PostRow post={item} />, []);
+
+  if (items.length === 0 && loading === 'initial') {
+    return <ActivityIndicator size="large" style={styles.center} />;
+  }
+
+  if (items.length === 0 && error?.mode === 'initial') {
+    return (
+      <View style={styles.center}>
+        <Text>{error.message}</Text>
+        <Pressable onPress={retry} accessibilityRole="button" style={styles.button}>
+          <Text>Try again</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  return (
+    <FlatList
+      data={items}
+      keyExtractor={(post) => post.id}
+      renderItem={renderItem}
+      onEndReached={loadMore}
+      onEndReachedThreshold={0.5}
+      refreshing={loading === 'refresh'}
+      onRefresh={refresh}
+      ListHeaderComponent={
+        error?.mode === 'refresh' ? <Text style={styles.banner}>{`Couldn't refresh: ${error.message}`}</Text> : null
+      }
+      ListEmptyComponent={loading === null ? <Text style={styles.empty}>No posts yet.</Text> : null}
+      ListFooterComponent={
+        loading === 'more' ? (
+          <ActivityIndicator style={styles.footer} />
+        ) : error?.mode === 'more' ? (
+          <Pressable onPress={retry} accessibilityRole="button" style={styles.footer}>
+            <Text>{`${error.message}. Tap to retry.`}</Text>
+          </Pressable>
+        ) : !hasMore && items.length > 0 ? (
+          <Text style={styles.footer}>You're all caught up</Text>
+        ) : null
+      }
+    />
+  );
+}
+
+const styles = StyleSheet.create({
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  button: { marginTop: 12, padding: 12 },
+  row: { padding: 16, borderBottomWidth: StyleSheet.hairlineWidth },
+  banner: { padding: 12, textAlign: 'center' },
+  empty: { textAlign: 'center', marginTop: 48 },
+  footer: { padding: 24, alignItems: 'center', textAlign: 'center' },
+});
+```
+
+#### Walkthrough
+
+```mermaid
+stateDiagram-v2
+    state "Loading first page" as LoadingInitial
+    state "Idle, more pages" as Idle
+    state "Loading next page" as LoadingMore
+    state "Refreshing" as Refreshing
+    state "First page failed" as ErrorInitial
+    state "Page failed, footer retry" as ErrorMore
+    state "End of list" as Exhausted
+    [*] --> LoadingInitial
+    LoadingInitial --> Idle : page ok with cursor
+    LoadingInitial --> Exhausted : page ok, no cursor
+    LoadingInitial --> ErrorInitial : request failed
+    ErrorInitial --> LoadingInitial : retry
+    Idle --> LoadingMore : onEndReached
+    LoadingMore --> LoadingMore : onEndReached ignored
+    LoadingMore --> Idle : page ok with cursor
+    LoadingMore --> Exhausted : no cursor
+    LoadingMore --> ErrorMore : request failed
+    ErrorMore --> LoadingMore : tap retry
+    Idle --> Refreshing : pull to refresh
+    LoadingMore --> Refreshing : pull aborts page load
+    Exhausted --> Refreshing : pull to refresh
+    Refreshing --> Idle : ok, or failed and items kept
+```
+*Figure: Infinite-scroll state machine. Each transition maps to a branch in `load()`.*
+
+- **Deduplicating concurrent loads**: `onEndReached` fires on mount when content is shorter than the screen, again during momentum, and again when `data` changes. Two calls can land before React re-renders, so a state-based `isLoading` check is not enough. The `inFlight` ref is read synchronously.
+- **Refresh wins**: a pull-to-refresh aborts an in-flight page load. The `inFlight.current === controller` check in `finally` stops the aborted request from clearing the *new* request's flag. The same check makes Strict Mode's double mount safe.
+- **Page errors stop auto-loading**: without `pageErrorRef`, a failing page combined with `onEndReached` firing produces a tight request loop on a bad network. The user retries explicitly from the footer.
+- **Cursor plus dedupe by id**: offset pagination (`?page=3`) shifts when new posts are inserted at the top, which duplicates or skips items. Cursors fix skipping, and `mergeUnique` handles the occasional overlap. For very long lists, keep the `Set` of ids in a ref instead of rebuilding it per page (currently O(n) per page).
+- **Performance**: a memoized row, stable `renderItem` and `keyExtractor`. Consider FlashList v2 for heavy rows, and tune `windowSize` and `maxToRenderPerBatch` on FlatList. See the [Performance guide](../guides/performance.html).
+
+> [!INTERVIEW]
+> Likely follow-up: "Why a ref and not `if (loading) return`?" A good answer is that state updates are asynchronous and batched, so two `onEndReached` calls in the same frame both see `loading === null`. A ref is read synchronously, so it closes that window.
+
+#### Follow-ups
+
+- **"Use TanStack Query."**
+
+  ```ts
+  const feed = useInfiniteQuery({
+    queryKey: ['feed'],
+    queryFn: ({ pageParam, signal }) => fetchPosts(pageParam, signal),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.nextCursor,
+    maxPages: 10, // cap memory for very long sessions
+  });
+  const items = feed.data?.pages.flatMap((p) => p.items) ?? [];
+  const onEndReached = () => {
+    if (feed.hasNextPage && !feed.isFetchingNextPage && !feed.isFetchNextPageError) void feed.fetchNextPage();
+  };
+  ```
+
+  The cache also preserves the list when navigating back, so there is no reload and scroll position survives.
+- **"Chat-style list that loads older messages at the top."** Use an `inverted` list, or `maintainVisibleContentPosition`, with `getPreviousPageParam`.
+- **"New posts arrive via websocket."** Don't prepend them under the user's thumb. Buffer them and show a "5 new posts" pill that scrolls to the top and merges.
+- **"Optimistic delete in a paginated cache."** Map over `pages` and filter out the item. Then deal with page sizes becoming uneven, which cursors tolerate and offsets don't.
+
+### Build a 6-digit OTP input with auto-advance, backspace, paste and SMS autofill
+
+**Task:** Build an OTP input with 6 separate boxes. Requirements:
+
+- Digits only.
+- Typing advances to the next box.
+- Backspace on an empty box moves back and clears the previous box.
+- Pasting a full code, or accepting the OS autofill suggestion, fills every box regardless of which box has focus.
+- `onComplete(code)` fires when all 6 are filled.
+- Support iOS `textContentType="oneTimeCode"` and Android `autoComplete="sms-otp"`.
+
+#### What the interviewer evaluates
+
+- Knowing that `maxLength={1}` breaks paste and autofill, because the full code gets truncated to one character.
+- Knowing that RN's `TextInput` has no `onPaste`, so a paste arrives as a multi-character `onChangeText`.
+- Focus management with an array of refs, and backspace via `onKeyPress`.
+- Platform autofill props and what they actually do.
+- Accessibility, plus the trade-off against the single-hidden-input design.
+
+#### Solution
+
+```tsx title="src/components/OtpInput.tsx"
+import React, { useRef, useState } from 'react';
+import {
+  Platform,
+  StyleSheet,
+  TextInput,
+  View,
+  type NativeSyntheticEvent,
+  type TextInputKeyPressEventData,
+} from 'react-native';
+
+interface OtpInputProps {
+  length?: number;
+  onComplete: (code: string) => void;
+  autoFocus?: boolean;
+  disabled?: boolean;
+}
+
+export function OtpInput({ length = 6, onComplete, autoFocus = true, disabled = false }: OtpInputProps) {
+  const [digits, setDigits] = useState<string[]>(() => Array.from({ length }, () => ''));
+  const inputs = useRef<Array<TextInput | null>>([]);
+
+  const focusBox = (index: number) => {
+    inputs.current[Math.min(Math.max(index, 0), length - 1)]?.focus();
+  };
+
+  const commit = (next: string[], focusIndex: number | null) => {
+    setDigits(next);
+    if (focusIndex !== null) focusBox(focusIndex);
+    if (next.every((d) => d !== '')) {
+      inputs.current.forEach((el) => el?.blur());
+      onComplete(next.join(''));
+    }
+  };
+
+  const handleChangeText = (index: number, raw: string) => {
+    const chars = raw.replace(/\D/g, '');
+
+    if (chars.length === 0) {
+      // Backspace on a filled box (or cut): clear it, keep focus here.
+      const next = digits.slice();
+      next[index] = '';
+      setDigits(next);
+      return;
+    }
+
+    // 1 char = typing. Several = paste, autofill, or typing into a filled box.
+    // A full-length code always fills from the first box, wherever focus is.
+    const start = chars.length >= length ? 0 : index;
+    const accepted = chars.slice(0, length - start).split('');
+    const next = digits.slice();
+    accepted.forEach((c, k) => {
+      next[start + k] = c;
+    });
+    const lastFilled = start + accepted.length - 1;
+    commit(next, lastFilled < length - 1 ? lastFilled + 1 : null);
+  };
+
+  const handleKeyPress = (index: number, e: NativeSyntheticEvent<TextInputKeyPressEventData>) => {
+    // Backspace on an EMPTY box produces no onChangeText, so handle it here.
+    if (e.nativeEvent.key === 'Backspace' && digits[index] === '' && index > 0) {
+      const next = digits.slice();
+      next[index - 1] = '';
+      setDigits(next);
+      focusBox(index - 1);
+    }
+  };
+
+  return (
+    <View style={styles.row} accessibilityLabel={`${length}-digit verification code`}>
+      {digits.map((digit, i) => (
+        <TextInput
+          // Index keys are correct here: a fixed set of boxes that never reorders.
+          key={i}
+          ref={(el) => {
+            inputs.current[i] = el;
+          }}
+          value={digit}
+          onChangeText={(text) => handleChangeText(i, text)}
+          onKeyPress={(e) => handleKeyPress(i, e)}
+          editable={!disabled}
+          autoFocus={autoFocus && i === 0}
+          keyboardType="number-pad"
+          textContentType="oneTimeCode" // iOS: offer the code from Messages/Mail above the keyboard
+          autoComplete={Platform.OS === 'android' ? 'sms-otp' : undefined} // Android autofill hint
+          selectTextOnFocus // typing into a filled box replaces its digit
+          caretHidden
+          accessibilityLabel={`Digit ${i + 1} of ${length}`}
+          style={[styles.box, digit !== '' && styles.boxFilled]}
+        />
+      ))}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  row: { flexDirection: 'row', justifyContent: 'space-between', gap: 8 },
+  box: {
+    flex: 1,
+    aspectRatio: 0.85,
+    borderWidth: 1,
+    borderRadius: 8,
+    borderColor: '#9aa0a6',
+    textAlign: 'center',
+    fontSize: 22,
+  },
+  boxFilled: { borderColor: '#1a73e8' },
+});
+```
+
+#### Walkthrough
+
+- **No `maxLength={1}`**: this is the classic bug. When iOS autofills "482913" into the focused box, or the user pastes, a 1-character limit truncates it and the code never arrives. Accepting any length and distributing the digits handles typing, paste and autofill in one code path.
+- **Full code, any box**: if the user taps into box 4 and accepts the suggestion, `start` resets to 0 because a full-length code clearly means the whole OTP.
+- **Backspace has two cases**. On a filled box, the OS deletes the character and `onChangeText('')` clears it. On an empty box nothing changes, so no `onChangeText` fires, and `onKeyPress` detects `Backspace` and moves back. `onKeyPress` behaviour varies across some Android soft keyboards; that is the main argument for the single-input design below.
+- **Autofill**: iOS `textContentType="oneTimeCode"` surfaces codes it detects in Messages or Mail in the QuickType bar. Android `autoComplete="sms-otp"` hints the autofill service to offer the SMS code. Neither reads SMS automatically. For zero-tap on Android you need the SMS Retriever API through a native module (the SMS must contain your app's hash). iOS also recognises domain-bound codes, where the last line of the SMS is `@example.com #482913`.
+- **`selectTextOnFocus`** makes re-typing a box replace its digit instead of producing two characters.
+- **`onComplete` fires in the event handler**, not in an effect watching `digits`, so it runs exactly once per completion with no extra render.
+- **Security**: never log the code, and rely on server-side expiry and rate limiting. The client only collects the input.
+
+#### Follow-ups
+
+- **"Implement it with a single hidden input instead."** This is often the more robust choice. One real `TextInput` owns the value, with native paste, autofill and backspace. The boxes are just a rendering of `code`:
+
+  ```tsx
+  const [code, setCode] = useState('');
+  const inputRef = useRef<TextInput>(null);
+
+  <Pressable onPress={() => inputRef.current?.focus()} style={styles.row} accessible={false}>
+    {Array.from({ length }, (_, i) => (
+      <View key={i} style={[styles.box, i === code.length && styles.boxFilled]}>
+        <Text style={styles.digit}>{code[i] ?? ''}</Text>
+      </View>
+    ))}
+    <TextInput
+      ref={inputRef}
+      value={code}
+      onChangeText={(t) => {
+        const next = t.replace(/\D/g, '').slice(0, length);
+        setCode(next);
+        if (next.length === length) onComplete(next);
+      }}
+      maxLength={length}
+      keyboardType="number-pad"
+      textContentType="oneTimeCode"
+      autoComplete={Platform.OS === 'android' ? 'sms-otp' : undefined}
+      style={[StyleSheet.absoluteFill, { color: 'transparent' }]} // laid out, but invisible
+      caretHidden
+    />
+  </Pressable>;
+  ```
+
+  Keep the input laid out (absolute, transparent text) rather than `display: 'none'`. The OS won't offer autofill to an input it considers hidden.
+- **"Clear and shake on a wrong code."** Expose `clear()` via a ref (in React 19 `ref` is a regular prop for function components; `useImperativeHandle` still defines the handle). Shake with a Reanimated `withSequence` of `withTiming` translations, and announce the error for screen readers.
+- **"Resend with cooldown."** Combine it with `useCountdown`.
+
+### Build an image carousel with paging dots
+
+**Task:** Build a horizontally paged image carousel. Requirements:
+
+- One image per page with snap paging.
+- Dots that show the active page and scroll to a page when tapped.
+- Correct behaviour when the carousel is not full screen width.
+- Reasonable memory use with 20+ images.
+- Use `FlatList` with `pagingEnabled` and `onViewableItemsChanged`.
+
+#### What the interviewer evaluates
+
+- Knowing that `pagingEnabled` pages by the **scroll view's width**, so items must match the measured container width.
+- The `onViewableItemsChanged` gotcha: it must be stable, because FlatList throws if it changes identity after mount.
+- `getItemLayout` for reliable `scrollToIndex`.
+- Virtualization settings for image-heavy content.
+- Accessibility of the dots (buttons with a selected state).
+
+#### Solution
+
+```tsx title="src/components/ImageCarousel.tsx"
+import React, { useCallback, useRef, useState } from 'react';
+import {
+  FlatList,
+  Image,
+  Pressable,
+  StyleSheet,
+  View,
+  type LayoutChangeEvent,
+  type ViewToken,
+} from 'react-native';
+
+export interface Slide {
+  id: string;
+  uri: string;
+  alt: string;
+}
+
+// Module-level constant: viewabilityConfig must not change between renders either.
+const VIEWABILITY_CONFIG = { itemVisiblePercentThreshold: 60 };
+
+export function ImageCarousel({ slides, height = 240 }: { slides: Slide[]; height?: number }) {
+  const [width, setWidth] = useState(0);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const listRef = useRef<FlatList<Slide>>(null);
+
+  const onLayout = (e: LayoutChangeEvent) => setWidth(Math.round(e.nativeEvent.layout.width));
+
+  // Stable for the component's lifetime (setActiveIndex is stable).
+  const onViewableItemsChanged = useCallback(
+    ({ viewableItems }: { viewableItems: ViewToken<Slide>[] }) => {
+      const first = viewableItems.find((v) => v.isViewable);
+      if (first?.index != null) setActiveIndex(first.index);
+    },
+    [],
+  );
+
+  const getItemLayout = useCallback(
+    (_data: unknown, index: number) => ({ length: width, offset: width * index, index }),
+    [width],
+  );
+
+  const goTo = (index: number) => listRef.current?.scrollToIndex({ index, animated: true });
+
+  return (
+    <View style={{ height }} onLayout={onLayout}>
+      {width > 0 ? (
+        <FlatList
+          ref={listRef}
+          data={slides}
+          keyExtractor={(s) => s.id}
+          horizontal
+          pagingEnabled
+          showsHorizontalScrollIndicator={false}
+          decelerationRate="fast"
+          getItemLayout={getItemLayout}
+          onViewableItemsChanged={onViewableItemsChanged}
+          viewabilityConfig={VIEWABILITY_CONFIG}
+          initialNumToRender={1}
+          maxToRenderPerBatch={2}
+          windowSize={3} // current page plus one screen either side
+          renderItem={({ item }) => (
+            <Image
+              source={{ uri: item.uri }}
+              style={{ width, height }}
+              resizeMode="cover"
+              accessibilityLabel={item.alt}
+            />
+          )}
+        />
+      ) : null}
+
+      <View style={styles.dots}>
+        {slides.map((s, i) => (
+          <Pressable
+            key={s.id}
+            onPress={() => goTo(i)}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel={`Show image ${i + 1} of ${slides.length}`}
+            accessibilityState={{ selected: i === activeIndex }}
+          >
+            <View style={[styles.dot, i === activeIndex && styles.dotActive]} />
+          </Pressable>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  dots: { position: 'absolute', bottom: 12, alignSelf: 'center', flexDirection: 'row', gap: 8 },
+  dot: { width: 8, height: 8, borderRadius: 4, backgroundColor: 'rgba(255,255,255,0.5)' },
+  dotActive: { width: 20, backgroundColor: '#ffffff' },
+});
+```
+
+#### Walkthrough
+
+- **Measure, don't assume**: `pagingEnabled` snaps to multiples of the scroll view's own width. Using `Dimensions` width inside a padded card makes each page drift by the padding. `onLayout` measures the real container, and the list only renders once it has a width.
+- **Viewability**: `onViewableItemsChanged` updates the dot as soon as 60% of the next page is visible, during the drag. The alternative, `onMomentumScrollEnd` with `Math.round(x / width)`, is simpler but only updates after the scroll settles. Both the callback and `viewabilityConfig` must be stable, because FlatList raises an invariant error if `onViewableItemsChanged` changes after mount. Hence `useCallback([])` and a module-level config.
+- **`getItemLayout`**: FlatList can compute offsets without measuring, so `scrollToIndex` works for far-away pages without triggering `onScrollToIndexFailed`.
+- **Memory**: `windowSize={3}` keeps roughly three pages mounted. For many large images, use a caching image component such as `expo-image`, request CDN-resized images at the displayed size and pixel ratio, and prefetch only the next image.
+- **Dots as buttons**: each has a label and `selected` state. An alternative pattern is making the whole carousel `accessibilityRole="adjustable"` with increment and decrement actions, so VoiceOver users can swipe up and down to change pages.
+
+#### Follow-ups
+
+- **"Autoplay."** Use `useInterval(() => goTo((activeIndex + 1) % slides.length), paused ? null : 4000)`. Pause on `onScrollBeginDrag`, resume on `onMomentumScrollEnd`, and pause when the screen loses focus (`useIsFocused`) or the app is backgrounded. Respect `AccessibilityInfo.isReduceMotionEnabled()`.
+- **"Dots that stretch smoothly with the swipe."** Track the scroll offset in a Reanimated shared value via `useAnimatedScrollHandler` (with `Animated.FlatList`). Each dot `interpolate`s its width and opacity from `offset / width` on the UI thread, with no React re-renders.
+- **"Rotation or split-screen resizes."** `onLayout` fires with the new width, but the scroll offset is still `oldWidth * index`. In an effect keyed on `width`, call `scrollToOffset({ offset: width * activeIndex, animated: false })`, reading `activeIndex` from a ref.
+- **"Infinite loop."** Render `[last, ...slides, first]` and jump without animation when landing on a clone, or use a maintained library such as react-native-reanimated-carousel.
+
+### Build an accordion with LayoutAnimation or Reanimated
+
+**Task:** Build an FAQ accordion. Tapping a header expands or collapses its body with an animation. It supports "only one open at a time" (default) or "many open", and it is accessible (the expanded state is announced, and collapsed content is hidden from screen readers). Show a zero-dependency version and a Reanimated version, and explain when you'd pick each.
+
+#### What the interviewer evaluates
+
+- Knowing that animating `height` is not supported by the native driver of the core `Animated` API, which only supports transform and opacity.
+- LayoutAnimation semantics: configure *before* the state change, and it applies to the entire next layout pass.
+- Reanimated measurement: animating to an unknown content height.
+- `accessibilityState={{ expanded }}` and hiding collapsed content.
+- Immutable `Set` state updates.
+
+#### Solution
+
+Version A, LayoutAnimation (content is unmounted when collapsed):
+
+```tsx title="src/components/Accordion.tsx"
+import React, { useState } from 'react';
+import { LayoutAnimation, Pressable, StyleSheet, Text, View } from 'react-native';
+
+export interface AccordionSection {
+  id: string;
+  title: string;
+  content: React.ReactNode;
+}
+
+export function Accordion({
+  sections,
+  allowMultiple = false,
+}: {
+  sections: AccordionSection[];
+  allowMultiple?: boolean;
+}) {
+  const [openIds, setOpenIds] = useState<ReadonlySet<string>>(() => new Set());
+
+  const toggle = (id: string) => {
+    // Must be configured BEFORE the state update that changes layout.
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    setOpenIds((prev) => {
+      const next = new Set<string>(allowMultiple ? prev : undefined);
+      if (prev.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  return (
+    <View>
+      {sections.map((section) => {
+        const open = openIds.has(section.id);
+        return (
+          <View key={section.id} style={styles.item}>
+            <Pressable
+              onPress={() => toggle(section.id)}
+              accessibilityRole="button"
+              accessibilityState={{ expanded: open }}
+              style={styles.header}
+            >
+              <Text style={styles.title}>{section.title}</Text>
+              <Text style={[styles.chevron, open && styles.chevronOpen]}>›</Text>
+            </Pressable>
+            {open ? <View style={styles.body}>{section.content}</View> : null}
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  item: { borderBottomWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
+  header: { flexDirection: 'row', alignItems: 'center', padding: 16 },
+  title: { flex: 1, fontSize: 16, fontWeight: '600' },
+  chevron: { fontSize: 22 },
+  chevronOpen: { transform: [{ rotate: '90deg' }] },
+  body: { paddingHorizontal: 16, paddingBottom: 16 },
+});
+```
+
+Version B, Reanimated (content stays mounted, animation runs on the UI thread and is interruptible):
+
+```tsx title="src/components/AnimatedAccordionItem.tsx"
+import React, { useState } from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import Animated, { useAnimatedStyle, useDerivedValue, useSharedValue, withTiming } from 'react-native-reanimated';
+
+export function AnimatedAccordionItem({ title, children }: { title: string; children: React.ReactNode }) {
+  const [open, setOpen] = useState(false); // drives accessibility props
+  const expanded = useSharedValue(0); // 0 = collapsed, 1 = expanded
+  const contentHeight = useSharedValue(0);
+
+  const progress = useDerivedValue(() => withTiming(expanded.value, { duration: 250 }));
+
+  const bodyStyle = useAnimatedStyle(() => ({
+    height: contentHeight.value * progress.value,
+    opacity: progress.value,
+  }));
+  const chevronStyle = useAnimatedStyle(() => ({
+    transform: [{ rotate: `${progress.value * 90}deg` }],
+  }));
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    expanded.value = next ? 1 : 0; // a tap mid-animation reverses smoothly from the current value
+  };
+
+  return (
+    <View style={styles.item}>
+      <Pressable
+        onPress={toggle}
+        accessibilityRole="button"
+        accessibilityState={{ expanded: open }}
+        style={styles.header}
+      >
+        <Text style={styles.title}>{title}</Text>
+        <Animated.Text style={[styles.chevron, chevronStyle]}>›</Animated.Text>
+      </Pressable>
+
+      <Animated.View style={[styles.clip, bodyStyle]}>
+        <View
+          // Absolutely positioned so it reports its natural height even while the parent is 0 tall.
+          style={styles.measure}
+          onLayout={(e) => {
+            contentHeight.value = e.nativeEvent.layout.height;
+          }}
+          accessibilityElementsHidden={!open} // iOS
+          importantForAccessibility={open ? 'auto' : 'no-hide-descendants'} // Android
+        >
+          {children}
+        </View>
+      </Animated.View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  item: { borderBottomWidth: StyleSheet.hairlineWidth },
+  header: { flexDirection: 'row', alignItems: 'center', padding: 16 },
+  title: { flex: 1, fontSize: 16, fontWeight: '600' },
+  chevron: { fontSize: 22 },
+  clip: { overflow: 'hidden' },
+  measure: { position: 'absolute', top: 0, left: 0, right: 0, paddingHorizontal: 16, paddingBottom: 16 },
+});
+```
+
+#### Walkthrough
+
+| | LayoutAnimation | Reanimated (measured height) |
+|---|---|---|
+| Dependencies | None (core) | `react-native-reanimated` |
+| Runs on | Native layout pass | UI thread (worklets) |
+| Scope | Every layout change in the next commit, so unrelated views animate too | Only the views you animate |
+| Interruptible | Not really; a new tap starts a new transition | Yes, it reverses from the current value |
+| Collapsed content | Unmounted (state lost, cheap) | Mounted (keeps state, costs memory) |
+| Best for | Simple static lists, prototypes | Polished UI, many items, gestures |
+
+- **LayoutAnimation**: `configureNext` tells the native side to animate whatever layout changes the *next* commit produces. That is also its weakness: if a toast appears in the same commit, it animates too, and it can glitch inside virtualized lists. On the legacy architecture Android needed `UIManager.setLayoutAnimationEnabledExperimental(true)`. On the New Architecture that call is a no-op, so omit it in new code.
+- **Reanimated measurement trick**: you can't animate to `height: 'auto'` directly. The inner view is absolutely positioned, so its `onLayout` reports its natural height even while the outer clip view is 0 tall. The outer view animates `height` between 0 and that measured value. When the content changes, `onLayout` fires again and the target updates.
+- **Accessibility**: `accessibilityState.expanded` makes VoiceOver say "collapsed/expanded". In version B, collapsed content is still mounted, so it must be hidden explicitly or screen readers will focus invisible text.
+- **Reanimated 4 note**: `.value` still works. `.get()` and `.set()` are the recommended accessors when using the React Compiler.
+
+#### Follow-ups
+
+- **"Use Reanimated layout animations instead of measuring."** Conditionally render the body with `entering={FadeIn}` and `exiting={FadeOut}`, and give the siblings `layout={LinearTransition}` so they slide. That is less code, but content unmounts as in version A.
+- **"Scroll the opened section into view."** Record each item's `y` via `onLayout`, then call `scrollViewRef.current?.scrollTo({ y, animated: true })` after expanding.
+- **"Controlled accordion."** Accept `expandedIds` and `onChange` props and fall back to internal state when they're undefined, the same pattern as controlled and uncontrolled inputs.
+- **"100 sections."** Use a `FlatList` with a memoized item component, and avoid LayoutAnimation in virtualized lists.
+
+### Build a toast/snackbar queue with context and an imperative API
+
+**Task:** Build a toast system. Requirements:
+
+- `useToast().show({ message, type, action })` from components.
+- `toast.show(...)` from **outside React** (API interceptors, services).
+- One toast visible at a time, queued, auto-dismissed after a duration.
+- Duplicate toasts are dropped and the queue is capped.
+- Optional action button ("Undo").
+- Animated enter and exit, positioned above the safe area.
+- Accessible (announced by screen readers).
+
+#### What the interviewer evaluates
+
+- The queue data structure and the timer lifecycle (effects keyed by toast id, cleanup).
+- A stable context value, so consumers don't re-render when the queue changes.
+- An imperative bridge that works outside the tree, with safe behaviour before the provider mounts.
+- Handling toast storms (dedupe, cap).
+- Platform gotchas: the native `Modal` window layering, safe areas, and screen reader announcements.
+
+#### Solution
+
+```tsx title="src/toast/ToastProvider.tsx"
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { AccessibilityInfo, Platform, Pressable, StyleSheet, Text } from 'react-native';
+import Animated, { FadeInDown, FadeOutDown } from 'react-native-reanimated';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+export type ToastType = 'info' | 'success' | 'error';
+
+export interface ToastOptions {
+  message: string;
+  type?: ToastType;
+  durationMs?: number;
+  action?: { label: string; onPress: () => void };
+}
+
+interface Toast {
+  id: number;
+  message: string;
+  type: ToastType;
+  durationMs: number;
+  action?: ToastOptions['action'];
+}
+
+export interface ToastApi {
+  show: (options: ToastOptions | string) => number;
+  hide: (id?: number) => void;
+}
+
+const MAX_QUEUE = 5;
+const ToastContext = createContext<ToastApi | null>(null);
+
+// Imperative bridge for non-React code. No-op (returns -1) until the provider mounts.
+const apiRef: { current: ToastApi | null } = { current: null };
+export const toast: ToastApi = {
+  show: (options) => apiRef.current?.show(options) ?? -1,
+  hide: (id) => apiRef.current?.hide(id),
+};
+
+export function useToast(): ToastApi {
+  const ctx = useContext(ToastContext);
+  if (!ctx) throw new Error('useToast must be used inside ToastProvider');
+  return ctx;
+}
+
+export function ToastProvider({ children }: { children: React.ReactNode }) {
+  const [queue, setQueue] = useState<Toast[]>([]);
+  const nextId = useRef(1);
+
+  const show = useCallback((input: ToastOptions | string) => {
+    const o = typeof input === 'string' ? { message: input } : input;
+    const item: Toast = {
+      id: nextId.current++,
+      message: o.message,
+      type: o.type ?? 'info',
+      durationMs: o.durationMs ?? (o.action ? 5000 : 3000), // action toasts need longer
+      action: o.action,
+    };
+    setQueue((q) => {
+      if (q.some((t) => t.message === item.message && t.type === item.type)) return q; // dedupe
+      const next = [...q, item];
+      // Cap: keep the visible toast plus the newest waiting ones.
+      return next.length > MAX_QUEUE ? [next[0], ...next.slice(next.length - (MAX_QUEUE - 1))] : next;
+    });
+    return item.id;
+  }, []);
+
+  const hide = useCallback((id?: number) => {
+    setQueue((q) => (id === undefined ? q.slice(1) : q.filter((t) => t.id !== id)));
+  }, []);
+
+  // Stable value: components calling useToast() never re-render because of the queue.
+  const api = useMemo<ToastApi>(() => ({ show, hide }), [show, hide]);
+
+  useEffect(() => {
+    apiRef.current = api;
+    return () => {
+      if (apiRef.current === api) apiRef.current = null;
+    };
+  }, [api]);
+
+  const current = queue[0];
+  const currentId = current?.id;
+  const currentDuration = current?.durationMs;
+
+  // Auto-dismiss the visible toast; the next one mounts when it leaves.
+  useEffect(() => {
+    if (currentId === undefined || currentDuration === undefined) return;
+    const timer = setTimeout(() => hide(currentId), currentDuration);
+    return () => clearTimeout(timer);
+  }, [currentId, currentDuration, hide]);
+
+  return (
+    <ToastContext.Provider value={api}>
+      {children}
+      {current ? <ToastView key={current.id} toast={current} onDismiss={() => hide(current.id)} /> : null}
+    </ToastContext.Provider>
+  );
+}
+
+function ToastView({ toast: t, onDismiss }: { toast: Toast; onDismiss: () => void }) {
+  const insets = useSafeAreaInsets();
+
+  useEffect(() => {
+    // Android announces via accessibilityLiveRegion; iOS needs an explicit announcement.
+    if (Platform.OS === 'ios') AccessibilityInfo.announceForAccessibility(t.message);
+  }, [t.message]);
+
+  return (
+    <Animated.View
+      entering={FadeInDown}
+      exiting={FadeOutDown}
+      accessibilityLiveRegion="polite"
+      style={[styles.toast, styles[t.type], { bottom: insets.bottom + 16 }]}
+    >
+      <Text style={styles.message} onPress={onDismiss}>
+        {t.message}
+      </Text>
+      {t.action ? (
+        <Pressable
+          onPress={() => {
+            t.action?.onPress();
+            onDismiss();
+          }}
+          accessibilityRole="button"
+          hitSlop={8}
+        >
+          <Text style={styles.action}>{t.action.label}</Text>
+        </Pressable>
+      ) : null}
+    </Animated.View>
+  );
+}
+
+const styles = StyleSheet.create({
+  toast: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    elevation: 4,
+  },
+  info: { backgroundColor: '#323232' },
+  success: { backgroundColor: '#1e7d32' },
+  error: { backgroundColor: '#b3261e' },
+  message: { flex: 1, color: '#ffffff' },
+  action: { color: '#ffffff', fontWeight: '700', marginLeft: 16 },
+});
+```
+
+```tsx
+// In components
+const { show } = useToast();
+show({ message: 'Message archived', action: { label: 'Undo', onPress: unarchive } });
+
+// Outside React (e.g. an HTTP client interceptor)
+toast.show({ message: 'Your session expired. Please sign in again.', type: 'error' });
+```
+
+#### Walkthrough
+
+- **Queue model**: the head of the array is the visible toast. The auto-dismiss effect depends on the head's **id**, not the object, so it restarts exactly when a new toast becomes visible. Its cleanup clears the timer if the toast is dismissed manually.
+- **`key={current.id}`** gives each toast a fresh mount, so Reanimated's `entering` and `exiting` animations run for every toast change.
+- **Re-render isolation**: the context value is a memoized `{ show, hide }` that never changes. When `queue` changes, the provider re-renders, but `children` is the same element reference from the parent, so the app below doesn't re-render. Only the toast view does.
+- **Imperative bridge**: a module-level ref is registered in an effect and unregistered only if it still points at this provider. That makes it safe under Strict Mode and multiple mounts. Calls before mount are dropped here; buffer them if that matters (for example, errors during startup).
+- **Toast storms**: ten failed requests shouldn't produce ten identical toasts. Dedupe by message and type, and cap the queue.
+- **Modal gotcha**: RN's `Modal` presents a separate native window, so a toast rendered at the app root appears *behind* an open modal. Options are rendering a toast host inside modal screens, or a full-window overlay (react-native-screens offers `FullWindowOverlay` on iOS).
+
+#### Follow-ups
+
+- **"Swipe to dismiss."** Wrap it in a Gesture Handler `Gesture.Pan()` that updates a `translateX` shared value. Past a threshold, animate it out and call `onDismiss` via `scheduleOnRN` (Reanimated 4 / worklets) or `runOnJS` (older Reanimated).
+- **"Pause the timer while the user is touching it."** Store `remaining = durationMs - (Date.now() - shownAt)` on press-in and restart with `remaining` on press-out.
+- **"Show up to three stacked."** Render `queue.slice(0, 3)` with `layout={LinearTransition}` and a timer per visible toast, keyed by id.
+- **"Test it."** Use RNTL with fake timers: call `show`, assert the text, then `act(() => jest.advanceTimersByTime(3000))` and assert it's gone. Use Reanimated's Jest setup so layout animations resolve synchronously.
+
+## State & data logic
+
+### Implement an optimistic like button with rollback using TanStack Query
+
+**Task:** A post appears on its detail screen (`['post', id]`) and in an infinite feed (`['feed']`). Tapping "Like" must update the count instantly in **both** places, send the request, roll back and show a toast on failure, and resync with the server afterwards. Rapid taps (like, unlike, like) must not leave the UI in a wrong state.
+
+#### What the interviewer evaluates
+
+- The `onMutate`, `onError`, `onSettled` lifecycle and *why* each step exists (cancel, snapshot, set, return context).
+- Updating every cache that renders the entity, including `InfiniteData` pages.
+- Concurrency: overlapping mutations and refetches clobbering optimistic state.
+- API design: an idempotent "set liked = true/false" endpoint rather than a toggle.
+- Accessible button semantics.
+
+#### Solution
+
+```ts title="src/features/likes/useToggleLike.ts"
+import { useMutation, useQueryClient, type InfiniteData } from '@tanstack/react-query';
+import { toast } from '../../toast/ToastProvider';
+
+export interface Post {
+  id: string;
+  title: string;
+  liked: boolean;
+  likeCount: number;
+}
+interface FeedPage {
+  items: Post[];
+  nextCursor: string | null;
+}
+
+async function setLike(postId: string, liked: boolean): Promise<Post> {
+  // Idempotent: PUT = liked, DELETE = not liked. Retries and replays converge.
+  const res = await fetch(`https://api.example.com/posts/${postId}/like`, {
+    method: liked ? 'PUT' : 'DELETE',
+  });
+  if (!res.ok) throw new Error(`Like failed (${res.status})`);
+  return (await res.json()) as Post;
+}
+
+const applyLike = (post: Post, liked: boolean): Post =>
+  post.liked === liked ? post : { ...post, liked, likeCount: post.likeCount + (liked ? 1 : -1) };
+
+export function useToggleLike(postId: string) {
+  const qc = useQueryClient();
+  const detailKey = ['post', postId] as const;
+  const feedKey = ['feed'] as const;
+
+  return useMutation({
+    mutationKey: ['like', postId],
+    mutationFn: (liked: boolean) => setLike(postId, liked),
+
+    onMutate: async (liked) => {
+      // 1. Stop in-flight refetches from overwriting our optimistic write.
+      await Promise.all([qc.cancelQueries({ queryKey: detailKey }), qc.cancelQueries({ queryKey: feedKey })]);
+
+      // 2. Snapshot for rollback.
+      const previousDetail = qc.getQueryData<Post>(detailKey);
+      const previousFeed = qc.getQueryData<InfiniteData<FeedPage>>(feedKey);
+
+      // 3. Optimistically update every cache that shows this post.
+      qc.setQueryData<Post>(detailKey, (old) => (old ? applyLike(old, liked) : old));
+      qc.setQueryData<InfiniteData<FeedPage>>(feedKey, (old) =>
+        old
+          ? {
+              ...old,
+              pages: old.pages.map((page) => ({
+                ...page,
+                items: page.items.map((p) => (p.id === postId ? applyLike(p, liked) : p)),
+              })),
+            }
+          : old,
+      );
+
+      // 4. Returned value is passed to onError/onSettled.
+      return { previousDetail, previousFeed };
+    },
+
+    onError: (_error, _liked, context) => {
+      if (context?.previousDetail) qc.setQueryData(detailKey, context.previousDetail);
+      if (context?.previousFeed) qc.setQueryData(feedKey, context.previousFeed);
+      toast.show({ message: "Couldn't update like. Please try again.", type: 'error' });
+    },
+
+    onSettled: () => {
+      // Resync only when this is the last pending like for the post, so an
+      // older response can't overwrite a newer optimistic state.
+      if (qc.isMutating({ mutationKey: ['like', postId] }) === 1) {
+        void qc.invalidateQueries({ queryKey: detailKey });
+      }
+    },
+  });
+}
+```
+
+```tsx title="src/features/likes/LikeButton.tsx"
+import React from 'react';
+import { Pressable, Text } from 'react-native';
+import { useToggleLike, type Post } from './useToggleLike';
+
+export function LikeButton({ post }: { post: Post }) {
+  const { mutate } = useToggleLike(post.id);
+
+  return (
+    <Pressable
+      onPress={() => mutate(!post.liked)}
+      hitSlop={8}
+      accessibilityRole="button"
+      accessibilityState={{ selected: post.liked }}
+      accessibilityLabel={post.liked ? 'Unlike post' : 'Like post'}
+    >
+      <Text>{`${post.liked ? 'Liked' : 'Like'} · ${post.likeCount}`}</Text>
+    </Pressable>
+  );
+}
+```
+
+#### Walkthrough
+
+- **Why cancel first**: if a refetch of `['post', id]` is in flight, its (pre-like) response would land after the optimistic write and flip the heart back. `cancelQueries` prevents that.
+- **Snapshot and rollback**: the context returned from `onMutate` is the only reliable way to know what to restore in `onError`.
+- **The post comes from the cache**: `LikeButton` renders `post` from `useQuery` or `useInfiniteQuery`. The optimistic `setQueryData` re-renders it immediately, with no local `useState` copy to keep in sync.
+- **Don't invalidate the whole feed on every like**: that refetches every loaded page. Patch the feed optimistically and invalidate only the cheap detail query, or rely on the server response.
+- **Idempotent endpoint**: with `PUT`/`DELETE` semantics, rapid taps send "true, false, true", and the final server state equals the last intent even if requests are retried. A `POST /toggle` endpoint turns retries into bugs.
+- **Concurrency**: the `isMutating(...) === 1` check skips resync while newer like mutations are pending. An alternative is `` scope: { id: `like-${postId}` } `` on the mutation, which makes TanStack Query v5 run mutations with the same scope **serially**.
+
+> [!INTERVIEW]
+> What a senior answer includes: cancel, snapshot, optimistic write, rollback, then invalidate; every cache that renders the entity; and a concrete strategy for rapid taps (idempotent API plus serialization or last-mutation resync). Red flag: keeping a local `liked` state that drifts from the cache.
+
+#### Follow-ups
+
+- **"Without TanStack Query?"** React 19's `useOptimistic` shows an optimistic value while an async transition is pending and automatically reverts to the real state when it ends:
+
+  ```tsx
+  const [optimisticPost, addOptimistic] = useOptimistic(post, (p: Post, liked: boolean) => applyLike(p, liked));
+  const onPress = () =>
+    startTransition(async () => {
+      const liked = !optimisticPost.liked;
+      addOptimistic(liked);
+      const saved = await setLike(post.id, liked);
+      setPost(saved); // update real state; on error, the optimistic value simply disappears
+    });
+  ```
+
+- **"Likes while offline."** Either persist paused mutations (TanStack `persistQueryClient`, `setMutationDefaults` so mutation functions can be restored, then `resumePausedMutations()`), or push the intent into your own offline queue (next challenge).
+- **"Debounce the network, not the UI."** Update the cache on every tap, but send only the final state after 500 ms of quiet, and skip the request if it equals the server state.
+- **"The post is shown in 5 different lists."** Use `qc.setQueriesData({ queryKey: ['feed'] }, updater)` to patch all matching lists. Better still, normalize: one entity cache (RTK Query entity adapter, Apollo or Relay) that all lists reference.
+
+### Build an offline mutation queue persisted to storage with retries
+
+**Task:** Users must be able to post comments and likes while offline. Build a queue that:
+
+- Persists mutations **before** attempting the network, so they survive an app kill.
+- Replays them in order when connectivity returns, on app start and on foreground.
+- Retries transient failures with exponential backoff and jitter.
+- Drops permanently failing items to a dead-letter callback so the UI can roll back.
+- Never processes two items concurrently.
+- Lets the UI show "pending" badges.
+
+#### What the interviewer evaluates
+
+- Durability ordering (persist first) and idempotency, because a request can succeed while its response is lost.
+- Single-flight processing, FIFO ordering, and the head-of-line blocking trade-off.
+- Error classification: network or 5xx/429 retry; other 4xx is permanent; 401 means refresh auth, not dead-letter.
+- Serialization: handlers are looked up by `type` because functions can't be persisted.
+- Integration with NetInfo and AppState, and a `useSyncExternalStore`-friendly API.
+
+#### Solution
+
+```mermaid
+flowchart TD
+    Act["User action e.g. send comment"] --> Opt["Optimistic UI update"]
+    Opt --> Enq["enqueue: id, type, payload, attempts = 0"]
+    Enq --> Persist[("Persist queue to storage")]
+    Persist --> Proc{"Processor already running?"}
+    Trig["Triggers: app start, reconnect, foreground, timer"] --> Proc
+    Proc -->|"yes"| Skip(["Return, single flight"])
+    Proc -->|"no"| Empty{"Queue empty?"}
+    Empty -->|"yes"| Idle(["Idle"])
+    Empty -->|"no"| Due{"Head item due now?"}
+    Due -->|"no"| Sched["Schedule timer for nextAttemptAt"]
+    Due -->|"yes"| Send["Run handler with Idempotency-Key"]
+    Send -->|"2xx"| Remove["Remove item and persist"]
+    Send -->|"network, 5xx, 429"| Backoff["attempts + 1, set nextAttemptAt with jittered backoff"]
+    Send -->|"4xx or max attempts"| Dead["Dead letter: remove, roll back UI, notify"]
+    Remove --> Empty
+    Backoff --> Due
+    Dead --> Empty
+```
+*Figure: Offline mutation queue. Persist first, process one item at a time, classify every failure.*
+
+```ts title="src/offline/OfflineQueue.ts"
+import 'react-native-get-random-values'; // crypto.getRandomValues polyfill required by uuid
+import { v4 as uuidv4 } from 'uuid';
+
+export interface AsyncKeyValueStore {
+  getItem(key: string): Promise<string | null>;
+  setItem(key: string, value: string): Promise<void>;
+}
+
+export interface QueuedMutation<P = unknown> {
+  id: string; // doubles as the Idempotency-Key
+  type: string; // selects the handler, e.g. 'comment.create'
+  payload: P;
+  createdAt: number;
+  attempts: number;
+  nextAttemptAt: number;
+  lastError?: string;
+}
+
+export type MutationHandler = (m: QueuedMutation) => Promise<void>;
+
+/** Throw from a handler when retrying can never succeed (400, 403, 404, 422...). */
+export class PermanentError extends Error {
+  name = 'PermanentError';
+}
+
+interface QueueOptions {
+  storageKey?: string;
+  maxAttempts?: number;
+  onDeadLetter?: (m: QueuedMutation, error: unknown) => void;
+}
+
+const backoffMs = (attempt: number) => Math.round(Math.random() * Math.min(60_000, 1_000 * 2 ** attempt));
+
+export class OfflineQueue {
+  private items: readonly QueuedMutation[] = [];
+  private processing = false;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private listeners = new Set<() => void>();
+  private readonly ready: Promise<void>;
+
+  constructor(
+    private readonly storage: AsyncKeyValueStore,
+    private readonly handlers: Record<string, MutationHandler>,
+    private readonly options: QueueOptions = {},
+  ) {
+    this.ready = this.restore();
+  }
+
+  private get key() {
+    return this.options.storageKey ?? 'offline-queue/v1';
+  }
+
+  private get maxAttempts() {
+    return this.options.maxAttempts ?? 8;
+  }
+
+  // ---- public API -------------------------------------------------------
+
+  async enqueue<P>(type: string, payload: P): Promise<string> {
+    await this.ready;
+    const m: QueuedMutation<P> = {
+      id: uuidv4(),
+      type,
+      payload,
+      createdAt: Date.now(),
+      attempts: 0,
+      nextAttemptAt: 0,
+    };
+    await this.commit([...this.items, m]); // durable BEFORE touching the network
+    void this.process();
+    return m.id;
+  }
+
+  /** Call on reconnect / foreground: skip any remaining backoff and try now. */
+  async retryNow(): Promise<void> {
+    await this.ready; // never overwrite storage before the saved queue is restored
+    if (this.items.some((m) => m.nextAttemptAt > 0)) {
+      await this.commit(this.items.map((m) => ({ ...m, nextAttemptAt: 0 })));
+    }
+    await this.process();
+  }
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  };
+
+  getSnapshot = (): readonly QueuedMutation[] => this.items;
+
+  // ---- processing -------------------------------------------------------
+
+  async process(): Promise<void> {
+    await this.ready;
+    if (this.processing) return; // single flight
+    this.processing = true;
+    try {
+      while (this.items.length > 0) {
+        const head = this.items[0];
+        const wait = head.nextAttemptAt - Date.now();
+        if (wait > 0) {
+          this.schedule(wait);
+          return;
+        }
+
+        try {
+          const handler = this.handlers[head.type];
+          if (!handler) throw new PermanentError(`No handler registered for '${head.type}'`);
+          await handler(head);
+          await this.commit(this.items.filter((m) => m.id !== head.id));
+        } catch (error) {
+          const attempts = head.attempts + 1;
+          if (error instanceof PermanentError || attempts >= this.maxAttempts) {
+            await this.commit(this.items.filter((m) => m.id !== head.id));
+            this.options.onDeadLetter?.(head, error);
+          } else {
+            const updated: QueuedMutation = {
+              ...head,
+              attempts,
+              nextAttemptAt: Date.now() + backoffMs(attempts),
+              lastError: String(error),
+            };
+            await this.commit(this.items.map((m) => (m.id === head.id ? updated : m)));
+          }
+        }
+      }
+    } finally {
+      this.processing = false;
+    }
+  }
+
+  // ---- internals ----------------------------------------------------------
+
+  private async commit(next: readonly QueuedMutation[]): Promise<void> {
+    this.items = next; // in-memory state updates synchronously (new array = new snapshot)
+    this.listeners.forEach((l) => l());
+    await this.storage.setItem(this.key, JSON.stringify(next));
+  }
+
+  private schedule(ms: number) {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this.process();
+    }, ms);
+  }
+
+  private async restore(): Promise<void> {
+    try {
+      const raw = await this.storage.getItem(this.key);
+      const parsed: unknown = raw ? JSON.parse(raw) : [];
+      this.items = Array.isArray(parsed) ? (parsed as QueuedMutation[]) : [];
+    } catch {
+      this.items = []; // corrupted payload: start clean (and report it in real code)
+    }
+    this.listeners.forEach((l) => l());
+  }
+}
+```
+
+```ts title="src/offline/queue.ts"
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
+import { AppState } from 'react-native';
+import { OfflineQueue, PermanentError, type QueuedMutation } from './OfflineQueue';
+import { toast } from '../toast/ToastProvider';
+
+async function postJson(url: string, m: QueuedMutation): Promise<void> {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': m.id },
+    body: JSON.stringify(m.payload),
+  });
+  if (res.ok) return;
+  const retryable = res.status === 401 || res.status === 408 || res.status === 429 || res.status >= 500;
+  if (!retryable) throw new PermanentError(`HTTP ${res.status}`);
+  throw new Error(`HTTP ${res.status}`); // 401: the auth layer refreshes the token; retry later
+}
+
+export const offlineQueue = new OfflineQueue(
+  AsyncStorage,
+  {
+    'comment.create': (m) => postJson('https://api.example.com/comments', m),
+    'post.like': (m) => postJson('https://api.example.com/likes', m),
+  },
+  {
+    onDeadLetter: (m) => {
+      toast.show({ message: "Some offline changes couldn't be saved.", type: 'error' });
+      // Also: roll back the optimistic UI for m.id, report to monitoring.
+    },
+  },
+);
+
+// Wire once at app start (module scope), not inside a component.
+NetInfo.addEventListener((state) => {
+  if (state.isConnected && state.isInternetReachable !== false) void offlineQueue.retryNow();
+});
+AppState.addEventListener('change', (status) => {
+  if (status === 'active') void offlineQueue.retryNow();
+});
+void offlineQueue.process(); // drain what's left from the previous session
+```
+
+```ts title="src/offline/usePendingMutations.ts"
+import { useSyncExternalStore } from 'react';
+import { offlineQueue } from './queue';
+
+export function usePendingMutations(type?: string) {
+  const items = useSyncExternalStore(offlineQueue.subscribe, offlineQueue.getSnapshot);
+  return type ? items.filter((m) => m.type === type) : items;
+}
+```
+
+#### Walkthrough
+
+- **Persist first**: if the app is killed between the tap and the request, the mutation is still on disk. The reverse order loses data.
+- **Idempotency key**: the request might succeed on the server while the response is lost (for example, a tunnel). The retry carries the same `Idempotency-Key`, so the server returns the original result instead of creating a duplicate comment. Without server support for idempotency, an offline queue is unsafe for non-idempotent operations.
+- **Single flight and FIFO**: the `processing` flag prevents two loops racing when reconnect and foreground events arrive together. Strict FIFO preserves causality: "create comment" must land before "edit comment". The cost is **head-of-line blocking**, where one stuck item delays everything behind it.
+- **Classification**: 4xx (except 401, 408 and 429) is permanent. Retrying a 422 forever wastes battery and hides the bug. 401 is treated as transient so the auth layer can refresh the token.
+- **Immutable snapshots**: every change assigns a new array, so `getSnapshot` works with `useSyncExternalStore`. Mutating in place would mean React never sees a change.
+- **Guarding restore**: every public method awaits `ready`. Otherwise an early `retryNow()` could write `[]` to storage before the saved queue was read, and a crash at that moment would lose it.
+- **Storage choice**: AsyncStorage is unencrypted. Don't queue tokens or sensitive payloads there; use encrypted MMKV or keep secrets out of payloads. MMKV's synchronous API also removes the interleaved-write question entirely. See [Offline Storage & Sync](../guides/offline-storage.html).
+
+#### Follow-ups
+
+- **"Conflicts: the comment was edited on another device."** Send a version or ETag (`If-Match`). On 409, dead-letter the item, refetch, and let the user resolve it. Last-write-wins is a product decision, not a default.
+- **"Avoid head-of-line blocking."** Partition queues by entity (`postId`) and process partitions in parallel with a concurrency limit. That keeps order within an entity and parallelism across entities.
+- **"Create offline, then edit the same comment before sync."** Assign a client-generated id (UUID) that the server accepts as the primary key, so there are no temporary ids to remap. Otherwise, keep a temp-to-server id map and rewrite queued payloads when the create resolves.
+- **"Sync in the background."** OS-scheduled background tasks (expo-background-task, BackgroundFetch/WorkManager) are opportunistic, not guaranteed. The queue must work correctly without them. See [Background Tasks](../guides/background-tasks.html).
+
+### Build a minimal global store on `useSyncExternalStore` with selectors
+
+**Task:** Without Redux or Zustand, build `createStore(initializer)` returning `{ getState, setState, subscribe, useStore }`. Components subscribe with a **selector** and re-render only when the selected slice changes (with optional custom equality). Actions live in the store. The store is usable outside React.
+
+#### What the interviewer evaluates
+
+- Why `useSyncExternalStore` exists: tearing-free reads under concurrent rendering and correct subscription timing.
+- The **getSnapshot caching rule**: it must return the same reference for unchanged state, or React re-renders forever.
+- Selector memoization and equality (`Object.is` versus shallow).
+- Immutable updates, and skipping notifications for no-op writes.
+- Comparison with Context: fan-out re-renders and no selectors.
+
+#### Solution
+
+```ts title="src/store/createStore.ts"
+import { useMemo, useSyncExternalStore } from 'react';
+
+type Listener = () => void;
+export type SetState<T> = (partial: Partial<T> | ((state: T) => Partial<T>)) => void;
+export type GetState<T> = () => T;
+
+export function createStore<T extends object>(init: (set: SetState<T>, get: GetState<T>) => T) {
+  let state: T;
+  const listeners = new Set<Listener>();
+
+  const getState: GetState<T> = () => state;
+
+  const setState: SetState<T> = (partial) => {
+    const patch = typeof partial === 'function' ? (partial as (s: T) => Partial<T>)(state) : partial;
+    const changed = (Object.keys(patch) as Array<keyof T>).some((k) => !Object.is(patch[k], state[k]));
+    if (!changed) return; // no-op writes don't notify anyone
+    state = { ...state, ...patch }; // new reference = new snapshot
+    listeners.forEach((listener) => listener());
+  };
+
+  const subscribe = (listener: Listener) => {
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
+  };
+
+  state = init(setState, getState);
+
+  function useStore(): T;
+  function useStore<S>(selector: (state: T) => S, isEqual?: (a: S, b: S) => boolean): S;
+  function useStore<S>(selector?: (state: T) => S, isEqual: (a: S, b: S) => boolean = Object.is) {
+    const select = selector ?? ((s: T) => s as unknown as S);
+
+    // getSnapshot must return a cached value for the same store state,
+    // otherwise useSyncExternalStore loops. Memoize per selector/equality.
+    const getSelection = useMemo(() => {
+      let memo: { state: T; selected: S } | null = null;
+      return () => {
+        const current = state;
+        if (memo && Object.is(memo.state, current)) return memo.selected;
+        const selected = select(current);
+        if (memo && isEqual(memo.selected, selected)) {
+          memo = { state: current, selected: memo.selected }; // keep the old reference
+          return memo.selected;
+        }
+        memo = { state: current, selected };
+        return selected;
+      };
+    }, [select, isEqual]);
+
+    return useSyncExternalStore(subscribe, getSelection, getSelection);
+  }
+
+  return { getState, setState, subscribe, useStore };
+}
+
+export function shallow<A>(a: A, b: A): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  const keysA = Object.keys(a) as Array<keyof A>;
+  if (keysA.length !== Object.keys(b).length) return false;
+  return keysA.every((k) => Object.prototype.hasOwnProperty.call(b, k) && Object.is(a[k], b[k]));
+}
+```
+
+```tsx title="src/store/cartStore.tsx"
+import React from 'react';
+import { Button, Text } from 'react-native';
+import { createStore, shallow } from './createStore';
+
+interface CartState {
+  items: Record<string, number>; // productId -> quantity
+  add: (id: string) => void;
+  remove: (id: string) => void;
+  clear: () => void;
+}
+
+export const cartStore = createStore<CartState>((set) => ({
+  items: {},
+  add: (id) => set((s) => ({ items: { ...s.items, [id]: (s.items[id] ?? 0) + 1 } })),
+  remove: (id) =>
+    set((s) => {
+      const { [id]: _removed, ...rest } = s.items;
+      return { items: rest };
+    }),
+  clear: () => set({ items: {} }),
+}));
+
+const useCart = cartStore.useStore;
+const selectCount = (s: CartState) => Object.values(s.items).reduce((sum, q) => sum + q, 0);
+
+export function CartBadge() {
+  const count = useCart(selectCount); // re-renders only when the total changes
+  return <Text>{count}</Text>;
+}
+
+export function AddToCart({ productId }: { productId: string }) {
+  const add = useCart((s) => s.add); // actions never change, so this never re-renders from the store
+  return <Button title="Add to cart" onPress={() => add(productId)} />;
+}
+
+export function CartActions() {
+  // Object selector: pass shallow, or every store change would produce a "new" object.
+  const { items, clear } = useCart((s) => ({ items: s.items, clear: s.clear }), shallow);
+  return <Button title={`Clear ${Object.keys(items).length} products`} onPress={clear} />;
+}
+
+// Outside React (e.g. after a successful checkout API call):
+export const resetCart = () => cartStore.getState().clear();
+```
+
+#### Walkthrough
+
+- **Why `useSyncExternalStore`**: a hand-rolled `useState` + `useEffect(subscribe)` misses updates that happen between render and subscribe. Under concurrent rendering, it can also *tear*, where two components read different versions of the store in the same render. `useSyncExternalStore` solves both. It is what Redux, Zustand and friends use under the hood.
+- **Snapshot caching**: React calls `getSnapshot` during render and again to check for changes. If it returns a fresh object each time, React assumes the store changed and re-renders forever (in development it warns that the result of getSnapshot should be cached). The memo returns the previous selection for unchanged state, and keeps the previous reference when `isEqual` says the new selection is equivalent.
+- **Equality**: `Object.is` is right for primitives and stable references (`s.add`, `s.items`). Selectors that build objects need `shallow`.
+- **Immutable writes**: `set` creates a new state object. Mutating `state.items[id]++` would keep the same references, so no one would be notified.
+- **Inline selectors**: a new selector function each render recreates the memo. That is fine for correctness (it recomputes once per render), and hoisting selectors (`selectCount`) avoids the work.
+- **Honest limitation**: the official `useSyncExternalStoreWithSelector` (in the `use-sync-external-store` package) also carries the last selection *across* selector identity changes. Libraries use it, or equivalent logic, for that reason.
+
+#### Follow-ups
+
+- **"Persist it."** `subscribe` to the store and write the relevant slice to MMKV, debounced. Hydrate synchronously from MMKV at creation time, so there is no flash of empty cart.
+- **"Middleware (logging, devtools, immer)."** Wrap `setState`: `const set = (p) => { const prev = state; rawSet(p); log(prev, state); }`. With immer, `set((s) => produce(s, draft => ...))`.
+- **"Global singletons break tests and multi-instance screens."** Create the store per provider (`const [store] = useState(() => createStore(init))`) and pass it via context. The context value never changes, and the store handles the updates.
+- **"Why not just Context?"** Every consumer re-renders when the context value changes, and there is no selector API. Context is ideal for rarely changing values (theme, auth, DI) and poor for hot state.
+
+### Write a retry utility with exponential backoff and jitter
+
+**Task:** Implement `retry(fn, options)`. It retries a failing async operation with exponential backoff, a maximum delay, **jitter**, a configurable `shouldRetry` predicate, a `Retry-After` header override, an `onRetry` hook and cancellation via `AbortSignal`. Only transient errors are retried.
+
+#### What the interviewer evaluates
+
+- The backoff formula and why **jitter** matters (the thundering herd after an outage).
+- Error classification: network, 408, 429 and 5xx are retryable; 4xx and aborts are not.
+- Honouring `Retry-After`.
+- An abortable sleep, and not retrying non-idempotent requests blindly.
+- Clean, generic TypeScript.
+
+#### Solution
+
+```ts title="src/lib/retry.ts"
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+    public readonly retryAfterMs?: number,
+  ) {
+    super(message);
+    this.name = 'HttpError';
+  }
+}
+
+export interface RetryOptions {
+  retries?: number; // retries AFTER the first attempt
+  baseMs?: number;
+  maxMs?: number;
+  factor?: number;
+  jitter?: 'full' | 'equal' | 'none';
+  shouldRetry?: (error: unknown, attempt: number) => boolean;
+  onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
+  signal?: AbortSignal;
+}
+
+export function computeDelay(
+  attempt: number,
+  { baseMs = 300, maxMs = 30_000, factor = 2, jitter = 'full' }: RetryOptions = {},
+): number {
+  const exp = Math.min(maxMs, baseMs * factor ** attempt);
+  if (jitter === 'none') return exp;
+  if (jitter === 'equal') return exp / 2 + Math.random() * (exp / 2);
+  return Math.random() * exp; // full jitter: uniform in [0, exp]
+}
+
+export function isRetryable(error: unknown): boolean {
+  if (error instanceof HttpError) {
+    return error.status === 408 || error.status === 429 || error.status >= 500;
+  }
+  if (error instanceof Error && error.name === 'AbortError') return false;
+  // RN's fetch rejects with TypeError('Network request failed') on connectivity errors.
+  return error instanceof TypeError;
+}
+
+export function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(value); // HTTP-date form
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+}
+
+function abortError(): Error {
+  const e = new Error('Aborted');
+  e.name = 'AbortError';
+  return e;
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort);
+  });
+}
+
+export async function retry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
+  const { retries = 3, shouldRetry = isRetryable, onRetry, signal } = options;
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt >= retries || signal?.aborted || !shouldRetry(error, attempt)) throw error;
+      const serverHint = error instanceof HttpError ? error.retryAfterMs ?? 0 : 0;
+      const delay = Math.max(computeDelay(attempt, options), serverHint);
+      onRetry?.(error, attempt + 1, delay);
+      await sleep(delay, signal);
+    }
+  }
+}
+```
+
+```ts
+const controller = new AbortController();
+
+const profile = await retry(
+  async () => {
+    const res = await fetch('https://api.example.com/me', { signal: controller.signal });
+    if (!res.ok) {
+      throw new HttpError(res.status, `HTTP ${res.status}`, parseRetryAfter(res.headers.get('Retry-After')));
+    }
+    return (await res.json()) as { id: string; name: string };
+  },
+  {
+    retries: 4,
+    signal: controller.signal,
+    onRetry: (e, n, ms) => console.log(`retry #${n} in ${Math.round(ms)} ms`),
+  },
+);
+```
+
+#### Walkthrough
+
+| Attempt (0-based) | No jitter (base 300 ms, ×2) | Full jitter range |
+|---|---|---|
+| 0 | 300 ms | 0–300 ms |
+| 1 | 600 ms | 0–600 ms |
+| 2 | 1.2 s | 0–1.2 s |
+| 3 | 2.4 s | 0–2.4 s |
+| 10 | capped at 30 s | 0–30 s |
+
+- **Why jitter**: when a backend recovers from an outage, a million clients using identical backoff schedules retry in synchronized waves and knock it over again. Randomizing spreads the load. "Full jitter" (uniform between 0 and the exponential value) is the variant AWS's architecture blog found to work well. "Equal jitter" keeps a guaranteed minimum wait.
+- **Classification first**: retrying a 400 or 403 just delays the inevitable error and multiplies server load. Aborts are user intent, so never retry them.
+- **Retry-After**: servers returning 429 or 503 often tell you when to come back. Taking `max(backoff, hint)` respects it.
+- **Abortable sleep**: navigating away should stop the whole chain, not just the in-flight request. The listener is removed on normal completion to avoid leaks on long-lived signals.
+- **Idempotency**: only retry `POST` with an idempotency key. `GET`, `PUT` and `DELETE` are idempotent by definition.
+- The loop has no condition, so TypeScript knows it never falls through, and no unreachable `return` is needed.
+
+#### Follow-ups
+
+- **"Use it with TanStack Query."** It has this built in: `retry: (count, error) => count < 3 && isRetryable(error)` and `retryDelay: (attempt) => computeDelay(attempt)`.
+- **"Many concurrent requests get 401. Refresh the token once."** Keep a single in-flight `refreshPromise`. Every 401 awaits it, then replays its request once. On refresh failure, log the user out.
+- **"Circuit breaker."** After N consecutive failures, fail fast for a cool-down period, then allow one probe request (half-open). This protects the battery and the backend.
+- **"Test it deterministically."** Mock `Math.random` (`jest.spyOn(Math, 'random').mockReturnValue(0.5)`), use fake timers, and advance by the computed delays.
+
+### Implement an LRU cache
+
+**Task:** Implement `LRUCache<K, V>` with a fixed capacity. `get(key)` returns the value and marks it most recently used. `set(key, value)` inserts or updates, evicting the least recently used entry when full. Both must be **O(1)**. Then implement it again without relying on `Map` insertion order (hash map plus doubly linked list), which is the version many interviewers are really asking for.
+
+#### What the interviewer evaluates
+
+- Knowing that JS `Map` preserves insertion order, and using delete-plus-reinsert to refresh recency.
+- The classic hash map plus doubly linked list design, with pointer manipulation that has no edge-case bugs (single node, head, tail).
+- API semantics: does `has()` count as a use? Does updating an existing key refresh it?
+- Input validation and TypeScript generics.
+- Real uses in apps: response caches, image metadata, memoized computations.
+
+#### Solution
+
+```ts title="src/lib/LRUCache.ts"
+/** O(1) LRU using Map's insertion order: first key = least recently used. */
+export class LRUCache<K, V> {
+  private readonly map = new Map<K, V>();
+
+  constructor(private readonly capacity: number) {
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new RangeError('capacity must be a positive integer');
+    }
+  }
+
+  get size(): number {
+    return this.map.size;
+  }
+
+  get(key: K): V | undefined {
+    if (!this.map.has(key)) return undefined;
+    const value = this.map.get(key) as V;
+    this.map.delete(key); // move to the "most recent" end
+    this.map.set(key, value);
+    return value;
+  }
+
+  /** Read without affecting recency. */
+  peek(key: K): V | undefined {
+    return this.map.get(key);
+  }
+
+  has(key: K): boolean {
+    return this.map.has(key);
+  }
+
+  set(key: K, value: V): this {
+    if (this.map.has(key)) {
+      this.map.delete(key);
+    } else if (this.map.size >= this.capacity) {
+      const oldest = this.map.keys().next().value as K;
+      this.map.delete(oldest);
+    }
+    this.map.set(key, value);
+    return this;
+  }
+
+  delete(key: K): boolean {
+    return this.map.delete(key);
+  }
+
+  clear(): void {
+    this.map.clear();
+  }
+}
+```
+
+```ts title="src/lib/LinkedLRUCache.ts"
+interface Node<K, V> {
+  key: K;
+  value: V;
+  prev: Node<K, V> | null;
+  next: Node<K, V> | null;
+}
+
+/** Hash map for O(1) lookup + doubly linked list for O(1) recency updates. */
+export class LinkedLRUCache<K, V> {
+  private readonly nodes = new Map<K, Node<K, V>>();
+  private head: Node<K, V> | null = null; // most recently used
+  private tail: Node<K, V> | null = null; // least recently used
+
+  constructor(
+    private readonly capacity: number,
+    private readonly onEvict?: (key: K, value: V) => void,
+  ) {
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new RangeError('capacity must be a positive integer');
+    }
+  }
+
+  get(key: K): V | undefined {
+    const node = this.nodes.get(key);
+    if (!node) return undefined;
+    this.moveToFront(node);
+    return node.value;
+  }
+
+  set(key: K, value: V): void {
+    const existing = this.nodes.get(key);
+    if (existing) {
+      existing.value = value;
+      this.moveToFront(existing);
+      return;
+    }
+    const node: Node<K, V> = { key, value, prev: null, next: null };
+    this.nodes.set(key, node);
+    this.addToFront(node);
+    if (this.nodes.size > this.capacity) this.evictTail();
+  }
+
+  private addToFront(node: Node<K, V>): void {
+    node.prev = null;
+    node.next = this.head;
+    if (this.head) this.head.prev = node;
+    this.head = node;
+    if (!this.tail) this.tail = node;
+  }
+
+  private unlink(node: Node<K, V>): void {
+    if (node.prev) node.prev.next = node.next;
+    else this.head = node.next;
+    if (node.next) node.next.prev = node.prev;
+    else this.tail = node.prev;
+    node.prev = null;
+    node.next = null;
+  }
+
+  private moveToFront(node: Node<K, V>): void {
+    if (this.head === node) return;
+    this.unlink(node);
+    this.addToFront(node);
+  }
+
+  private evictTail(): void {
+    const lru = this.tail;
+    if (!lru) return;
+    this.unlink(lru);
+    this.nodes.delete(lru.key);
+    this.onEvict?.(lru.key, lru.value);
+  }
+}
+```
+
+```ts
+const cache = new LRUCache<string, number>(2);
+cache.set('a', 1).set('b', 2);
+cache.get('a'); // 1: 'a' is now most recent
+cache.set('c', 3); // evicts 'b' (least recently used)
+cache.has('b'); // false
+```
+
+#### Walkthrough
+
+- **Map version**: `Map` iterates keys in insertion order. Deleting and re-inserting a key moves it to the end, so the first key is always the least recently used. Every operation is O(1) amortized. `has()` and `peek()` deliberately don't refresh recency, because "checking" is not "using". Say that decision out loud.
+- **Linked version**: the map gives O(1) lookup of the *node*, and the list gives O(1) move-to-front and evict-tail because each node knows its neighbours. `unlink` handles all four cases (middle, head, tail, only node) through the `else` branches that update `head` and `tail`.
+- **`onEvict`** lets callers release resources: revoke object URLs, delete temp files, cancel prefetches.
+- **Memory**: an LRU bounds entry *count*, not bytes. For images or blobs, bound by size (next follow-up) or cache references (URIs), not decoded bitmaps. Native image libraries already maintain their own memory and disk caches.
+
+#### Follow-ups
+
+- **"Add TTL."** Store `{ value, expiresAt }`. `get` checks expiry lazily and deletes stale entries, and an optional sweep runs on `AppState` `active`.
+- **"Bound by bytes."** Take a `sizeOf(value)` function, track `totalSize`, and evict from the tail while `totalSize > maxBytes`.
+- **"Cache async results without duplicate fetches."** Store the **Promise** as the value, so concurrent callers share it. Delete the entry if the promise rejects, so errors aren't cached.
+- **"Production?"** The `lru-cache` package (TTL, size limits, fetch method) or TanStack Query's cache (`gcTime`) for server state.
+
+### Implement a type-safe event emitter
+
+**Task:** Implement `TypedEmitter<Events>` where `Events` maps event names to payload types. `on`, `once` and `off` are type-checked, `emit('x', payload)` requires the correct payload, and events with a `void` payload take **no** argument. `on` returns an unsubscribe function. A throwing listener must not stop the other listeners.
+
+#### What the interviewer evaluates
+
+- Generic constraints, `keyof`, indexed access types, and conditional rest parameters.
+- Safe iteration while listeners unsubscribe during emit (`once`).
+- Error isolation between listeners.
+- An API that fits React: an unsubscribe function returned directly from `useEffect`.
+- Knowing when an emitter is appropriate (cross-cutting signals) and when it isn't (state belongs in a store).
+
+#### Solution
+
+```ts title="src/lib/TypedEmitter.ts"
+type Handler<P> = (payload: P) => void;
+type EmitArgs<P> = [P] extends [void] ? [] : [payload: P];
+
+export class TypedEmitter<Events extends Record<string, unknown>> {
+  private readonly handlers = new Map<keyof Events, Set<Handler<unknown>>>();
+
+  constructor(
+    private readonly onError: (error: unknown, event: keyof Events) => void = (error) => console.error(error),
+  ) {}
+
+  on<K extends keyof Events>(event: K, handler: Handler<Events[K]>): () => void {
+    let set = this.handlers.get(event);
+    if (!set) {
+      set = new Set();
+      this.handlers.set(event, set);
+    }
+    set.add(handler as Handler<unknown>);
+    return () => this.off(event, handler);
+  }
+
+  once<K extends keyof Events>(event: K, handler: Handler<Events[K]>): () => void {
+    const off = this.on(event, (payload) => {
+      off();
+      handler(payload);
+    });
+    return off;
+  }
+
+  off<K extends keyof Events>(event: K, handler: Handler<Events[K]>): void {
+    const set = this.handlers.get(event);
+    if (!set) return;
+    set.delete(handler as Handler<unknown>);
+    if (set.size === 0) this.handlers.delete(event);
+  }
+
+  emit<K extends keyof Events>(event: K, ...args: EmitArgs<Events[K]>): void {
+    const set = this.handlers.get(event);
+    if (!set) return;
+    const payload = (args as unknown[])[0];
+    // Snapshot: listeners added/removed during this emit don't affect this round.
+    for (const handler of [...set]) {
+      try {
+        handler(payload);
+      } catch (error) {
+        this.onError(error, event);
+      }
+    }
+  }
+
+  waitFor<K extends keyof Events>(event: K): Promise<Events[K]> {
+    return new Promise((resolve) => {
+      this.once(event, resolve);
+    });
+  }
+
+  listenerCount(event: keyof Events): number {
+    return this.handlers.get(event)?.size ?? 0;
+  }
+}
+```
+
+```ts title="src/lib/appEvents.ts"
+import { useEffect, useLayoutEffect, useRef } from 'react';
+import { TypedEmitter } from './TypedEmitter';
+
+// A `type` alias, not an `interface`: only type aliases get the implicit index
+// signature needed to satisfy `Record<string, unknown>`.
+type AppEvents = {
+  'auth:expired': void;
+  'cart:updated': { count: number };
+  'deeplink:received': { url: string };
+};
+
+export const appEvents = new TypedEmitter<AppEvents>();
+
+appEvents.emit('auth:expired'); // OK, no payload
+appEvents.emit('cart:updated', { count: 3 }); // OK
+// appEvents.emit('cart:updated');             // error: payload required
+// appEvents.emit('cart:updatd', { count: 3 }); // error: unknown event name
+
+export function useAppEvent<K extends keyof AppEvents>(event: K, handler: (payload: AppEvents[K]) => void) {
+  const handlerRef = useRef(handler);
+  useLayoutEffect(() => {
+    handlerRef.current = handler;
+  });
+  // `on` returns the unsubscribe function, which is exactly what an effect cleanup wants.
+  useEffect(() => appEvents.on(event, (payload) => handlerRef.current(payload)), [event]);
+}
+```
+
+#### Walkthrough
+
+- **Typing**: `K extends keyof Events` ties the event name to its payload through `Events[K]`. `EmitArgs` wraps both sides in tuples (`[P] extends [void]`) so the conditional doesn't distribute over unions and `void` events take zero arguments.
+- **Internals are loosely typed on purpose**: storing `Set<Handler<unknown>>` behind a strictly typed public API avoids fighting TypeScript over generic mapped-type writes. Soundness is guaranteed at the boundary (`on`/`emit`).
+- **Snapshot iteration**: `once` removes itself during emit. Iterating a copy (`[...set]`) also prevents a listener added during emit from firing in the same round.
+- **Error isolation**: one faulty analytics listener must not stop the logout listener. The error is reported through `onError` (wire it to Sentry) instead of being swallowed.
+- **The `interface` gotcha**: `interface AppEvents { ... }` fails the `Record<string, unknown>` constraint because interfaces are open to declaration merging and get no implicit index signature. A `type` alias works. It is a good detail to volunteer.
+
+#### Follow-ups
+
+- **"Where would you use this in an RN app?"** For cross-cutting fire-and-forget signals: an HTTP interceptor emits `auth:expired` and the navigation layer shows login; a deep link arrives before the navigator is ready. Don't use it for state other screens need to *read*; that belongs in a store.
+- **"Detect leaks."** Warn in development when `listenerCount(event)` exceeds a threshold, like Node's `MaxListenersExceededWarning`. The usual cause is a missing effect cleanup.
+- **"Wildcard listener."** Keep a separate `Set<(event, payload) => void>` notified on every emit. It is useful for logging and devtools.
+- **"`waitFor` with timeout."** Race the `once` promise against a timer, and unsubscribe in both paths so neither leaks.
+
+### Implement `debounce` and `throttle` from scratch
+
+**Task:** Without lodash, implement `debounce(fn, wait, { leading, trailing })` with `cancel()` and `flush()`, and `throttle(fn, wait)` with leading and trailing invocation plus `cancel()`. Both must forward `this` and arguments, and throttle must use the latest arguments for the trailing call. Write tests with fake timers.
+
+#### What the interviewer evaluates
+
+- Closures as private state, and timer management.
+- Precise leading and trailing semantics (lodash-compatible behaviour is a plus).
+- `this` and argument forwarding (`fn.apply`), and TypeScript typing of the returned function with attached methods.
+- Timestamp-based remaining-time math for throttle, including clock-skew safety.
+- Testing with Jest fake timers.
+
+#### Solution
+
+```ts title="src/lib/timing.ts"
+type Timer = ReturnType<typeof setTimeout>;
+
+export function debounce<A extends unknown[]>(
+  fn: (...args: A) => void,
+  wait: number,
+  { leading = false, trailing = true }: { leading?: boolean; trailing?: boolean } = {},
+) {
+  let timer: Timer | undefined;
+  let lastArgs: A | undefined;
+  let lastThis: unknown;
+
+  function invoke() {
+    const args = lastArgs as A;
+    const ctx = lastThis;
+    lastArgs = undefined;
+    lastThis = undefined;
+    fn.apply(ctx, args);
+  }
+
+  function debounced(this: unknown, ...args: A): void {
+    lastArgs = args;
+    lastThis = this;
+    const isIdle = timer === undefined;
+    if (timer !== undefined) clearTimeout(timer);
+
+    timer = setTimeout(() => {
+      timer = undefined;
+      // Trailing call only if there were calls since the leading invoke.
+      if (trailing && lastArgs) invoke();
+      lastArgs = undefined;
+      lastThis = undefined;
+    }, wait);
+
+    if (leading && isIdle) invoke();
+  }
+
+  debounced.cancel = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+    lastArgs = undefined;
+    lastThis = undefined;
+  };
+
+  debounced.flush = (): void => {
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    timer = undefined;
+    if (lastArgs) invoke();
+  };
+
+  return debounced;
+}
+
+export function throttle<A extends unknown[]>(fn: (...args: A) => void, wait: number) {
+  let lastCall = 0;
+  let timer: Timer | undefined;
+  let pendingArgs: A | undefined;
+  let pendingThis: unknown;
+
+  function throttled(this: unknown, ...args: A): void {
+    const now = Date.now();
+    const remaining = wait - (now - lastCall);
+
+    // `remaining > wait` means the system clock went backwards: treat it as expired.
+    if (remaining <= 0 || remaining > wait) {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      lastCall = now;
+      pendingArgs = undefined;
+      fn.apply(this, args); // leading edge
+      return;
+    }
+
+    // Inside the window: remember the latest call for the trailing edge.
+    pendingArgs = args;
+    pendingThis = this;
+    if (timer === undefined) {
+      timer = setTimeout(() => {
+        timer = undefined;
+        lastCall = Date.now();
+        const a = pendingArgs;
+        const ctx = pendingThis;
+        pendingArgs = undefined;
+        pendingThis = undefined;
+        if (a) fn.apply(ctx, a); // trailing edge with the latest args
+      }, remaining);
+    }
+  }
+
+  throttled.cancel = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+    lastCall = 0;
+    pendingArgs = undefined;
+    pendingThis = undefined;
+  };
+
+  return throttled;
+}
+```
+
+```ts title="src/lib/__tests__/timing.test.ts"
+import { debounce, throttle } from '../timing';
+
+beforeEach(() => jest.useFakeTimers());
+afterEach(() => jest.useRealTimers());
+
+test('debounce calls once with the last arguments', () => {
+  const fn = jest.fn();
+  const d = debounce(fn, 100);
+  d('a');
+  d('b');
+  d('c');
+  jest.advanceTimersByTime(99);
+  expect(fn).not.toHaveBeenCalled();
+  jest.advanceTimersByTime(1);
+  expect(fn).toHaveBeenCalledTimes(1);
+  expect(fn).toHaveBeenCalledWith('c');
+});
+
+test('debounce leading fires immediately and skips trailing for a single call', () => {
+  const fn = jest.fn();
+  const d = debounce(fn, 100, { leading: true });
+  d(1);
+  expect(fn).toHaveBeenCalledWith(1);
+  jest.advanceTimersByTime(100);
+  expect(fn).toHaveBeenCalledTimes(1);
+});
+
+test('throttle fires on the leading and trailing edges', () => {
+  const fn = jest.fn();
+  const t = throttle(fn, 100);
+  t(1);
+  t(2);
+  t(3);
+  expect(fn).toHaveBeenNthCalledWith(1, 1);
+  jest.advanceTimersByTime(100);
+  expect(fn).toHaveBeenNthCalledWith(2, 3);
+  expect(fn).toHaveBeenCalledTimes(2);
+});
+
+test('debounce preserves this', () => {
+  const calls: string[] = [];
+  const obj = {
+    name: 'form',
+    save: debounce(function (this: { name: string }) {
+      calls.push(this.name);
+    }, 50),
+  };
+  obj.save();
+  jest.runAllTimers();
+  expect(calls).toEqual(['form']);
+});
+```
+
+#### Walkthrough
+
+- **Debounce**: every call resets the timer. With `leading: true`, the first call of a burst runs immediately (`isIdle`) and clears `lastArgs`, so a single call doesn't also fire a trailing call. That matches lodash: with both edges enabled, the trailing call happens only if the function was called again during the wait.
+- **Throttle**: it is timestamp-based, not "one timer per call". Calls outside the window run immediately. Calls inside store the latest arguments, and a single timer fires at the window's end with them. The `remaining > wait` guard handles the device clock being moved backwards, which would otherwise freeze the throttle.
+- **`this` forwarding**: declaring `this: unknown` as a fake first parameter types the context, and `fn.apply(ctx, args)` forwards it. Arrow functions would lose the caller's `this`.
+- **Typing**: TypeScript supports expando properties on function declarations, so `debounced.cancel = ...` produces a callable type with `cancel` and `flush` without casts.
+- **Fake timers**: Jest's modern fake timers also mock `Date`, so throttle's `Date.now()` math advances together with `advanceTimersByTime`.
+- **Complexity**: O(1) per call, with one timer alive at most.
+
+#### Follow-ups
+
+- **"Implement `maxWait`."** Track the time of the first call in the burst. On each call, if `now - burstStart >= maxWait`, invoke immediately. Lodash implements `throttle` as `debounce` with `maxWait = wait` and both edges enabled.
+- **"Return the function's result."** Lodash returns the result of the *last* invocation, which is often confusing. A cleaner design for async work is a debounced function that returns a Promise resolved with the eventual result for every caller in the burst.
+- **"Why not `setInterval` for throttle?"** It fires even when there are no calls (wasted work) and doesn't align the window with the first call.
+
+## Debug this code
+
+### Find the bugs: a stopwatch that sticks at 1 and won't stop
+
+**Task:** A teammate's stopwatch shows "1s" forever after Start, Stop doesn't stop it, pressing Start again makes it misbehave, and it shows the wrong time after returning from the background. Find every bug and fix it.
+
+```tsx title="src/components/Stopwatch.tsx (buggy)"
+import React, { useEffect, useState } from 'react';
+import { Button, Text, View } from 'react-native';
+
+export function Stopwatch() {
+  const [seconds, setSeconds] = useState(0);
+  const [running, setRunning] = useState(false);
+
+  useEffect(() => {
+    if (running) {
+      setInterval(() => {
+        setSeconds(seconds + 1);
+      }, 1000);
+    }
+  }, [running]);
+
+  return (
+    <View>
+      <Text>{seconds}s</Text>
+      <Button title={running ? 'Stop' : 'Start'} onPress={() => setRunning(!running)} />
+      <Button title="Reset" onPress={() => setSeconds(0)} />
+    </View>
+  );
+}
+```
+
+#### What the interviewer evaluates
+
+- Spotting the **stale closure**: the interval callback captured `seconds` from the render in which the effect ran.
+- Spotting the **missing cleanup**: the interval is never cleared.
+- Knowing that `exhaustive-deps` would have flagged `seconds`, and that adding it is *not* the right fix.
+- Going beyond the minimal fix to a timestamp-based design that survives backgrounding.
+
+#### Solution
+
+**Bugs:**
+
+1. **Stale closure**: `setSeconds(seconds + 1)` always computes `0 + 1`, so the display sticks at 1s.
+2. **No cleanup**: the effect doesn't return `clearInterval`. Stop only changes `running`, and the old interval keeps ticking. Every Start adds another interval, and they all keep running after unmount (a leak).
+3. **Reset appears broken**: the stale interval immediately writes `seconds + 1` again, using the captured value.
+4. **Tick counting**: intervals pause while the app is suspended and drift under load, so the elapsed time is wrong after backgrounding.
+
+Minimal fix (functional update plus cleanup):
+
+```tsx
+useEffect(() => {
+  if (!running) return;
+  const id = setInterval(() => setSeconds((s) => s + 1), 1000);
+  return () => clearInterval(id);
+}, [running]);
+```
+
+Production fix (derive elapsed time from timestamps):
+
+```tsx title="src/components/Stopwatch.tsx (fixed)"
+import React, { useEffect, useState } from 'react';
+import { Button, Text, View } from 'react-native';
+
+export function Stopwatch() {
+  const [accumulatedMs, setAccumulatedMs] = useState(0); // from previous runs
+  const [startedAt, setStartedAt] = useState<number | null>(null); // null = stopped
+  const [now, setNow] = useState(() => Date.now());
+  const running = startedAt !== null;
+
+  useEffect(() => {
+    if (startedAt === null) return;
+    const id = setInterval(() => setNow(Date.now()), 250); // only triggers re-renders
+    return () => clearInterval(id);
+  }, [startedAt]);
+
+  const elapsedMs = accumulatedMs + (startedAt !== null ? now - startedAt : 0);
+
+  const start = () => {
+    const t = Date.now();
+    setStartedAt(t);
+    setNow(t);
+  };
+  const stop = () => {
+    if (startedAt === null) return;
+    setAccumulatedMs((a) => a + (Date.now() - startedAt));
+    setStartedAt(null);
+  };
+  const reset = () => {
+    const t = Date.now();
+    setAccumulatedMs(0);
+    setStartedAt(running ? t : null);
+    setNow(t);
+  };
+
+  return (
+    <View>
+      <Text>{Math.floor(elapsedMs / 1000)}s</Text>
+      <Button title={running ? 'Stop' : 'Start'} onPress={running ? stop : start} />
+      <Button title="Reset" onPress={reset} />
+    </View>
+  );
+}
+```
+
+#### Walkthrough
+
+- Adding `seconds` to the deps would "fix" the counter by tearing down and recreating the interval every second. That is wasteful, and the timer resets on any re-render. The functional updater `setSeconds((s) => s + 1)` doesn't need the closure value at all.
+- The cleanup ties the interval's lifetime to `running`: stopping, restarting and unmounting all clear the previous interval.
+- In the production version, the interval only *schedules re-renders*. The displayed value is always `now - startedAt`, so a late tick, a busy JS thread or 5 minutes in the background can't make it wrong. The first tick after resume corrects it within 250 ms.
+
+#### Follow-ups
+
+- **"How would the linter have helped?"** `react-hooks/exhaustive-deps` warns that `seconds` is missing. The right response is a functional update, not adding the dependency.
+- **"Persist a running stopwatch across app restarts."** Store `startedAt` and `accumulatedMs` in MMKV. Both are absolute values, so a restore is exact.
+- **"Lap times?"** Record `elapsedMs` snapshots in an array. They are derived values, so they are consistent with the display.
+
+### Find the bugs: a chat screen that leaks subscriptions
+
+**Task:** After visiting a few chat rooms, users see duplicated messages, messages from the previous room, and battery drain. The keyboard handling gets slower over time. Find and fix the bugs.
+
+```tsx title="src/screens/ChatScreen.tsx (buggy)"
+import React, { useEffect, useState } from 'react';
+import { Keyboard } from 'react-native';
+import { fetchHistory, type Message } from '../api/chat';
+import { MessageList } from '../components/MessageList';
+
+export function ChatScreen({ roomId }: { roomId: string }) {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+
+  useEffect(() => {
+    fetchHistory(roomId).then((history) => setMessages(history));
+  }, [roomId]);
+
+  useEffect(() => {
+    const socket = new WebSocket(`wss://chat.example.com/rooms/${roomId}`);
+    socket.onmessage = (e) => {
+      setMessages((prev) => [...prev, JSON.parse(e.data)]);
+    };
+  }, []);
+
+  useEffect(() => {
+    Keyboard.addListener('keyboardDidShow', (e) => setKeyboardHeight(e.endCoordinates.height));
+    Keyboard.addListener('keyboardDidHide', () => setKeyboardHeight(0));
+  });
+
+  return <MessageList messages={messages} bottomInset={keyboardHeight} />;
+}
+```
+
+#### What the interviewer evaluates
+
+- Every subscription needs a matching cleanup: sockets, listeners, timers, requests.
+- Dependency arrays that match what the effect uses (`roomId`).
+- Async races when a prop changes (room A's slow history arriving in room B).
+- Merging two data sources (history plus live) without losing or duplicating messages.
+- RN navigation context: stack screens stay mounted when you navigate forward.
+
+#### Solution
+
+**Bugs:**
+
+1. **Socket never closed**: leaving the screen leaves the connection open (battery, data, server load). Remounting opens another one, so every message is delivered twice.
+2. **Missing `roomId` dependency on the socket effect**: switching rooms keeps the *first* room's socket, so messages from the wrong room appear. `exhaustive-deps` flags this.
+3. **Keyboard listeners with no deps array and no cleanup**: two new listeners on *every render*, none removed. After 100 renders, each keyboard event runs 100 `setState` calls. That is the "gets slower" symptom.
+4. **History race**: room A's slow history can resolve after the switch to room B and overwrite B's messages.
+5. **History overwrites live messages**: messages that arrived over the socket before history resolved are thrown away by `setMessages(history)`.
+
+```tsx title="src/screens/ChatScreen.tsx (fixed)"
+import React, { useEffect, useState } from 'react';
+import { Keyboard } from 'react-native';
+import { fetchHistory, type Message } from '../api/chat';
+import { MessageList } from '../components/MessageList';
+
+function mergeById(a: Message[], b: Message[]): Message[] {
+  const byId = new Map<string, Message>();
+  for (const m of [...a, ...b]) byId.set(m.id, m);
+  return [...byId.values()].sort((x, y) => x.createdAt - y.createdAt);
+}
+
+export function ChatScreen({ roomId }: { roomId: string }) {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+
+  // History: race-safe, merged with anything that already arrived live.
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    setMessages([]);
+    fetchHistory(roomId, controller.signal)
+      .then((history) => {
+        if (active) setMessages((live) => mergeById(history, live));
+      })
+      .catch((e: unknown) => {
+        if (active && !controller.signal.aborted) console.warn('History failed', e);
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [roomId]);
+
+  // Live messages: one socket per room, closed on room change and unmount.
+  useEffect(() => {
+    const socket = new WebSocket(`wss://chat.example.com/rooms/${encodeURIComponent(roomId)}`);
+    socket.onmessage = (e) => {
+      const message = JSON.parse(e.data) as Message;
+      setMessages((prev) => mergeById(prev, [message]));
+    };
+    return () => {
+      socket.onmessage = null;
+      socket.close();
+    };
+  }, [roomId]);
+
+  // Keyboard: subscribe once, remove on unmount.
+  useEffect(() => {
+    const show = Keyboard.addListener('keyboardDidShow', (e) => setKeyboardHeight(e.endCoordinates.height));
+    const hide = Keyboard.addListener('keyboardDidHide', () => setKeyboardHeight(0));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+
+  return <MessageList messages={messages} bottomInset={keyboardHeight} />;
+}
+```
+
+#### Walkthrough
+
+- **The cleanup rule**: whatever an effect opens, its cleanup closes. React runs the cleanup before re-running the effect (on dependency change) and on unmount, so "one socket per room" follows from the deps array.
+- **Strict Mode helps here**: in development, React mounts, unmounts and remounts every component. With the buggy code you'd immediately see two sockets and doubled messages. That is exactly the bug Strict Mode is designed to surface.
+- **Merge by id**: history and live streams overlap. A `Map` keyed by id deduplicates, and sorting by `createdAt` restores order. For very long chats, append-only merging with a `Set` of seen ids avoids the O(n log n) sort per message.
+- **Keyboard**: manual heights are fragile. Prefer `KeyboardAvoidingView`, or `react-native-keyboard-controller` for frame-accurate, interactive keyboard handling.
+
+#### Follow-ups
+
+- **"The chat should disconnect when the user navigates to another screen in the stack."** Stack screens stay mounted underneath the pushed screen, so the effect doesn't clean up. Use React Navigation's `useFocusEffect` (with a `useCallback`) to scope the socket to focus, or close it when the app backgrounds.
+- **"Reconnect after network loss."** Listen to `onclose`, reconnect with backoff and jitter, fetch missed messages since the last seen id, and stop reconnecting after cleanup has run.
+- **"How would you catch these in CI?"** Enforce the `react-hooks/exhaustive-deps` lint rule as an error, and add a test that unmounts the screen and asserts `socket.close` was called (mock `WebSocket`).
+
+### Find the bugs: a todo list that shows the wrong text after inserting and sorting
+
+**Task:** In this todo list, after tapping "Add", the first row shows the *old* first item's title. Sorting sometimes does nothing, edits disappear, and occasionally a warning about duplicate keys appears. Find the bugs.
+
+```tsx title="src/screens/TodoList.tsx (buggy)"
+import React, { useState } from 'react';
+import { Button, FlatList, Switch, Text, TextInput, View } from 'react-native';
+
+interface Todo {
+  id: string;
+  title: string;
+  done: boolean;
+}
+
+function TodoRow({ todo, onToggle }: { todo: Todo; onToggle: (id: string) => void }) {
+  const [draft, setDraft] = useState(todo.title);
+  const [editing, setEditing] = useState(false);
+
+  return (
+    <View style={{ flexDirection: 'row', alignItems: 'center', padding: 12 }}>
+      <Switch value={todo.done} onValueChange={() => onToggle(todo.id)} />
+      {editing ? (
+        <TextInput value={draft} onChangeText={setDraft} onBlur={() => setEditing(false)} autoFocus />
+      ) : (
+        <Text onPress={() => setEditing(true)}>{draft}</Text>
+      )}
+    </View>
+  );
+}
+
+export function TodoList({ initialTodos }: { initialTodos: Todo[] }) {
+  const [todos, setTodos] = useState<Todo[]>(initialTodos);
+
+  const addTodo = (title: string) =>
+    setTodos((prev) => [{ id: String(Date.now()), title, done: false }, ...prev]);
+  const toggle = (id: string) =>
+    setTodos((prev) => prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));
+  const sortByDone = () => setTodos((prev) => prev.sort((a, b) => Number(a.done) - Number(b.done)));
+
+  return (
+    <View style={{ flex: 1 }}>
+      <Button title="Add" onPress={() => addTodo('New todo')} />
+      <Button title="Sort" onPress={sortByDone} />
+      <FlatList
+        data={todos}
+        keyExtractor={(_, index) => String(index)}
+        renderItem={({ item }) => <TodoRow todo={item} onToggle={toggle} />}
+      />
+    </View>
+  );
+}
+```
+
+#### What the interviewer evaluates
+
+- Understanding reconciliation: keys decide which component instance (and its state) belongs to which item.
+- The "state initialized from props" anti-pattern (copying props into state).
+- Immutable updates: `Array.prototype.sort` mutates and returns the same reference.
+- Stable, unique ids, and knowing when index keys are acceptable.
+
+#### Solution
+
+**Bugs:**
+
+1. **Index keys plus local state**: inserting at the top shifts every item's index. React keeps the component instance for key `"0"` and gives it the new todo, but that instance's `draft` state still holds the *old* first title, and `editing` sticks to the position too. The same happens after sorting.
+2. **Props copied into state**: `useState(todo.title)` only uses its argument on the first render. Even with correct keys, if the title changes (server sync, rename elsewhere), the row keeps showing the stale `draft`.
+3. **Edits are never saved**: `onBlur` just leaves edit mode, and nothing propagates the new title to `todos`.
+4. **`prev.sort()` mutates state**: it sorts in place and returns the *same array*. `Object.is(prev, next)` is true, so React bails out and the UI may not update. You've also mutated state that other code may hold.
+5. **`Date.now()` ids collide** when two todos are created in the same millisecond, which produces duplicate keys.
+
+```tsx title="src/screens/TodoList.tsx (fixed)"
+import 'react-native-get-random-values';
+import { v4 as uuidv4 } from 'uuid';
+import React, { memo, useCallback, useState } from 'react';
+import { Button, FlatList, Switch, Text, TextInput, View } from 'react-native';
+
+interface Todo {
+  id: string;
+  title: string;
+  done: boolean;
+}
+
+interface RowProps {
+  todo: Todo;
+  onToggle: (id: string) => void;
+  onRename: (id: string, title: string) => void;
+}
+
+const TodoRow = memo(function TodoRow({ todo, onToggle, onRename }: RowProps) {
+  // null = not editing. The draft only exists while editing and starts from the current title.
+  const [draft, setDraft] = useState<string | null>(null);
+
+  const commit = () => {
+    const title = draft?.trim();
+    if (title && title !== todo.title) onRename(todo.id, title);
+    setDraft(null);
+  };
+
+  return (
+    <View style={{ flexDirection: 'row', alignItems: 'center', padding: 12 }}>
+      <Switch value={todo.done} onValueChange={() => onToggle(todo.id)} />
+      {draft !== null ? (
+        <TextInput value={draft} onChangeText={setDraft} onBlur={commit} onSubmitEditing={commit} autoFocus />
+      ) : (
+        <Text onPress={() => setDraft(todo.title)}>{todo.title}</Text>
+      )}
+    </View>
+  );
+});
+
+export function TodoList({ initialTodos }: { initialTodos: Todo[] }) {
+  const [todos, setTodos] = useState<Todo[]>(initialTodos);
+
+  const addTodo = useCallback(
+    (title: string) => setTodos((prev) => [{ id: uuidv4(), title, done: false }, ...prev]),
+    [],
+  );
+  const toggle = useCallback(
+    (id: string) => setTodos((prev) => prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t))),
+    [],
+  );
+  const rename = useCallback(
+    (id: string, title: string) => setTodos((prev) => prev.map((t) => (t.id === id ? { ...t, title } : t))),
+    [],
+  );
+  const sortByDone = () => setTodos((prev) => [...prev].sort((a, b) => Number(a.done) - Number(b.done)));
+
+  return (
+    <View style={{ flex: 1 }}>
+      <Button title="Add" onPress={() => addTodo('New todo')} />
+      <Button title="Sort" onPress={sortByDone} />
+      <FlatList
+        data={todos}
+        keyExtractor={(item) => item.id}
+        renderItem={({ item }) => <TodoRow todo={item} onToggle={toggle} onRename={rename} />}
+      />
+    </View>
+  );
+}
+```
+
+#### Walkthrough
+
+- **Keys are identity**: with `item.id` keys, React moves each row's component instance (and its state) along with its item. With index keys, identity follows the *position*, so any insert, delete or reorder mismatches state and data.
+- **When index keys are fine**: static lists that never reorder, insert or delete (like the OTP boxes), or items with no state or uncontrolled inputs.
+- **Don't mirror props in state**: render `todo.title` directly, and create the draft only while editing. If a component must reset its state when an entity changes, `key={entity.id}` is the idiomatic reset.
+- **Immutable sort**: `[...prev].sort(...)` returns a new reference. On runtimes that support ES2023, `prev.toSorted(...)` does the same; check your engine version before relying on it.
+- **`memo` plus stable callbacks** (`useCallback` with functional updates) keep unrelated rows from re-rendering on each toggle. The React Compiler can do this memoization automatically.
+
+#### Follow-ups
+
+- **"Same component in FlashList."** FlashList **recycles** component instances across items while scrolling, so local state leaks between items even with correct keys. Avoid item-local state, lift it into a map keyed by id, or use FlashList's `useRecyclingState`, which resets when its dependencies change.
+- **"Stable ids for server data without ids?"** Ask the backend for them. Never use `Math.random()` in `keyExtractor`, because it remounts every row on every render.
+- **"How would a test catch bug 1?"** Render the list, type into row 0's editor, add a todo, then assert that the first row shows "New todo".
+
+### Find the bugs: a context that re-renders the whole app on scroll
+
+**Task:** The app drops frames when scrolling the feed, and the React DevTools profiler shows about 200 components re-rendering per scroll event. Find the problems in this provider and propose a fixed architecture.
+
+```tsx title="src/app/AppProvider.tsx (buggy)"
+import React, { createContext, useState } from 'react';
+import { api, type User } from '../api';
+
+export const AppContext = createContext<any>(null);
+
+export function AppProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [theme, setTheme] = useState<'light' | 'dark'>('light');
+  const [cartCount, setCartCount] = useState(0);
+  const [scrollY, setScrollY] = useState(0);
+
+  const login = async (email: string, password: string) => {
+    setUser(await api.login(email, password));
+  };
+
+  return (
+    <AppContext.Provider value={{ user, theme, cartCount, scrollY, setTheme, setCartCount, setScrollY, login }}>
+      {children}
+    </AppContext.Provider>
+  );
+}
+
+// FeedScreen:      <FlatList onScroll={(e) => setScrollY(e.nativeEvent.contentOffset.y)} ... />
+// ~200 components: const { theme } = useContext(AppContext);
+```
+
+#### What the interviewer evaluates
+
+- Knowing that **every consumer** re-renders when the context value changes identity, and that there are no selectors.
+- Separating state by update frequency and by concern.
+- Keeping animation and scroll-driven values out of React state.
+- Knowing what the React Compiler fixes (memoization) and what it doesn't (fan-out).
+- Typing contexts properly.
+
+#### Solution
+
+**Bugs:**
+
+1. **New `value` object on every provider render**: every consumer re-renders whenever the provider renders, even if the fields it reads didn't change.
+2. **Hot state in global context**: `scrollY` updates up to 60 times a second, and each update re-renders all ~200 consumers. The JS thread saturates and frames drop.
+3. **Kitchen-sink context**: unrelated concerns with very different update rates share one context. A theme-only consumer re-renders for cart and scroll changes, because context has no way to subscribe to a slice.
+4. **`login` has a new identity every render**: it breaks `memo` and effect deps downstream.
+5. **`createContext<any>(null)`**: no type safety, and a missing provider fails silently at runtime.
+
+Note that `children` is passed in, so a provider re-render does not by itself re-render the tree below. The damage comes from the *consumers*.
+
+```tsx title="src/app/providers.tsx (fixed)"
+import React, { createContext, useContext, useMemo, useState } from 'react';
+import { api, type User } from '../api';
+
+// 1. Theme: rarely changes -> own context, memoized value.
+type Theme = 'light' | 'dark';
+const ThemeContext = createContext<{ theme: Theme; setTheme: (t: Theme) => void } | null>(null);
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const [theme, setTheme] = useState<Theme>('light');
+  const value = useMemo(() => ({ theme, setTheme }), [theme]);
+  return <ThemeContext value={value}>{children}</ThemeContext>; // React 19: context as provider
+}
+
+export function useTheme() {
+  const ctx = useContext(ThemeContext);
+  if (!ctx) throw new Error('useTheme must be used within ThemeProvider');
+  return ctx;
+}
+
+// 2. Auth: split state from actions so action-only consumers never re-render.
+interface AuthActions {
+  login: (email: string, password: string) => Promise<void>;
+  logout: () => void;
+}
+const AuthStateContext = createContext<User | null>(null);
+const AuthActionsContext = createContext<AuthActions | null>(null);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const actions = useMemo<AuthActions>(
+    () => ({
+      login: async (email, password) => setUser(await api.login(email, password)),
+      logout: () => setUser(null),
+    }),
+    [],
+  );
+  return (
+    <AuthActionsContext value={actions}>
+      <AuthStateContext value={user}>{children}</AuthStateContext>
+    </AuthActionsContext>
+  );
+}
+
+export const useUser = () => useContext(AuthStateContext);
+export function useAuthActions() {
+  const ctx = useContext(AuthActionsContext);
+  if (!ctx) throw new Error('useAuthActions must be used within AuthProvider');
+  return ctx;
+}
+```
+
+```ts title="src/features/cart/cartStore.ts"
+// 3. Cart count: updated often, read by a few components -> external store with selectors
+//    (createStore from the useSyncExternalStore challenge, or Zustand).
+import { createStore } from '../../store/createStore';
+
+export const cartStore = createStore<{ count: number; setCount: (n: number) => void }>((set) => ({
+  count: 0,
+  setCount: (count) => set({ count }),
+}));
+// const count = cartStore.useStore((s) => s.count);
+```
+
+```tsx title="src/screens/FeedScreen.tsx (scroll handling)"
+// 4. scrollY: never React state. Keep it on the UI thread.
+import React from 'react';
+import Animated, { useAnimatedScrollHandler, useSharedValue } from 'react-native-reanimated';
+import { CollapsingHeader } from '../components/CollapsingHeader';
+import { PostRow, type Post } from '../components/PostRow';
+
+export function FeedScreen({ posts }: { posts: Post[] }) {
+  const scrollY = useSharedValue(0);
+  const onScroll = useAnimatedScrollHandler((e) => {
+    scrollY.value = e.contentOffset.y; // runs on the UI thread, no React render
+  });
+
+  return (
+    <>
+      <CollapsingHeader scrollY={scrollY} /* reads scrollY inside useAnimatedStyle */ />
+      <Animated.FlatList
+        data={posts}
+        keyExtractor={(p) => p.id}
+        renderItem={({ item }) => <PostRow post={item} />}
+        onScroll={onScroll}
+        scrollEventThrottle={16}
+      />
+    </>
+  );
+}
+```
+
+#### Walkthrough
+
+- **Rule of thumb**: context is a dependency-injection mechanism, not a state manager. It is great for values that change rarely (theme, locale, auth user, service instances). For frequently changing or large shared state, use a store with selectors (Zustand, Redux, a custom `useSyncExternalStore` store, Jotai atoms).
+- **Split state from actions**: components that only call `login` subscribe to a context whose value never changes.
+- **The React Compiler** would memoize the value object, which fixes bug 1 on renders where nothing changed. But whenever *any* field changes, every consumer still re-renders, so bugs 2 and 3 remain. Architecture beats memoization.
+- **Scroll-linked UI** (collapsing headers, parallax) belongs on the UI thread with Reanimated shared values: zero React renders per frame.
+
+#### Follow-ups
+
+- **"How do you prove the fix?"** Use the React DevTools Profiler: record a scroll, compare commit counts and "why did this render", and enable "highlight updates when components render". Check the JS FPS in the performance monitor.
+- **"Can't I select from context?"** Not natively. `use-context-selector` emulates it, but a store is the cleaner solution.
+- **"Does React 19's `use(Context)` change anything?"** It can be called conditionally, but its re-render semantics are identical to `useContext`.
+
+### Find the bugs: a product screen stuck in an infinite render loop
+
+**Task:** This screen crashes with "Too many re-renders" and, before that fix, it was hammering the product API continuously. Find every cause and fix them.
+
+```tsx title="src/screens/ProductScreen.tsx (buggy)"
+import React, { useEffect, useState } from 'react';
+import { Button, Text, View } from 'react-native';
+import { fetchProduct, type Product } from '../api/products';
+
+export function ProductScreen({ productId }: { productId: string }) {
+  const [product, setProduct] = useState<Product | null>(null);
+  const [quantity, setQuantity] = useState(1);
+  const [total, setTotal] = useState(0);
+
+  useEffect(() => {
+    fetchProduct(productId).then(setProduct);
+  });
+
+  if (product) {
+    setTotal(product.price * quantity);
+  }
+
+  return (
+    <View>
+      <Text>{product?.name}</Text>
+      <Button title="-" onPress={setQuantity(quantity - 1)} />
+      <Text>{quantity}</Text>
+      <Button title="+" onPress={() => setQuantity(quantity + 1)} />
+      <Text>Total: {total}</Text>
+    </View>
+  );
+}
+```
+
+#### What the interviewer evaluates
+
+- Distinguishing *calling* a function from *passing* it (`onPress={fn()}` versus `onPress={fn}`).
+- Render-phase `setState` rules, and derived state versus stored state.
+- Effects without a dependency array.
+- Money handling and input bounds, the senior-level details.
+
+#### Solution
+
+**Bugs:**
+
+1. **`onPress={setQuantity(quantity - 1)}` calls `setState` during render**. Each render schedules another render, and React throws "Too many re-renders". TypeScript also rejects it (`void` is not a press handler), which is one more reason to keep `strict` on; in plain JS it slips through.
+2. **Unconditional `setTotal(...)` during render**: once `product` exists, every render sets state, which triggers a render, and so on. It is the same error. `total` is **derived data** and shouldn't be state at all.
+3. **`useEffect` with no deps array** runs after *every* render: fetch, `setProduct(newObject)`, render, fetch again. It is an infinite network loop that throws **no error**, which makes it the most dangerous of the three. It also has no race protection when `productId` changes.
+4. **Quantity can go to 0 or negative**, and there is no loading or error state.
+5. **Floating-point money**: `19.99 * 3` gives `59.97000000000001`. Use integer minor units and `Intl.NumberFormat`.
+
+```tsx title="src/screens/ProductScreen.tsx (fixed)"
+import React, { useEffect, useState } from 'react';
+import { ActivityIndicator, Button, Text, View } from 'react-native';
+import { fetchProduct, type Product } from '../api/products'; // Product: { id, name, priceCents, currency }
+
+const formatMoney = (minorUnits: number, currency: string) =>
+  // Assumes a 2-decimal currency; use the currency's minor-unit exponent in real code.
+  new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(minorUnits / 100);
+
+export function ProductScreen({ productId }: { productId: string }) {
+  const [product, setProduct] = useState<Product | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [quantity, setQuantity] = useState(1);
+
+  useEffect(() => {
+    let active = true;
+    setProduct(null);
+    setError(null);
+    fetchProduct(productId)
+      .then((p) => {
+        if (active) setProduct(p);
+      })
+      .catch((e: unknown) => {
+        if (active) setError(e instanceof Error ? e.message : 'Failed to load product');
+      });
+    return () => {
+      active = false;
+    };
+  }, [productId]);
+
+  if (error) return <Text>{error}</Text>;
+  if (!product) return <ActivityIndicator />;
+
+  const totalMinor = product.priceCents * quantity; // derived during render, never stored
+
+  return (
+    <View>
+      <Text>{product.name}</Text>
+      <Button title="-" onPress={() => setQuantity((q) => Math.max(1, q - 1))} disabled={quantity <= 1} />
+      <Text>{quantity}</Text>
+      <Button title="+" onPress={() => setQuantity((q) => q + 1)} />
+      <Text>{`Total: ${formatMoney(totalMinor, product.currency)}`}</Text>
+    </View>
+  );
+}
+```
+
+#### Walkthrough
+
+- **The render-phase rule**: React allows `setState` during render only when it is guarded by a condition that becomes false after the update (the `usePreviousDistinct` pattern earlier). An unconditional render-phase update always loops, even when the value is identical, because React re-runs the component for render-phase updates until none are scheduled.
+- **"You might not need an effect or state"**: anything computable from props and state (`total`) is computed during render. Storing it creates sync bugs and extra renders.
+- **Silent loops are worse**: the missing deps array produces no crash, just continuous requests, battery drain and a surprise server bill. Network logging in development (React Native DevTools network panel) catches it quickly.
+- **Hooks before early returns**: all hooks run unconditionally before `if (error) return ...`, which keeps hook order stable.
+
+#### Follow-ups
+
+- **"Reset quantity when navigating to another product."** Render the screen with `key={productId}`, which remounts it and resets all local state in one move.
+- **"Replace the effect with TanStack Query."** `useQuery({ queryKey: ['product', productId], queryFn: ({ signal }) => fetchProduct(productId, signal) })` gives caching, dedupe and race safety for free.
+- **"Why did React not catch bug 3?"** Effects are allowed to set state, and looping through async work is not detectable. Only the render-phase loops hit React's re-render limit.
+
+## JavaScript fundamentals
+
+### Predict the output: microtasks, macrotasks and `queueMicrotask`
+
+**Task:** What does this print, and why? Explain the queues involved.
+
+```js
+console.log('1');
+
+setTimeout(() => console.log('2'), 0);
+
+Promise.resolve().then(() => console.log('3'));
+
+queueMicrotask(() => console.log('4'));
+
+(async () => {
+  console.log('5');
+  await null;
+  console.log('6');
+})();
+
+Promise.resolve().then(() => {
+  console.log('7');
+  setTimeout(() => console.log('8'), 0);
+  Promise.resolve().then(() => console.log('9'));
+});
+
+console.log('10');
+```
+
+#### What the interviewer evaluates
+
+- The call stack, the microtask queue and the macrotask (task) queue, and the rule that **all microtasks drain before the next macrotask**.
+- That an async function runs synchronously until its first `await`.
+- That microtasks queued *by* microtasks still run before any timer.
+- Relevance to RN: long promise chains or microtask loops can starve rendering and input just like synchronous work.
+
+#### Solution
+
+```plaintext
+1
+5
+10
+3
+4
+6
+7
+9
+2
+8
+```
+
+```mermaid
+flowchart TD
+    Task["Take the next macrotask<br/>(script, timer, native event)"] --> Run["Run it on the call stack to completion"]
+    Run --> Check{"Microtask queue empty?"}
+    Check -->|"no"| Micro["Run the oldest microtask<br/>(then/catch, await continuation, queueMicrotask)"]
+    Micro -->|"may enqueue more microtasks"| Check
+    Check -->|"yes"| Host["Host work: rendering, UI updates"]
+    Host --> Task
+```
+*Figure: The event loop. Microtasks always drain completely between macrotasks.*
+
+#### Walkthrough
+
+1. **Synchronous pass (the script is the first macrotask)**: prints `1`. The timer callback `2` goes to the macrotask queue. The microtask queue gets `3`, then `4`. The async IIFE runs synchronously and prints `5`, then `await null` queues its continuation (`6`) as a microtask. `7` is queued. The script prints `10`.
+2. **Drain microtasks in FIFO order**: `3`, `4`, `6`, `7`. While running, `7` queues timer `8` (a macrotask) and microtask `9`. The drain continues until the queue is empty, so `9` runs next.
+3. **Next macrotasks**: `2`, then `8`, in the order the timers were queued (both have 0 ms delay).
+
+React Native note: in current React Native (Hermes plus the New Architecture) the event loop follows the web model: microtasks drain after each task. This snippet therefore prints the same as in a browser or Node. Older RN versions implemented Promises with a polyfill scheduled through `setImmediate`, which could interleave differently with timers. Code that depends on sub-tick ordering is fragile everywhere.
+
+#### Follow-ups
+
+- **"Can microtasks freeze the app?"** Yes. A microtask that keeps queueing microtasks never lets the loop reach the next task, so timers, native events and render updates never run. It behaves like an infinite synchronous loop.
+- **"Where do `setImmediate` and `requestAnimationFrame` fit?"** Both are host-scheduled callbacks, not microtasks. `requestAnimationFrame` runs before the next frame, and `setImmediate` is an RN/Node-specific "soon" callback. Neither preempts pending microtasks.
+- **"Why does this matter in React?"** State updates are batched, and effects are flushed at scheduled points. Code like `await something; setState(...)` runs in a microtask continuation, after the render that triggered it has committed. That is why stale closures and "state not updated yet" questions come up.
+
+### Predict the output: closures in loops with `var` vs `let`
+
+**Task:** What does each loop print? Then predict the bonus.
+
+```js
+for (var i = 0; i < 3; i++) {
+  setTimeout(() => console.log('var', i), 0);
+}
+
+for (let j = 0; j < 3; j++) {
+  setTimeout(() => console.log('let', j), 0);
+}
+
+// Bonus
+const fns = [];
+for (let k = 0; k < 4; k++) {
+  fns.push(() => k);
+  k++;
+}
+console.log(fns.map((f) => f()));
+```
+
+#### What the interviewer evaluates
+
+- Function scope versus block scope, and what a closure actually captures (a **binding**, not a value).
+- Per-iteration bindings for `let` in `for` loops.
+- Pre-`let` fixes (IIFE, `bind`, the timer's extra-arguments parameter).
+- Connecting it to stale closures in React hooks.
+
+#### Solution
+
+```plaintext
+[1, 3]
+var 3
+var 3
+var 3
+let 0
+let 1
+let 2
+```
+
+The bonus `console.log` is synchronous, so it prints **first**. All timers run afterwards, in the order they were queued.
+
+#### Walkthrough
+
+- **`var`**: there is one `i` binding for the whole function. The three callbacks close over the same variable, and by the time they run, the loop has finished and `i === 3`.
+- **`let`**: the spec creates a **fresh binding per iteration** and copies the value into it before the increment step. Each callback closes over its own `j` (0, 1, 2).
+- **Bonus**: iteration 1 gets a binding with `k = 0`. It pushes a closure over that binding, then `k++` mutates *that same binding* to 1. The loop copies 1 into a new binding for iteration 2 and increments it to 2. Iteration 2 pushes a closure over that binding, then `k++` makes it 3. The next copy is incremented to 4 and the loop exits. The closures see their bindings' final values: `[1, 3]`.
+- **Pre-ES2015 fixes for `var`**: `setTimeout((n) => console.log(n), 0, i)` (extra arguments are passed to the callback), an IIFE `((n) => setTimeout(() => console.log(n)))(i)`, or `forEach`, whose callback gets a new parameter binding per element.
+
+#### Follow-ups
+
+- **"How is this related to React hooks?"** Each render is like a loop iteration with its own `const count` binding. A `setInterval` created in the first render's effect closes over the first render's `count` forever. That is the stale-closure bug from the stopwatch exercise, and the cure is the same idea: read the latest value through a ref or a functional update.
+- **"Does `const` in `for...of` work?"** Yes: `for (const x of arr)` creates a new binding per iteration. `for (const i = 0; i < 3; i++)` throws, because the increment assigns to a constant.
+- **"Memory implications?"** Closures keep their captured bindings (and whatever they reference) alive. Long-lived listeners that capture large objects are a common source of leaks in RN apps.
+
+### Predict the output: `this` binding in classes, arrow fields and `bind`
+
+**Task:** What does this print? Assume it runs as module code (strict mode), as all RN code does.
+
+```js
+class Timer {
+  seconds = 0;
+  tickMethod() {
+    this.seconds++;
+  }
+  tickArrow = () => {
+    this.seconds++;
+  };
+}
+
+const t = new Timer();
+const method = t.tickMethod;
+const arrow = t.tickArrow;
+
+arrow();
+console.log(t.seconds);
+
+try {
+  method();
+} catch (e) {
+  console.log(e instanceof TypeError);
+}
+
+const bound = t.tickMethod.bind(t);
+bound();
+console.log(t.seconds);
+
+const other = { seconds: 100, a: t.tickArrow, m: t.tickMethod };
+other.a();
+other.m();
+console.log(t.seconds, other.seconds);
+
+bound.call(other);
+console.log(t.seconds, other.seconds);
+```
+
+#### What the interviewer evaluates
+
+- The four `this` rules: `new`, explicit (`call`/`apply`/`bind`), implicit (`obj.method()`), and default (`undefined` in strict mode).
+- Arrow functions capturing lexical `this`, and why arrow class fields are per-instance.
+- That `bind` is permanent: a bound function ignores later `call`/`apply`/implicit receivers.
+- RN relevance: passing `this.handlePress` to `onPress` in class components.
+
+#### Solution
+
+```plaintext
+1
+true
+2
+3 101
+4 101
+```
+
+#### Walkthrough
+
+1. `arrow()`: `tickArrow` is a class field initialized in the constructor, so the arrow captured `this = t` permanently. `t.seconds` becomes 1.
+2. `method()`: a detached method called with no receiver. Class bodies are always strict, so `this` is `undefined`, and `this.seconds++` throws a `TypeError`.
+3. `bound()`: `bind(t)` fixes `this`, so `t.seconds` becomes 2.
+4. `other.a()`: the arrow ignores the receiver and increments `t`, making it 3. `other.m()`: an unbound method takes its receiver from the call site, so `other.seconds` becomes 101.
+5. `bound.call(other)`: `call` cannot override a bound `this`, so `t.seconds` becomes 4 and `other` stays at 101.
+
+#### Follow-ups
+
+- **"Arrow class fields versus prototype methods: trade-offs?"** Arrow fields create one function per instance (more memory, not on the prototype, so they can't be overridden via `super` or mocked on the prototype in tests), but they're safe to pass as callbacks. Prototype methods are shared and need `bind` when detached.
+- **"Why doesn't this matter in function components?"** There is no `this`: handlers close over props and state directly. The equivalent pitfall is stale closures.
+- **"What's `this` at the top level of an ES module?"** `undefined`, and an arrow function defined there inherits that. Don't write code that relies on a global `this`; use `globalThis` explicitly.
+
+### Predict the output: async/await ordering
+
+**Task:** What does this print?
+
+```js
+async function first() {
+  console.log('first start');
+  await second();
+  console.log('first end');
+}
+
+async function second() {
+  console.log('second');
+}
+
+console.log('script start');
+setTimeout(() => console.log('timeout'), 0);
+first();
+new Promise((resolve) => {
+  console.log('executor');
+  resolve();
+})
+  .then(() => console.log('then 1'))
+  .then(() => console.log('then 2'));
+console.log('script end');
+```
+
+#### What the interviewer evaluates
+
+- That an async function body runs synchronously until its first `await`, and that a called async function's body (`second`) also runs synchronously.
+- That the `Promise` executor runs synchronously.
+- That each `.then` in a chain runs in a separate microtask, and that `await` continuations interleave with `.then` callbacks.
+- That timers come after all microtasks.
+
+#### Solution
+
+```plaintext
+script start
+first start
+second
+executor
+script end
+first end
+then 1
+then 2
+timeout
+```
+
+#### Walkthrough
+
+1. **Synchronous**: `script start`. The timer is queued. `first()` prints `first start`, then calls `second()`, which prints `second` and returns an already-resolved promise. `await` suspends `first` and queues its continuation (microtask A). The executor prints `executor` and resolves, so `then 1` is queued (microtask B). `script end`.
+2. **Microtasks**: A prints `first end`. B prints `then 1`, which resolves the promise returned by the first `.then`, queueing `then 2`, which prints next.
+3. **Macrotask**: `timeout`.
+- Awaiting a native, already-resolved promise takes a single microtask tick in modern engines (an ES2019 spec optimization). That is why `first end` comes before `then 1`.
+
+#### Follow-ups
+
+- **"Sequential or parallel?"** `for (const id of ids) await load(id)` is sequential (total time is the sum). `await Promise.all(ids.map(load))` is parallel (time of the slowest) and fails fast on the first rejection. `Promise.allSettled` collects every outcome. `ids.forEach(async (id) => await load(id))` waits for nothing, and its errors become unhandled rejections.
+- **"Returning a promise from an async function costs extra ticks."** Consider this:
+
+  ```js
+  async function f1() { return 1; }
+  async function f2() { return Promise.resolve(2); }
+  f2().then(console.log);
+  f1().then(console.log);
+  Promise.resolve().then(() => console.log('A')).then(() => console.log('B')).then(() => console.log('C'));
+  ```
+
+  Per the spec this prints `1, A, B, 2, C`. Resolving an async function's promise with another promise adds two extra microtask hops. In React Native, Babel may transpile async functions (Hermes has historically lacked native async/await support), so tick-exact ordering can differ from V8. Treat this as a spec curiosity and never rely on it.
+- **"How are unhandled rejections surfaced in RN?"** In development they show as LogBox warnings. In production they are easy to lose, so attach global handlers and use Sentry, which instruments rejection tracking. Always `await` or `.catch` your promises, and lint with `@typescript-eslint/no-floating-promises`.
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>

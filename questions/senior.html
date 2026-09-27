@@ -1,0 +1,1816 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Senior, Architecture &amp; System Design Q&amp;A · React Native Interview Handbook</title>
+<meta name="description" content="This page covers the questions that separate senior candidates from strong mid-level ones: mobile system design end to end, architecture and code organisation, release…">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="Senior, Architecture &amp; System Design Q&amp;A · React Native Interview Handbook">
+<meta property="og:description" content="This page covers the questions that separate senior candidates from strong mid-level ones: mobile system design end to end, architecture and code organisation, release…">
+<meta property="og:type" content="article">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>try{var t=localStorage.getItem('rnh-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+</head>
+<body data-root=".." data-page="questions/senior.html" data-type="qa">
+<noscript><p style="padding:2rem;font-family:sans-serif">This handbook renders its content with JavaScript. Please enable JavaScript.</p></noscript>
+<!-- Page content is Markdown: edit it below. It is rendered in the browser by assets/js/app.js. -->
+<script type="text/markdown" id="page-content">
+# Senior, Architecture & System Design Q&A
+
+This page covers the questions that separate senior candidates from strong mid-level ones: mobile system design end to end, architecture and code organisation, release engineering, cross-cutting concerns such as accessibility and privacy, technical leadership, and behavioural questions with model STAR answers. Treat the designs as worked examples of a way of thinking. Interviewers score how you reason about trade-offs more than whether you name the "right" library.
+
+## Mobile system design
+
+### How do you structure your answer to a mobile system design question?
+
+**Short answer:** I use a fixed skeleton and say it out loud: clarify requirements and constraints, sketch the high-level architecture, go deep on the client (layers, state, storage), define the data flow and API contract, then cover offline behaviour, performance, failure modes, security and observability, and finish with trade-offs and what changes at 10x scale. I keep checking with the interviewer where they want depth.
+
+A mobile design round is not a backend design round with a phone drawn on the left. The interviewer wants to see that you understand what is unique about the client: unreliable networks, OS lifecycle (backgrounded, suspended, killed), battery and memory limits, store release latency, and the fact that old app versions stay in the wild for years.
+
+```mermaid
+mindmap
+  root((Mobile system design))
+    Requirements
+      Functional
+      Non-functional
+      Scale and constraints
+    High-level design
+      Client
+      Backend services
+      Third parties
+    Client architecture
+      Layers
+      State
+      Storage
+    Data and APIs
+      Protocol choice
+      Pagination
+      Contracts
+    Resilience
+      Offline
+      Failure modes
+      Retries
+    Quality
+      Performance
+      Security
+      Observability
+    Trade-offs and scale
+```
+*Figure: The skeleton to apply to every design question on this page.*
+
+#### A time budget for a 45–60 minute round
+
+| Phase | Time | What you produce |
+|---|---|---|
+| Requirements | 5–8 min | Functional list, non-functional targets, explicit out-of-scope, rough numbers (DAU, payload sizes, update rates) |
+| High-level architecture | 5 min | Boxes: client modules, API/gateway, core services, push, CDN, third parties |
+| Client deep dive | 15–20 min | Layers, state ownership, local storage, navigation, list rendering |
+| Data flow and API | 8–10 min | Protocol choice, request/response shapes, pagination, versioning |
+| Resilience and quality | 8–10 min | Offline, retries, failure modes, security, observability |
+| Trade-offs and scale | 5 min | What you'd revisit at 10x, what you consciously did not build |
+
+#### Mobile constraints backend-leaning candidates forget
+
+| Constraint | Design consequence |
+|---|---|
+| App gets suspended within seconds of backgrounding (iOS especially) | Sockets die, so you need push for background delivery and a resume/gap-fill protocol |
+| Store review and user update lag | APIs must stay backward compatible, and you need feature flags, kill switches and a minimum-version gate |
+| Flaky, slow, metered networks | Idempotent writes, outbox queues, cursor pagination, payload budgets, image variants |
+| Memory limits and low-end Android | Virtualised lists, bounded caches, limited video decoders |
+| Battery | Batch network calls, adaptive location sampling, avoid wake-ups |
+| Permissions and privacy review | Just-in-time permission prompts, privacy manifests, Data safety declarations |
+
+> [!INTERVIEW]
+> What evaluators score: **requirements gathering** (do you ask before drawing?), **structure** (can they follow you?), **depth** in at least two areas (usually client state/storage and sync), **trade-off articulation** ("I chose X over Y because…, and it costs us Z"), and **communication** (driving the session, checking in, handling hints). Red flags: naming libraries before requirements, ignoring offline and app lifecycle, designing a 30-minute database sharding scheme in a mobile round, never stating assumptions, and claiming there are no downsides. Likely follow-ups: "What happens if the user kills the app mid-operation?", "How do you roll this out safely?", "What do you measure?"
+
+### How would you design an offline-first chat/messaging app?
+
+**Short answer:** Make the local database the source of truth for the UI. Every send goes into an outbox with a client-generated ID, and a sync engine flushes it over a WebSocket and reconciles server acknowledgements, receipts and gaps. When the app is in the background, push notifications take over from the socket. Messages move through explicit states (pending, sending, sent, delivered, read, failed), and history comes in via cursor pagination over REST.
+
+#### Requirements
+
+- **Functional:** 1:1 and group chats, text and media, message states and read receipts, typing indicators, conversation list with unread counts, history scrollback, push notifications, multi-device sign-in.
+- **Non-functional:** a send feels instant (optimistic, under 100 ms to appear), delivery under 1 s when both parties are online, no lost or duplicated messages, works offline (read history, compose, queue), battery-friendly, and cold start shows the conversation list from cache.
+- **Clarify:** group size limit (fan-out)? End-to-end encryption? Message edit/delete? Search? Retention?
+
+#### High-level architecture
+
+```mermaid
+flowchart TD
+    subgraph client["RN client"]
+        UI["Screens<br/>conversation list, thread"]
+        Obs["Reactive queries<br/>DB observers"]
+        DB[("SQLite<br/>messages, outbox, cursors")]
+        Sync["Sync engine<br/>outbox flush, gap fill"]
+        WS["WebSocket client<br/>heartbeat, backoff"]
+    end
+    subgraph backend["Backend"]
+        GW["Realtime gateway"]
+        API["REST API<br/>history, media, search"]
+        Msg["Message service"]
+        Log[("Message store<br/>per-conversation seq")]
+        Push["Push service<br/>APNs and FCM"]
+        CDN["Object storage and CDN"]
+    end
+    UI -->|"send"| DB
+    DB --> Obs
+    Obs --> UI
+    DB --> Sync
+    Sync --> WS
+    WS -->|"frames"| GW
+    Sync -->|"gap fill"| API
+    GW --> Msg
+    API --> Msg
+    Msg --> Log
+    Msg -->|"offline recipients"| Push
+    UI -.->|"media upload"| CDN
+```
+*Figure: The UI reads only from the local DB. The sync engine is the only component that talks to the network for messages.*
+
+#### Client architecture
+
+- **Storage:** SQLite (op-sqlite or expo-sqlite, WAL mode) with tables `conversations`, `messages`, `outbox`, `sync_cursors`. Index on `(conversation_id, seq)`. Optionally WatermelonDB for lazy loading plus observable queries. MMKV for drafts and small flags. Use FTS5 for local search.
+- **State:** screens subscribe to DB queries (observables or a thin TanStack Query layer invalidated by the sync engine). Ephemeral state such as typing indicators and presence lives in a small in-memory store (Zustand), never in the DB and never in the list's data, so a typing event doesn't re-render the thread.
+- **Sync engine:** a plain TypeScript module outside React. It owns the socket, the outbox and the cursors, and exposes events. That keeps it testable, and it can run from a headless/background context.
+
+```ts title="src/features/chat/data/types.ts"
+export type MessageStatus = 'pending' | 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+
+export interface OutboxItem {
+  clientId: string; // ULID/UUIDv7 made on device: idempotency key + stable list key
+  conversationId: string;
+  body: string;
+  attachmentJobIds: string[]; // references to the upload queue, not raw bytes
+  attempts: number;
+  createdAt: number; // local clock, used only to order pending items
+}
+
+// Frames over the socket (JSON or protobuf)
+export type ClientFrame =
+  | { t: 'send'; clientId: string; conversationId: string; body: string; mediaIds: string[] }
+  | { t: 'receipt'; conversationId: string; kind: 'delivered' | 'read'; upToSeq: number }
+  | { t: 'resume'; cursors: Record<string, number> }; // conversationId -> last seq seen
+
+export type ServerFrame =
+  | { t: 'ack'; clientId: string; seq: number; serverTs: number }
+  | { t: 'msg'; conversationId: string; seq: number; senderId: string; body: string; serverTs: number }
+  | { t: 'receipt'; conversationId: string; userId: string; kind: 'delivered' | 'read'; upToSeq: number };
+```
+
+#### Message lifecycle
+
+```mermaid
+stateDiagram-v2
+    state "Pending (in outbox)" as Pending
+    state "Sending (frame written)" as Sending
+    state "Sent (server ack + seq)" as Sent
+    state "Delivered (recipient device)" as Delivered
+    state "Read (receipt)" as Read
+    state "Failed (needs user action)" as Failed
+    [*] --> Pending : user taps send
+    Pending --> Sending : socket connected
+    Sending --> Sent : ack with seq
+    Sending --> Pending : timeout or disconnect
+    Pending --> Failed : retries exhausted or rejected
+    Failed --> Pending : user taps retry
+    Sent --> Delivered : recipient persisted it
+    Delivered --> Read : read receipt
+    Read --> [*]
+```
+*Figure: Message states. Only the server's ack moves a message out of the outbox.*
+
+#### Data flow and API
+
+- **Transport:** WebSocket for realtime (sends, acks, new messages, receipts, typing). REST for history, media, search and anything cacheable. SSE can't carry client-to-server frames, and long-polling costs battery and latency. MQTT is a reasonable alternative at very large scale.
+- **Ordering:** the server assigns a monotonically increasing `seq` per conversation. The client sorts by `seq`, and pending messages sort after the last `seq` by `createdAt`. Never order by device clocks.
+- **Idempotency:** the server dedupes on `clientId`. A resend after a lost ack returns the same `seq`, so you never get duplicates.
+- **Gap detection:** if a `msg` arrives with `seq > lastSeq + 1`, fetch `GET /conversations/:id/messages?after=lastSeq` before rendering past the gap.
+- **Pagination:** history uses cursors (`before=<seq>&limit=50`), never offsets. New messages arriving would shift offset pages and cause duplicates or skips.
+- **Reconnect:** exponential backoff with jitter (so a gateway restart doesn't cause a thundering herd), triggered by NetInfo changes and app foregrounding. After connect, send `resume` with per-conversation cursors, and the server streams what you missed or tells you to gap-fill via REST.
+
+```ts
+// "Equal jitter" backoff: 0.25s, 0.5s, 1s ... capped at 30s, randomised
+export const reconnectDelay = (attempt: number): number => {
+  const cap = Math.min(30_000, 500 * 2 ** attempt);
+  return cap / 2 + Math.random() * (cap / 2);
+};
+```
+
+#### Offline, background and push
+
+- **Offline:** the user can read cached history, compose and send. Items wait in the outbox, and the UI shows a clock icon. The outbox flushes in order per conversation once the socket reconnects.
+- **Background:** iOS suspends the app shortly after backgrounding, so don't fight it. Close the socket on `AppState` background after a short grace period and rely on push. The server tracks presence and sends APNs/FCM notifications to offline devices.
+- **Rich/encrypted notifications:** an iOS Notification Service Extension (a native target) can decrypt or enrich content before display. On Android, handle data messages. Silent/background pushes are throttled and are not delivered after a user force-quits on iOS, so never rely on them for correctness. They are only an optimisation to prefetch.
+- **Delivered receipts** fire when the recipient device has *persisted* the message: on socket receipt, or when the app syncs after a push.
+
+#### Media
+
+Upload media separately (presigned URL, see the upload design below). The message only carries `mediaIds` plus dimensions and a blurhash, so the bubble renders at the right size immediately. Show a local preview from the file URI while uploading. The message stays `pending` until its attachments finish.
+
+#### Performance
+
+- FlashList v2 with `getItemType` (text, image, system, date separator), memoised bubbles, and bottom-anchored scrolling (`maintainVisibleContentPosition` or an inverted list).
+- Load the latest ~50 messages per thread, then page on scroll. Apply sync results in a single DB transaction to avoid N re-renders.
+- Keep typing and presence updates out of the list data.
+
+#### Failure modes
+
+| Failure | Mitigation |
+|---|---|
+| Ack lost after server stored the message | Resend with same `clientId`, server returns existing `seq` |
+| Socket flapping on bad network | Backoff with jitter, heartbeat ping/pong to detect half-open sockets |
+| Messages out of order or gaps | Server `seq`, gap fill via REST before rendering |
+| App killed with items in outbox | Outbox is persisted, flush on next launch or background task |
+| DB migration fails on upgrade | Versioned migrations tested in CI against real old DB snapshots, fallback to re-sync |
+| Push token rotated | Re-register on every launch and token refresh event |
+
+#### Security
+
+TLS everywhere. Authenticate the socket with a short-lived token sent in the first frame or a header, never in the URL query string, because URLs get logged. Encrypt the DB at rest (SQLCipher via op-sqlite) with the key in Keychain/Keystore. **End-to-end encryption** (Signal protocol) is a big trade-off: it rules out server-side search and moderation and makes multi-device and backup much harder. Raise it as a requirement question, don't silently assume it.
+
+#### Observability
+
+Send latency (tap to ack) p50/p95, end-to-end delivery latency, outbox depth and time-in-pending, socket connect success rate and reconnects per session, gap-fill frequency, push delivery and open rates, plus DB size per device.
+
+#### Trade-offs and 10x
+
+At 10x: move to binary frames (protobuf), delta sync of conversation metadata, a dedicated presence service, and fan-out on read for very large groups (fan-out on write is fine for small groups). On the client: prune or archive old threads, sync only the most recent N conversations on cold start, and lazy-load media. The main trade-off I'd name: a local-DB-first design adds complexity (migrations, reconciliation), but it is the only way to get instant sends and a reliable offline experience.
+
+> [!INTERVIEW]
+> What a senior answer includes: client-generated IDs for idempotency, server sequence numbers for ordering, an explicit message state machine, a resume/gap-fill protocol, and push as the background channel, with the honest caveat that silent pushes are unreliable. Red flags: "keep the socket open in the background", ordering by `Date.now()`, storing chat history only in Redux, offset pagination. Likely follow-ups: "How do you show 'delivered' for a group?" (per-member receipts aggregated as `upToSeq`), "How do you handle edits and deletes?" (tombstone events with their own `seq`), "Multi-device read sync?" (read receipts from your own devices update unread counts).
+
+### How would you design an infinite social feed with images and autoplaying video?
+
+**Short answer:** Page a server-ranked feed with opaque cursors through `useInfiniteQuery` and render it in FlashList v2 with typed cells. Serve media as pre-sized CDN variants with blurhash placeholders and fixed aspect ratios, and prefetch the next page's images. Only the most-visible video plays, using a small pool of players driven by viewability callbacks. Memory stays bounded through recycling, image variants and capped decoders.
+
+#### Requirements
+
+- **Functional:** ranked feed of posts (text, images, carousels, video), like and comment counts, pull-to-refresh, "new posts" pill, infinite scroll, autoplay muted video in viewport, impression tracking.
+- **Non-functional:** 60 fps scrolling on mid-range Android, first content under 1 s on warm start (from cache), video start under 500 ms, bounded memory in long sessions, and a data-saver mode on cellular.
+- **Clarify:** is ranking personalised (cursors must snapshot a ranking)? Ads injected? Offline expectations? Content types expected to grow (server-driven cards)?
+
+```mermaid
+flowchart TD
+    Screen["Feed screen<br/>FlashList v2, typed cells"] --> Hook["useInfiniteQuery<br/>cursor pages"]
+    Hook --> Cache[("Query cache<br/>first page persisted")]
+    Hook -->|"GET /feed?cursor=abc"| API["Feed API<br/>ranked, cursor based"]
+    Screen -->|"onViewableItemsChanged"| Vis["Viewability tracker"]
+    Vis --> Pool["Video player pool<br/>2 to 3 players"]
+    Vis --> Pre["Prefetcher<br/>next images, video posters"]
+    Vis --> Imp["Impression logger<br/>batched"]
+    Pre --> Img[("Image cache<br/>memory and disk")]
+    Pool --> CDN["Media CDN<br/>sized variants, HLS"]
+    Img --> CDN
+```
+*Figure: Feed data and media pipeline.*
+
+#### API design
+
+- **Cursor pagination:** `GET /feed?cursor=<opaque>&limit=20` returns `{ items, nextCursor }`. The cursor encodes a ranking snapshot ID plus position. With offsets, newly ranked items shift the pages and you get duplicates and gaps. Expired cursors return `410`, and the client refreshes from the top.
+- **Media metadata in the post:** `width`, `height`, `blurhash`, and a list of variants (`360w`, `720w`, `1080w`) or an image-resizing URL template. Video carries an HLS URL plus a poster. Knowing the aspect ratio up front means no layout jumps.
+- **New posts:** poll `GET /feed/head?since=<topId>` or listen on a socket, then show a pill. Never inject new items above the user's scroll position unasked.
+- **GraphQL vs REST:** GraphQL with fragments per card type suits heterogeneous feeds. REST with a BFF is fine too. The pagination model matters more than the protocol.
+
+#### Client implementation
+
+```tsx title="src/features/feed/ui/FeedScreen.tsx"
+import { useCallback, useRef } from 'react';
+import { FlashList } from '@shopify/flash-list';
+import { useInfiniteQuery } from '@tanstack/react-query';
+import { feedApi, type Post } from '../data/feedApi';
+import { useFeedStore } from '../state/feedStore';
+import { PostCell } from './PostCell';
+
+export function FeedScreen() {
+  const setActiveVideo = useFeedStore((s) => s.setActiveVideo);
+  const { data, fetchNextPage, hasNextPage, isFetchingNextPage, refetch, isRefetching } =
+    useInfiniteQuery({
+      queryKey: ['feed'],
+      queryFn: ({ pageParam }) => feedApi.getFeed({ cursor: pageParam, limit: 20 }),
+      initialPageParam: null as string | null,
+      getNextPageParam: (last) => last.nextCursor ?? undefined,
+    });
+
+  const posts = data?.pages.flatMap((p) => p.items) ?? [];
+
+  // Stable across renders: viewability config must not change identity
+  const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 70, minimumViewTime: 250 }).current;
+  const onViewableItemsChanged = useCallback(
+    ({ viewableItems }: { viewableItems: Array<{ item: Post; isViewable: boolean }> }) => {
+      const firstVideo = viewableItems.find((v) => v.isViewable && v.item.kind === 'video');
+      setActiveVideo(firstVideo?.item.id ?? null);
+    },
+    [setActiveVideo],
+  );
+
+  return (
+    <FlashList
+      data={posts}
+      keyExtractor={(p) => p.id}
+      getItemType={(p) => p.kind} // separate recycling pools per card type
+      renderItem={({ item }) => <PostCell post={item} />}
+      onEndReached={() => hasNextPage && !isFetchingNextPage && fetchNextPage()}
+      onEndReachedThreshold={0.5}
+      onViewableItemsChanged={onViewableItemsChanged}
+      viewabilityConfig={viewabilityConfig}
+      onRefresh={refetch}
+      refreshing={isRefetching}
+    />
+  );
+}
+```
+
+Each video cell subscribes with a selector, `useFeedStore((s) => s.activeVideoId === post.id)`, so when the active video changes only two cells re-render, not the whole list.
+
+- **Images:** `expo-image` (or FastImage-style caching) with `placeholder={{ blurhash }}`, `recyclingKey={post.id}` (so recycled cells don't flash the previous image), and `cachePolicy="memory-disk"`. Request the variant closest to `layoutWidth * PixelRatio.get()`. Prefetch the next page's first images with `Image.prefetch` when the user is about half a page from the end.
+- **Video:** `expo-video` or `react-native-video` with a **pool of 2–3 players**. Each player instance holds a hardware decoder and buffers, so one per cell will exhaust memory on Android. Autoplay muted only the active item. Pause on screen blur (`useIsFocused`), on `AppState` background, and during fast flings. Show the poster until the first frame. Use HLS so bitrate adapts to the network.
+- **Mutations:** likes are optimistic updates via `queryClient.setQueriesData` across every cached page containing that post, plus an idempotent `PUT /posts/:id/like` (not a toggle, which isn't idempotent). Queue them offline.
+- **State ownership:** server data lives in TanStack Query. The active video, mute preference and data-saver setting live in a small Zustand store. Persist only the first page for an instant cold start (stale-while-revalidate).
+
+#### Memory and performance
+
+- FlashList recycling keeps view count constant. Keep cells cheap: no heavy work in render, and move measurement and formatting to the data layer.
+- TanStack Query v5's `maxPages` can cap cached pages in very long sessions. Use it with care: dropping head pages means scrolling back re-fetches them (you need `getPreviousPageParam`) and can shift content. Many teams rely on recycling plus bounded image caches and only cap pages as a safety net.
+- Clear image memory caches on memory warnings. Downsample large images server-side, not on device.
+- Measure slow and frozen frames on a low-end Android device, not the simulator.
+
+#### Offline and failure modes
+
+| Failure | Behaviour |
+|---|---|
+| Offline at launch | Show the persisted first page with an offline banner, disable infinite scroll |
+| Ranking service slow or down | Backend falls back to a cached or chronological feed, client shows what it has |
+| Duplicate items across pages | Dedupe by ID when flattening pages |
+| Video fails to load | Keep the poster, show a retry affordance, don't block scrolling |
+| Cursor expired after long background | `410` triggers a refresh from the top, preserving the "new posts" UX |
+
+#### Security, observability, 10x
+
+- **Security:** signed or expiring CDN URLs for private media, server-authoritative counts, moderation pipeline before content reaches feeds, and no trust in client-reported impressions for billing without server validation.
+- **Observability:** time to first post, slow/frozen frame rate, video start time and rebuffer ratio, impressions (for example 50% visible for 1 s), OOM and app-hang rates, and cache hit ratio.
+- **10x:** server-driven card definitions (so new card types don't need a store release), edge caching of media variants, prefetch aggressiveness tuned per device tier and network type, and precomputed feeds.
+
+> [!INTERVIEW]
+> What a senior answer includes: why cursors beat offsets for ranked feeds, known aspect ratios to prevent layout shift, a bounded video player pool, and a clear split between server state and UI state. Red flags: `ScrollView` with `map`, one video player per cell, loading full-resolution images, putting the whole feed in Redux by hand. Likely follow-ups: "How do you count an impression?", "How do you inject ads without breaking recycling?" (separate `getItemType`, positions decided server-side), "How would you support a TikTok-style full-screen vertical video feed?" (paging, preload next video, one decoder active plus one warm).
+
+### How would you design the live-tracking screen for a ride-hailing or delivery app?
+
+**Short answer:** There are two apps and two problems. The driver app is a background location *producer*: adaptive sampling, batching, a foreground service on Android, and background location on iOS. The rider app is a *consumer*: it subscribes to a trip channel over WebSocket and interpolates the marker between sparse updates. The server validates, snaps to roads and fans out. Battery, stale data and privacy drive most of the decisions.
+
+#### Requirements
+
+- **Functional:** rider sees driver position, heading, route polyline and ETA. Trip states: searching, assigned, arriving, in trip, completed. Lock-screen status (iOS Live Activity, Android ongoing notification). The driver app streams location during a shift, including in the background.
+- **Non-functional:** end-to-end latency under 2–3 s, smooth marker motion (no teleporting), driver battery drain acceptable over an 8-hour shift, data usage minimal, and location shared only with trip participants.
+- **Clarify:** how often must the rider see updates? Multiple watchers (shared trip link)? Driver app on company devices or personal phones (OEM battery killers)?
+
+```mermaid
+sequenceDiagram
+    participant Drv as Driver app
+    participant Ing as Location ingest
+    participant Bus as Pub/Sub
+    participant GW as Socket gateway
+    participant Rider as Rider app
+    participant Map as Map view
+    loop every 3-5 s or 25-50 m
+        Drv->>Ing: batch of fixes (lat, lng, speed, heading, ts)
+        Ing->>Ing: validate accuracy, snap to road
+        Ing->>Bus: publish trip location
+    end
+    Rider->>GW: subscribe to trip (last seq)
+    Bus->>GW: trip location
+    GW-->>Rider: position update (seq, ts, eta)
+    Rider->>Rider: drop stale or out-of-order updates
+    Rider->>Map: animate marker over expected interval
+    alt socket lost
+        Rider->>GW: reconnect with backoff
+        GW-->>Rider: latest snapshot
+    end
+```
+*Figure: Location streaming from producer to consumer.*
+
+#### Driver side (producer)
+
+- **Library:** `react-native-background-geolocation` (commercial licence for Android release builds, very battle-tested motion detection) or `expo-location` `startLocationUpdatesAsync` with `expo-task-manager`. See the [Location & Maps guide](../guides/location.html) and [Background Tasks guide](../guides/background-tasks.html).
+- **Platform requirements:** iOS needs "Always" authorisation, the `location` background mode, and `allowsBackgroundLocationUpdates` with an automotive activity type. Android needs a foreground service with type `location` (mandatory since Android 14), `ACCESS_BACKGROUND_LOCATION` with a Play Console declaration, and a persistent notification.
+- **Adaptive sampling:** tie the `distanceFilter` and interval to speed. Stationary means barely any updates (use motion detection). Highway means every 50 m. Discard fixes with poor accuracy (for example above 50 m).
+- **Batching:** send every few seconds as a batch over HTTP or the socket. Buffer in SQLite while offline and flush later, because gaps matter for trip distance audits.
+- **OEM battery killers:** Xiaomi, Samsung and others kill background services aggressively. Onboard drivers to whitelist the app, and have the server detect stale drivers.
+
+#### Rider side (consumer)
+
+- Subscribe while the tracking screen is focused, unsubscribe on blur or background. In the background, trip-state changes arrive by push, and the Live Activity updates via ActivityKit push notifications.
+- Fall back to polling every 5 s if the socket can't connect (corporate networks, captive portals).
+- **Interpolation:** animate from the current rendered position to the new one over roughly the expected update interval, so the marker is always moving slightly behind real time. Interpolate heading along the shortest arc. If the gap is huge (more than about 30 s or 500 m), jump instead of animating through buildings. For short gaps (tunnels), dead-reckon with the last speed and heading, then correct.
+- **Map performance:** with `react-native-maps`, use `Marker` with `tracksViewChanges={false}` for custom marker views (otherwise the marker re-renders its bitmap every frame), and animate with `AnimatedRegion` or a Reanimated-driven coordinate. Throttle camera moves. Stop auto-follow when the user pans, and offer a "recenter" button.
+
+```ts title="src/features/tracking/interpolate.ts"
+export interface Fix { lat: number; lng: number; heading: number; ts: number; seq: number }
+
+export const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+
+// Rotate the car icon along the shortest arc (350 deg -> 10 deg turns +20, not -340)
+export function lerpHeading(from: number, to: number, t: number): number {
+  const delta = ((to - from + 540) % 360) - 180;
+  return (from + delta * t + 360) % 360;
+}
+
+export function shouldApply(prev: Fix | undefined, next: Fix): boolean {
+  return !prev || next.seq > prev.seq; // drop out-of-order and duplicate updates
+}
+```
+
+#### Failure modes and edge cases
+
+| Case | Handling |
+|---|---|
+| GPS jitter while stationary | Accuracy filter plus speed threshold, server snaps to road |
+| Driver in tunnel or GPS lost | Dead reckoning for a few seconds, then "location updating…" |
+| Driver app killed by OS/OEM | Server marks location stale after N seconds, rider UI says so honestly |
+| Rider socket drops | Backoff reconnect, snapshot on resume, polling fallback |
+| Mock locations/spoofing | Check the Android mock-location flag, Play Integrity/App Attest, server-side plausibility (speed between fixes) |
+
+#### Security, privacy, observability
+
+- Only trip participants can subscribe, and the server authorises each channel join. Stop sharing the driver's location when the trip ends. Apply retention limits to location history. Show the rider's pickup location to the driver only after assignment.
+- Metrics: end-to-end latency (driver fix timestamp to rider render), stale-location rate, socket reconnects, driver battery drain per hour (Android vitals, MetricKit), background-kill rate, and location accuracy distribution.
+
+#### Trade-offs and 10x
+
+Sending more often gives smoother movement and fresher ETAs but costs battery and data. Interpolation lets you send less often for the same perceived smoothness. At 10x: geo-sharded ingest, a streaming bus (Kafka or Redis Streams), gateways that fan out per trip, downsampled streams for passive watchers (shared links), and possibly MQTT for lower protocol overhead on the driver fleet.
+
+> [!INTERVIEW]
+> What a senior answer includes: treating producer and consumer separately, Android foreground-service types and iOS background modes, adaptive sampling, client-side interpolation, and an honest "stale" state. Red flags: polling every second, animating nothing (teleporting markers), ignoring battery, streaming location to everyone who asks. Likely follow-ups: "How do you compute ETA?" (server routing engine, client counts down between updates), "What about the lock screen?" (Live Activities/ongoing notifications), "How do you test this?" (GPX route playback in simulators/emulators, mocked location providers).
+
+### How would you design an e-commerce app with catalog, search, cart sync and checkout?
+
+**Short answer:** Put a BFF (GraphQL or REST) in front of catalog, pricing, inventory, cart and orders. The catalog is aggressively cached and prefetched. Search is a debounced, cancellable typeahead against a search service. The cart is server-authoritative and versioned, with optimistic UI and a guest-to-account merge. Checkout creates a server-side payment intent with an idempotency key, and webhooks are the source of truth for "paid". Deep links, feature flags and A/B tests are first-class because marketing drives traffic and conversion experiments.
+
+#### Requirements
+
+- **Functional:** home (merchandised, CMS-driven), category browsing with filters, search with typeahead and facets, product detail (PDP), cart across devices, guest checkout and account checkout, Apple Pay/Google Pay/cards, order history and tracking, deep links from email/ads/push, promotions.
+- **Non-functional:** PDP interactive in under 1 s from a list tap, correct prices (server-computed), PCI scope minimised, survives peak traffic (sales events), conversion measured end to end, experiments without store releases.
+- **Clarify:** physical or digital goods? That decides whether Apple/Google in-app purchase rules apply. Physical goods and real-world services use Stripe/Apple Pay and similar. Digital content consumed in-app generally requires IAP, with region-specific exceptions (check current App Review Guidelines §3.1 and Google Play Payments policy). Also: multi-currency? Marketplace (multiple sellers)?
+
+#### Client architecture and data
+
+- **API style:** GraphQL fits well (heterogeneous screens, fragments per component, a normalised cache so a price or stock change updates everywhere). REST plus a BFF with CDN caching is equally valid for the catalog. Either way, **the backend recomputes prices at checkout** and the client only displays them.
+- **Catalog performance:** stale-while-revalidate caching, image variants from a CDN, and prefetch the PDP query on `onPressIn` of a product tile (`queryClient.prefetchQuery`), so navigation feels instant. Render the PDP shell from the list item's cached summary data while the full product loads.
+- **Search:** debounce around 200 ms, cancel in-flight requests (TanStack Query passes an `AbortSignal` to `queryFn`), and query a search service (Algolia, Elasticsearch, Typesense) for suggestions, facets and zero-result fallbacks. Keep recent searches locally.
+- **Cart sync:** the server owns the cart. Each mutation sends `cartId` plus `version` (optimistic concurrency, or an ETag) and returns the full recalculated cart (totals, promotions, stock warnings). The client applies optimistic updates and rolls back on conflict. A guest cart ID lives in secure storage, and on login the server merges the guest cart into the account cart (sum quantities, cap at stock). Refetch on app foreground and screen focus. Other devices pick up changes on their next focus (or via a push/socket if the product needs it live).
+- **Home/CMS:** server-driven UI (a list of typed blocks) lets merchandising change the home screen without releases. The trade-off is versioning: old app versions must ignore unknown block types gracefully.
+
+#### Checkout and payments
+
+See the [Payments & In-App Purchases guide](../guides/payments.html) for implementation details.
+
+```mermaid
+sequenceDiagram
+    participant App as RN app
+    participant BE as Commerce backend
+    participant Stripe as Stripe
+    participant WH as Webhook handler
+    App->>BE: POST /checkout (cartId, version, Idempotency-Key)
+    BE->>BE: reprice cart, reserve stock with TTL
+    BE->>Stripe: create PaymentIntent
+    Stripe-->>BE: client secret
+    BE-->>App: orderId, client secret, ephemeral key
+    App->>Stripe: PaymentSheet confirm (3DS if required)
+    Stripe-->>App: result
+    Stripe->>WH: payment_intent.succeeded
+    WH->>BE: mark order paid, start fulfilment
+    App->>BE: poll or subscribe to order status
+    BE-->>App: order confirmed
+```
+*Figure: Checkout with a server-created PaymentIntent. The webhook, not the app, decides that an order is paid.*
+
+- **Idempotency:** one `Idempotency-Key` per checkout attempt, so double taps and retries don't create two orders or two charges. Disable the pay button while a request is in flight.
+- **PCI:** card data goes straight from Stripe's SDK to Stripe, so your servers never see a PAN. That keeps you in the lightest PCI scope.
+- **Reconciliation:** if the app crashes after payment but before confirmation, the order is still marked paid by the webhook. On next launch, the app fetches pending orders and shows the result.
+
+#### Deep links, flags and experiments
+
+- **Deep links:** Universal Links/App Links for products, categories, cart and promo codes, mapped through Expo Router or React Navigation's `linking` config. Validate params, and for auth-gated targets stash the pending link and resume it after login. Deferred deep linking (install and then land on the product) needs Branch, AppsFlyer, Adjust or a custom solution, since Firebase Dynamic Links shut down in August 2025. See the [Deep Linking guide](../guides/deep-linking.html).
+- **Feature flags:** evaluate at startup from a cached snapshot with compiled-in defaults, refresh in the background, and apply changes on the next screen or next launch. Don't flip a flag under a user mid-checkout.
+- **A/B tests:** sticky bucketing by user ID (or device ID for guests), and log an **exposure event when the variant actually renders**, not when it's fetched, or your analysis is diluted. Pair each experiment with guardrail metrics (crash rate, checkout conversion, refund rate). Tools: Statsig, LaunchDarkly, GrowthBook, Firebase Remote Config with A/B Testing, Optimizely.
+
+#### Failure modes, security, observability
+
+| Concern | Approach |
+|---|---|
+| Price changed between cart and checkout | Server reprices, app shows a clear "price updated" step before confirming |
+| Oversell during a flash sale | Reserve stock with a TTL at checkout start, release on timeout |
+| Payment succeeded, app crashed | Webhook marks paid, app reconciles pending orders on launch |
+| Checkout bots and card testing | App Attest/Play Integrity tokens, rate limits, Stripe Radar |
+| Search service down | Degrade to category browsing, show cached popular searches |
+
+Observability: a funnel (impression, PDP view, add to cart, checkout start, payment success) segmented by app version and experiment variant; payment failure reasons; search zero-result rate; API latency per endpoint; crash-free sessions on checkout screens specifically.
+
+**10x:** edge-cached catalog and search suggestions, queue-based order processing, read replicas, and flags evaluated at the edge. On the client, feature modules owned by separate teams (see monorepo and boundaries below), plus server-driven UI for merchandising.
+
+> [!INTERVIEW]
+> What a senior answer includes: the physical vs digital goods question (IAP rules), server-authoritative pricing, idempotent checkout, webhooks as the source of truth, cart merge semantics, and exposure logging for experiments. Red flags: computing totals on the client and sending them to the server, creating PaymentIntents from the app with a secret key, "we'll use Firebase Dynamic Links". Likely follow-ups: "How do you handle a user on an app version that doesn't know a new promotion type?", "How would you run a price experiment ethically and legally?", "How do you test payments in CI?" (Stripe test mode, test cards, mocked PaymentSheet in component tests).
+
+### How would you design the API layer and auth/session management for a large app?
+
+**Short answer:** Build one typed client (generated from OpenAPI or a GraphQL schema) with a small middleware chain: auth header, request IDs, timeout, **single-flight token refresh** on 401, and error normalisation into a discriminated union. Validate responses at the boundary. Put retries, caching and deduplication in the query layer (TanStack Query), and expose feature-level hooks. Keep the access token in memory and the rotating refresh token in Keychain/Keystore. Logout is a coordinated teardown of every cache, socket and token.
+
+#### Layers
+
+| Layer | Responsibility | Typical tools |
+|---|---|---|
+| Transport | `fetch`, timeouts, abort, base URL per environment | `fetch` + `AbortController` (or axios/ky) |
+| Middleware | Auth header, refresh, request ID/trace headers, logging, app-version headers | Custom interceptors |
+| Contract | Typed endpoints, runtime validation | openapi-typescript/orval, GraphQL Codegen, zod |
+| Query | Caching, dedupe, retries, invalidation, persistence | TanStack Query, RTK Query, Apollo/urql/Relay |
+| Feature hooks | `useOrders()`, `usePlaceOrder()` | Owned by features |
+
+#### Token refresh without logging users out
+
+```mermaid
+sequenceDiagram
+    participant A as Request A
+    participant B as Request B
+    participant C as API client
+    participant Auth as Auth server
+    participant API as Resource API
+    A->>C: GET /me
+    B->>C: GET /orders
+    C->>API: both with expired access token
+    API-->>C: 401 and 401
+    C->>Auth: one refresh with rotating refresh token
+    Note over B,C: B awaits the same in-flight refresh promise
+    Auth-->>C: new access and refresh tokens
+    C->>C: persist refresh token to Keychain or Keystore
+    C->>API: replay A and B once
+    API-->>C: 200 and 200
+    alt refresh fails
+        C->>C: clear session and emit logout
+    end
+```
+*Figure: Single-flight refresh. Without it, two parallel refreshes with a rotating token trip reuse detection and the server revokes the session.*
+
+```ts title="src/shared/http/client.ts"
+import { z } from 'zod';
+import { API_URL } from '../config';
+import { session } from '../auth/session';
+import { createRequestId } from './requestId';
+
+export type ApiError =
+  | { kind: 'network'; message: string }
+  | { kind: 'timeout' }
+  | { kind: 'unauthorized' }
+  | { kind: 'http'; status: number; code?: string; message?: string; requestId?: string }
+  | { kind: 'invalid_response'; issues: string[] };
+
+export class ApiException extends Error {
+  constructor(public readonly error: ApiError) {
+    super(error.kind);
+  }
+}
+
+let refreshInFlight: Promise<void> | null = null;
+
+function refreshOnce(): Promise<void> {
+  refreshInFlight ??= session.refresh().finally(() => {
+    refreshInFlight = null;
+  });
+  return refreshInFlight;
+}
+
+export async function request<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  init: RequestInit & { timeoutMs?: number } = {},
+  isReplay = false,
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), init.timeoutMs ?? 15_000);
+  const headers = new Headers(init.headers);
+  const token = session.accessToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  headers.set('X-Request-Id', createRequestId());
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}${path}`, { ...init, headers, signal: controller.signal });
+  } catch (e) {
+    throw new ApiException(
+      controller.signal.aborted ? { kind: 'timeout' } : { kind: 'network', message: String(e) },
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (res.status === 401 && !isReplay) {
+    try {
+      await refreshOnce();
+    } catch {
+      session.expire(); // clears tokens and notifies the app shell to log out
+      throw new ApiException({ kind: 'unauthorized' });
+    }
+    return request(path, schema, init, true);
+  }
+
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { code?: string; message?: string };
+    throw new ApiException({
+      kind: 'http',
+      status: res.status,
+      code: body.code,
+      message: body.message,
+      requestId: res.headers.get('x-request-id') ?? undefined,
+    });
+  }
+
+  const parsed = schema.safeParse(res.status === 204 ? undefined : await res.json());
+  if (!parsed.success) {
+    throw new ApiException({ kind: 'invalid_response', issues: parsed.error.issues.map((i) => i.message) });
+  }
+  return parsed.data;
+}
+```
+
+Retries belong in the query layer, where you know whether an operation is safe to repeat:
+
+```ts title="src/shared/http/queryClient.ts"
+import { QueryClient } from '@tanstack/react-query';
+import { ApiException } from './client';
+
+const isRetryable = (e: unknown) =>
+  e instanceof ApiException &&
+  (e.error.kind === 'network' || e.error.kind === 'timeout' ||
+    (e.error.kind === 'http' && [408, 429, 502, 503, 504].includes(e.error.status)));
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: (count, e) => count < 3 && isRetryable(e),
+      retryDelay: (n) => Math.min(1000 * 2 ** n, 10_000) * (0.5 + Math.random() / 2),
+    },
+    mutations: { retry: false }, // opt in per mutation, and only with an Idempotency-Key
+  },
+});
+```
+
+#### Session lifecycle details that matter
+
+- **Proactive refresh:** refresh when the access token is within about 60 s of expiry (on foreground and before requests), which avoids most 401 round trips. Allow for clock skew.
+- **Multiple JS contexts:** background tasks or headless JS can refresh concurrently with the UI. Use one shared session module and, if needed, a native-backed lock.
+- **Keychain survives reinstall on iOS:** clear stale tokens on the first launch after install (check a flag kept in MMKV/UserDefaults).
+- **Startup:** hold the splash screen until the session state is known (valid, refreshable or logged out), to avoid a flash of the login screen.
+- **Logout:** revoke the refresh token server-side, clear secure storage, `queryClient.clear()`, reset navigation, close sockets, unregister the push token and reset analytics identity.
+- **Old app versions:** send `X-App-Version` and platform headers. The backend can return a "minimum version" error that the app turns into a force-upgrade screen. APIs must evolve additively because binaries live for years.
+
+#### Caching, security, observability
+
+- **Caching:** set `staleTime` per resource (profile: minutes; stock: seconds), persist selected queries to MMKV for instant cold starts, and use ETags/`If-None-Match` for large, rarely changing payloads.
+- **Security:** no secrets in the JS bundle (it's trivially extractable). Certificate pinning only with backup pins and a rotation plan. App Attest/Play Integrity tokens for abuse-prone endpoints. Redact PII from logs and breadcrumbs. See the [Authentication & Sessions guide](../guides/authentication.html) and [Security guide](../guides/security.html).
+- **Observability:** propagate `X-Request-Id`/`traceparent` so a client error links to backend traces (Sentry distributed tracing). Track error rate and latency by endpoint and app version, and count refresh failures and forced logouts.
+
+**At 10x (many teams, many services):** generate the client from schemas in CI and fail builds on breaking contract changes. Add a BFF per client type. Use persisted queries (GraphQL) to shrink payloads and lock down operations. Give each team its own feature hooks over the shared client, never its own ad hoc `fetch`.
+
+> [!INTERVIEW]
+> What a senior answer includes: single-flight refresh and *why* (rotation reuse detection), where retries belong, a typed error model the UI can switch on, runtime validation at the boundary, and a complete logout teardown. Red flags: storing tokens in AsyncStorage, retrying POSTs blindly, every screen calling `fetch` directly, handling 401s in each component. Likely follow-ups: "REST or GraphQL for this app?", "How do you support offline mutations?" (persisted mutation queue with idempotency keys), "How do you test the refresh race?" (MSW handlers returning 401 to parallel requests, asserting one refresh call).
+
+### How would you build a white-label, multi-brand app from one codebase?
+
+**Short answer:** Treat a brand as *data*, not code. Each brand has a validated config (identity, bundle IDs, API endpoints, keys), design tokens and assets. Build-time config drives native identity through `app.config.ts` and CNG (or Android product flavors and iOS schemes in bare apps). Runtime config and feature flags drive behaviour. CI builds a brand × platform matrix, and store metadata is generated per brand. The hard parts are signing, store policy and keeping brand-specific `if`s out of feature code.
+
+#### Requirements
+
+- **Functional:** N brands (start with 5, plan for 50) sharing features, each with its own name, icon, splash, colours, typography, bundle ID, API environment, analytics/push keys, store listing, and optional feature subset.
+- **Non-functional:** onboarding a new brand in days without code changes, a shared fix reaching every brand quickly, one brand's customisation never leaking into another, and build time kept under control.
+- **Clarify:** do all brands release together or on their own cadence? Are apps published under *our* developer account or each client's? Do brands need genuinely different features, or only a different look?
+
+#### Build-time vs runtime configuration
+
+| Build time (needs a binary) | Runtime (remote config, OTA-able) |
+|---|---|
+| App name, bundle ID/applicationId, icons, splash | Feature toggles per brand |
+| URL schemes, associated domains, entitlements | Copy, legal links, support contacts |
+| Push/Firebase config files, signing | Theme tweaks within the token system |
+| Native SDKs a brand needs | Merchandising, content, API feature switches |
+
+```mermaid
+flowchart TD
+    Brands[("brands folder<br/>config.json, tokens, assets")] --> Validate["Validate with zod schema"]
+    Validate --> Config["app.config.ts<br/>reads BRAND env"]
+    Config --> Prebuild["expo prebuild per brand<br/>or flavor and scheme"]
+    Prebuild --> Matrix["CI matrix<br/>brand x platform"]
+    Matrix --> IOS["iOS build<br/>bundle id, signing"]
+    Matrix --> Android["Android build<br/>applicationId, keystore"]
+    IOS --> ASC["App Store Connect<br/>one app record per brand"]
+    Android --> Play["Play Console<br/>one listing per brand"]
+    Config --> OTA["OTA channel<br/>per brand and runtime"]
+    Brands --> Meta["fastlane metadata<br/>and screenshots per brand"]
+    Meta --> ASC
+    Meta --> Play
+```
+*Figure: One codebase, a brand × platform build matrix, per-brand store records.*
+
+#### Implementation (Expo/CNG)
+
+```ts title="app.config.ts"
+import type { ExpoConfig } from 'expo/config';
+import { loadBrand } from './brands/loadBrand'; // reads brands/<id>/config.json, validates with zod, throws on error
+
+const brand = loadBrand(process.env.BRAND ?? 'acme');
+const dir = `./brands/${brand.id}`;
+
+export default (): ExpoConfig => ({
+  name: brand.displayName,
+  slug: 'shop-white-label',
+  scheme: brand.urlScheme,
+  version: '5.12.0',
+  icon: `${dir}/icon.png`,
+  runtimeVersion: { policy: 'fingerprint' },
+  ios: {
+    bundleIdentifier: brand.ios.bundleId,
+    associatedDomains: [`applinks:${brand.webDomain}`],
+    googleServicesFile: `${dir}/GoogleService-Info.plist`,
+  },
+  android: {
+    package: brand.android.applicationId,
+    googleServicesFile: `${dir}/google-services.json`,
+    adaptiveIcon: { foregroundImage: `${dir}/adaptive-icon.png`, backgroundColor: brand.colors.primary },
+  },
+  plugins: [
+    ['expo-splash-screen', { image: `${dir}/splash.png`, backgroundColor: brand.colors.background, imageWidth: 200 }],
+  ],
+  extra: { brandId: brand.id, apiBaseUrl: brand.apiBaseUrl, eas: { projectId: process.env.EAS_PROJECT_ID } },
+});
+```
+
+In a **bare** app the same idea maps to Android `productFlavors` (with `android/app/src/<flavor>/` for resources and `google-services.json`) and iOS targets or schemes with per-brand `.xcconfig` files, usually plus `react-native-config`. CNG makes this far easier because the native projects are generated per brand instead of maintained N times.
+
+#### Keeping the codebase clean
+
+- **Capabilities, not brand checks:** feature code asks `brand.features.loyalty` or a flag, never `if (brand.id === 'acme')`. Add a lint rule that bans importing the brand ID in feature code.
+- **Theming:** the design system consumes semantic tokens (`color.action.primary`), and each brand provides values. Components never see raw hex values.
+- **Genuine divergence:** if a brand needs a different screen, register it in a slot (for example `brand.overrides.HomeScreen`) behind a stable interface. Forking the feature is the last resort.
+
+#### CI, stores and compliance
+
+- **CI matrix:** GitHub Actions/EAS builds over `brand × platform`. Rebuild everything when shared code changes, only one brand when only its config changes. Release in waves: an internal canary brand first, then everyone else.
+- **Signing:** each bundle ID needs its own provisioning profile and each Android app its own upload key (Play App Signing per app). Store credentials per brand in a secrets manager or EAS credentials.
+- **Store policy:** Apple Guideline 4.2.6 rejects apps made from commercialised templates unless the content provider submits them. For agency-style white-label apps (a restaurant chain, a gym), that usually means publishing under each **client's own developer account**, which multiplies credentials and App Store Connect API keys. Guideline 4.3 (spam) also bites if many near-identical apps ship under one account. Verify the current guideline wording before committing to a model.
+- **Metadata:** `fastlane/metadata/<brand>/` for descriptions, keywords and privacy URLs. Automate screenshots per brand with Maestro flows plus a framing step. Privacy labels and Play Data safety must be filled per app, so generate them from a shared SDK inventory.
+- **OTA:** one channel per brand and environment, keyed by runtime version, so a JS fix can roll out across all brands in minutes.
+
+#### Failure modes, observability, 10x
+
+- **Failure modes:** the wrong brand's assets or Firebase config shipped (add a CI step that inspects the built artifact's bundle ID, app name and config), a secret mix-up between brands, and fork drift when "just this once" changes accumulate.
+- **Observability:** tag every crash, event and log with `brandId`, and set release-health gates per brand. A crash that only hits one brand usually points to a config problem.
+- **10x (100+ brands):** move more into runtime config and server-driven theming fetched on first launch, build a self-serve brand onboarding pipeline (fastlane `produce` for app records, the App Store Connect API for the rest), and cache native builds aggressively. At that point a brand is a row in a database, not a folder.
+
+> [!INTERVIEW]
+> What a senior answer includes: the build-time vs runtime split, a validated brand config, CNG or flavors/schemes, the store-account question (4.2.6), CI matrix cost, and per-brand observability. Red flags: a git branch per brand, `if (brand === …)` scattered through features, manual per-brand Xcode edits. Likely follow-ups: "A client wants a totally custom checkout, now what?", "How do you keep 30 builds under an hour?", "How do push notifications work across brands?" (APNs auth key per team, FCM project or app per brand).
+
+### How would you design a resilient large file and media upload system?
+
+**Short answer:** Copy the file into the app sandbox, preprocess it (compress, strip EXIF), and persist an upload job in a local queue. Upload directly to object storage with **chunked, resumable multipart uploads through presigned URLs**, with a few parts in parallel, per-part retries and persisted progress. Hand long transfers to OS background mechanisms (iOS background `URLSession`, Android WorkManager or user-initiated data transfer jobs), then complete the upload server-side and process asynchronously.
+
+#### Requirements
+
+- **Functional:** upload photos and videos up to several GB, show progress, pause/resume/cancel, survive app backgrounding, app kill and network changes, retry automatically, and notify on completion.
+- **Non-functional:** no lost uploads, minimal re-sent bytes after interruption, respect for cellular data settings, low battery impact, and secure (no public buckets, no long-lived credentials on device).
+- **Clarify:** maximum file size? Must uploads continue when the app is killed? Server-side processing (transcode, virus scan)? Wi-Fi only option?
+
+```mermaid
+sequenceDiagram
+    participant App as RN app
+    participant Q as Upload queue (SQLite)
+    participant BE as Upload API
+    participant S3 as Object storage
+    App->>Q: enqueue job (sandbox file, size, sha256)
+    Q->>BE: POST /uploads (size, type, checksum)
+    BE->>S3: CreateMultipartUpload
+    BE-->>Q: uploadId, part size, presigned part URLs
+    loop each part, 3 to 4 in parallel
+        Q->>S3: PUT part N via presigned URL
+        S3-->>Q: ETag
+        Q->>Q: persist part N as done
+    end
+    Q->>BE: POST /uploads/uploadId/complete (ETags)
+    BE->>S3: CompleteMultipartUpload
+    BE-->>App: accepted, processing async
+    opt app killed or offline mid-upload
+        Q->>BE: resume, list uploaded parts
+        BE-->>Q: remaining parts and fresh URLs
+    end
+```
+*Figure: Resumable multipart upload via presigned URLs. The app never holds storage credentials.*
+
+#### Protocol choice
+
+| Option | Good for | Trade-offs |
+|---|---|---|
+| Single presigned `PUT` | Files under about 10–20 MB | Restart from zero on failure |
+| S3-style multipart (presigned parts) | Large files, direct to storage | Parts at least 5 MiB except the last, at most 10,000 parts. You orchestrate init/complete |
+| tus protocol | Resumable uploads to your own server/proxy | Extra infrastructure, but a standard client (`tus-js-client`) |
+| Upload through your API servers | Small files that need inline validation | Your servers carry all the bandwidth |
+
+#### Client pipeline
+
+1. **Pick and copy:** picker URIs can be temporary (iOS temp files get purged, Android `content://` grants can expire), so copy into the app's documents directory first.
+2. **Preprocess:** resize images, compress video (for example `react-native-compressor`), convert HEIC if the backend requires it, and strip GPS EXIF unless the product needs it.
+3. **Persist the job:** `{ id, filePath, size, checksum, uploadId, partSize, parts: [{ n, etag, done }], status, attempts }` in SQLite, so any process restart can resume.
+4. **Upload parts:** concurrency of 3–4 on Wi-Fi and 1–2 on cellular. Parts of 5–16 MiB: bigger parts mean fewer requests but more bytes re-sent per failure. Retry each part with exponential backoff and jitter. Refresh presigned URLs when they expire (`403`).
+5. **Complete** with the ordered ETags, then mark the job `processing` and wait for a server event (push or socket) that media is ready.
+
+```ts title="src/features/uploads/types.ts"
+export type UploadStatus = 'queued' | 'uploading' | 'paused' | 'completing' | 'processing' | 'done' | 'failed';
+
+export interface UploadJob {
+  id: string;            // client-generated, also the idempotency key for POST /uploads
+  filePath: string;      // copy inside the app sandbox
+  size: number;
+  sha256: string;
+  uploadId?: string;     // server multipart session
+  partSize: number;
+  parts: Array<{ n: number; etag?: string; done: boolean }>;
+  status: UploadStatus;
+  attempts: number;
+  wifiOnly: boolean;
+}
+
+// Aggregate progress from completed parts plus in-flight bytes; throttle UI updates to about 4 per second
+export const progressOf = (job: UploadJob, inFlightBytes: number): number =>
+  Math.min(1, (job.parts.filter((p) => p.done).length * job.partSize + inFlightBytes) / job.size);
+```
+
+#### Background execution
+
+| | iOS | Android |
+|---|---|---|
+| Mechanism | Background `URLSession` upload tasks (from a file, not in-memory data). The OS continues them while suspended and relaunches the app in the background when they finish | WorkManager (long-running worker with a `dataSync` foreground service) or, on Android 14+, user-initiated data transfer jobs for user-started transfers |
+| Limits | OS schedules at its discretion. A force-quit by the user cancels background transfers | Foreground service types mandatory (Android 14+), time limits on `dataSync` services in recent versions, OEM battery killers |
+| UX | Optional Live Activity for progress | Required ongoing notification with progress |
+
+Most JS-only upload libraries stop when the app is suspended. For truly resilient background uploads, many teams write a small native module (Expo Modules API or a Turbo Module) that wraps background `URLSession` and WorkManager and reports progress back to JS. See the [Camera, Media & Uploads guide](../guides/camera.html) and [Background Tasks guide](../guides/background-tasks.html).
+
+#### Failure modes and security
+
+| Failure | Handling |
+|---|---|
+| Network drops mid-part | Retry that part only, resume from persisted state |
+| Presigned URL expired | Request fresh URLs for remaining parts |
+| App killed or phone rebooted | Job in SQLite, resume on next launch (or the OS continues background tasks) |
+| Duplicate upload after retry of init | Idempotency key on `POST /uploads`, optional dedupe by content hash |
+| Abandoned multipart uploads | Storage lifecycle rule that aborts incomplete multipart uploads after N days (otherwise you pay for orphaned parts) |
+| Malicious file | Server validates size and magic bytes after upload, scans before making it visible |
+
+Security: short-lived presigned URLs scoped to one object key (and part), private buckets, content-type and size constraints enforced server-side, per-user quotas, and signed CDN URLs for reading.
+
+#### Observability and 10x
+
+Metrics: upload success rate, time to complete by file size and network type, retries per part, resume count, abandonment rate, and server processing latency. At 10x: regional buckets or transfer acceleration, adaptive part size from measured throughput, content-hash dedupe (skip bytes the server already has), and a processing pipeline on a queue with backpressure.
+
+> [!INTERVIEW]
+> What a senior answer includes: direct-to-storage uploads via presigned URLs, multipart with persisted part state, OS background mechanisms and their limits, and copying out of temporary picker URIs. Red flags: base64-encoding a video into a JSON body, keeping the whole file in JS memory, AWS credentials embedded in the app. Likely follow-ups: "How do you show progress across app restarts?", "What about uploads from a share extension?" (native extension writing into a shared app group container, then handing off to the queue), "How do you handle a 4 GB video on a low-storage device?" (compress in a streaming fashion, check free space first, clean up copies).
+
+## Architecture & code organization
+
+### How do you structure a large React Native codebase: folders, layers and dependency boundaries?
+
+**Short answer:** Organise by **feature**, not by file type. Inside each feature, split UI, domain and data only as far as the complexity justifies it. Features expose a small public API and never import each other's internals. Shared code lives in `shared/` and never imports from features. The app shell wires navigation and providers together. The rules are enforced by lint and CI, not by wiki pages.
+
+```plaintext
+src/
+  app/                      # composition root: navigation, providers, DI, app start
+  features/
+    checkout/
+      ui/                   # screens, components, hooks that touch React
+      domain/               # entities, pure business rules, use cases, ports (interfaces)
+      data/                 # API calls, repositories, DB access, mappers (DTO -> entity)
+      index.ts              # public API: screens + hooks other features may use
+    catalog/
+    profile/
+  shared/
+    design-system/          # tokens, primitives, components
+    lib/                    # http client, storage, analytics, logging, i18n
+    utils/
+```
+
+```mermaid
+flowchart TD
+    subgraph shell["app (composition root)"]
+        Nav["Navigation, providers, DI wiring"]
+    end
+    subgraph feat["features/checkout"]
+        FUI["ui<br/>screens, components, hooks"]
+        FDom["domain<br/>entities, use cases, ports"]
+        FData["data<br/>repositories, API, DB"]
+    end
+    subgraph shared["shared"]
+        DS["design-system"]
+        Lib["lib<br/>http, storage, analytics"]
+    end
+    Nav --> FUI
+    Nav --> FData
+    FUI --> FDom
+    FData -->|"implements ports"| FDom
+    FUI --> DS
+    FData --> Lib
+```
+*Figure: Dependencies point inward to the domain. Shared code never depends on features.*
+
+#### Why this shape
+
+- **Feature folders** keep change local: one PR touches one folder, ownership maps to teams (CODEOWNERS per feature), and deleting a feature means deleting a folder.
+- **Domain isolation** keeps business rules (pricing display, eligibility, validation) as pure TypeScript that is fast to unit-test and reusable on web.
+- **Data layer mappers** stop backend DTO shapes leaking into components, so an API change is fixed in one mapper.
+
+#### Enforcing boundaries
+
+```js title="eslint.config.js (excerpt)"
+export default [
+  {
+    files: ['src/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [
+          { group: ['@/features/*/*'], message: 'Import other features only via their public index.ts' },
+        ],
+      }],
+    },
+  },
+  {
+    files: ['src/shared/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [{ group: ['@/features/*', '@/app/*'], message: 'shared/ must not depend on features or app' }],
+      }],
+    },
+  },
+];
+```
+
+For richer rules (domain must not import React, data must not import UI), use `eslint-plugin-boundaries`, `dependency-cruiser` or Nx's `enforce-module-boundaries`, and run them in CI.
+
+#### Pitfalls
+
+- **Ceremony without payoff:** a CRUD settings screen doesn't need use-case classes and repository interfaces. Scale the layering to the feature.
+- **Barrel files everywhere:** big `index.ts` re-exports can cause circular imports and evaluate modules eagerly at startup. Keep barrels only at feature boundaries and enable Metro's `inlineRequires`.
+- **A `shared/` that becomes a junk drawer:** code moves to shared only once two features actually need it.
+
+> [!INTERVIEW]
+> What a senior answer includes: feature-first structure, the dependency rule, a public API per feature, automated enforcement, and pragmatism about how much layering is worth it. Red flags: `components/ screens/ reducers/ utils/` at the top level for a 200-screen app, or "clean architecture" dogma applied to every button. Likely follow-ups: "How do two features communicate?" (navigation params, shared domain events, or a thin shared service, never deep imports), "How would you migrate an existing type-based codebase?" (strangler approach, feature by feature, with lint rules at warn level first).
+
+### When would you use a monorepo, which tooling would you pick, and how do you share code with web?
+
+**Short answer:** Use a monorepo when mobile, web and shared packages change together and you want atomic PRs, one version of shared dependencies and cached, affected-only CI. The base is Yarn or pnpm workspaces. Add Turborepo for simple task caching or Nx for a project graph, generators and boundary enforcement. Share logic, types, API clients, validation and design tokens by default. Share UI only where the product is truly the same on both platforms.
+
+```plaintext
+apps/
+  mobile/          # Expo app
+  web/             # Next.js or Expo Router web
+packages/
+  api-client/      # generated types + typed client
+  domain/          # pure business logic, zod schemas
+  design-tokens/   # colours, spacing, typography as data
+  ui/              # optional cross-platform components (react-native-web, Tamagui, NativeWind)
+  config/          # shared tsconfig, eslint, jest presets
+```
+
+| Tool | Strengths | Costs |
+|---|---|---|
+| Yarn (Berry) / pnpm / Bun workspaces | Dependency linking, one lockfile | No task orchestration by themselves |
+| Turborepo | Simple pipeline config, local and remote caching, fast adoption | Fewer guardrails (no module boundary rules built in) |
+| Nx | Project graph, `affected` commands, generators, module boundary lint rule, RN/Expo plugins | More opinionated, steeper learning curve |
+
+#### RN-specific monorepo gotchas
+
+- **Exactly one copy of `react` and `react-native`.** Duplicates cause "Invalid hook call" or native modules registering twice. Align versions with `syncpack`, `resolutions`/`overrides`, or pnpm catalogs.
+- **Metro and symlinks:** modern Metro supports symlinks, and Expo configures Metro for monorepos automatically in recent SDKs. Bare apps may still need `watchFolders` and `resolver.nodeModulesPaths`.
+- **pnpm:** historically RN needed `node-linker=hoisted`. Recent Expo SDKs handle isolated installs better, but check your versions and native libraries.
+- **Native dependencies belong to the app package.** Autolinking reads the app's dependencies, so a shared package's native dependency should be a `peerDependency` installed in the app.
+- **CI:** build only affected apps, cache JS tasks remotely, and cache native builds separately (they dominate the time).
+
+#### What to share with web
+
+| Share by default | Share selectively | Usually don't share |
+|---|---|---|
+| Types, API client, zod schemas | Presentational components via react-native-web/Tamagui/NativeWind | Navigation structure |
+| Business rules, formatters, i18n strings | Hooks that wrap data fetching | Platform-specific screens (camera, maps) |
+| Design tokens | Full screens with Expo Router on web | Performance-critical native views |
+
+> [!INTERVIEW]
+> What a senior answer includes: a clear reason for the monorepo (atomic changes, dependency alignment), the single-React rule, native deps as peer deps, and a nuanced "share logic first" stance. Red flags: "a monorepo makes everything shareable" or ignoring CI cost. Likely follow-ups: "How do you version shared packages?" (internal packages stay unversioned, use workspace protocol, Changesets only if you publish externally), "How do you stop web code importing native modules?" (platform extensions `.native.ts`/`.web.ts`, boundary lint rules).
+
+### How do you build and govern a design system and component library for a React Native team?
+
+**Short answer:** Start from design tokens (colour, spacing, typography, radii, motion) exposed as semantic names. Build primitives on top of those, then components with typed variants and accessibility built in. Theming (light/dark/brand) happens at the token layer. Document everything in Storybook, test it visually, and treat the library as a product with owners, versioning, a contribution process and adoption metrics.
+
+#### Layers
+
+1. **Tokens:** raw palette, then semantic tokens (`color.text.primary`, `color.surface.raised`, `space.4`). Sync from Figma variables so design and code share names.
+2. **Primitives:** `Box`, `Text`, `Stack`, `Pressable` wrappers that only accept tokens, not arbitrary values.
+3. **Components:** `Button`, `TextField`, `Sheet`, `Toast`, with variants (`intent`, `size`), states, and a11y roles/labels built in. Minimum touch target 44×44 pt (iOS) / 48×48 dp (Android). Respect Dynamic Type/font scale.
+4. **Patterns:** forms, empty states, list rows, and error screens composed from components.
+
+```ts title="packages/design-tokens/src/themes.ts"
+const palette = { blue600: '#1F5EFF', gray900: '#111418', gray50: '#F7F8FA', white: '#FFFFFF' } as const;
+
+export const lightTheme = {
+  color: {
+    textPrimary: palette.gray900,
+    surface: palette.white,
+    surfaceSubtle: palette.gray50,
+    actionPrimary: palette.blue600,
+    onActionPrimary: palette.white,
+  },
+  space: { 1: 4, 2: 8, 3: 12, 4: 16, 6: 24, 8: 32 },
+  radius: { sm: 6, md: 10, lg: 16 },
+} as const;
+
+export type Theme = typeof lightTheme;
+```
+
+#### Choosing a styling approach
+
+| Approach | Fit |
+|---|---|
+| `StyleSheet` + typed tokens + a theme context | Small or medium teams, zero dependencies, full control |
+| Restyle (Shopify) | Type-safe, token-driven props, good for strict systems |
+| Tamagui | Cross-platform (web + native) with an optimising compiler, bigger learning curve |
+| NativeWind | Tailwind classes, great for teams coming from web Tailwind |
+| Unistyles 3 | Fast native-backed theming and breakpoints, New Architecture only |
+
+#### Governance
+
+- **Owners:** a core team (or a guild with rotation) owns the library. Features contribute via RFCs for new components.
+- **Quality gates:** Storybook stories for every variant, visual regression (Chromatic/Loki-style screenshots or device screenshots via Maestro), RNTL tests for a11y roles and states.
+- **Evolution:** deprecate with lint warnings and codemods, never with silent breaking changes. Track adoption (percentage of screens using library components, count of raw hex values in the codebase).
+- **Escape hatches:** allow local one-off components, but review repeated ones for promotion.
+
+> [!INTERVIEW]
+> What a senior answer includes: semantic tokens, accessibility as a built-in property, theming at the token layer, and governance (ownership, contribution, deprecation). Red flags: a "design system" that is a folder of screens' leftover components, hard-coded colours in features, or picking a styling library before defining tokens. Likely follow-up: "How do you get teams to adopt it?" (make it the easiest path: generators, lint rules for raw colours, migration help, a showcase app).
+
+### How do you choose state management for a team?
+
+**Short answer:** First classify state: server cache, global client state, local UI state, form state, navigation state and persisted state. Each has a best-fit tool, and most "state management" pain comes from forcing server data into a client store. My default is TanStack Query (or RTK Query/Apollo) for server state and Zustand for small global client state, with Redux Toolkit where a large team benefits from its conventions, middleware and devtools. The decision then hinges on team size, conventions, offline needs and what the team already knows.
+
+| Kind of state | Examples | Default tool |
+|---|---|---|
+| Server cache | Products, orders, profile | TanStack Query / RTK Query / Apollo or Relay (GraphQL) |
+| Global client state | Auth status, theme, active video, feature toggles | Zustand, Redux Toolkit, Jotai |
+| Local UI state | Modal open, input focus | `useState`/`useReducer` |
+| Form state | Checkout form, validation | react-hook-form + zod |
+| Navigation state | Current route, params | React Navigation / Expo Router |
+| Persisted | Preferences, drafts, cache snapshot | MMKV (+ query persistence) |
+| Local-first synced data | Offline documents, chat | SQLite/WatermelonDB, Legend-State |
+
+#### Decision criteria
+
+- **Team size and turnover:** Redux Toolkit's opinionated structure (slices, RTK Query, devtools, middleware) pays off with 15+ engineers. Zustand's minimal API suits smaller teams, but you have to write the conventions yourself (store per domain, selectors, no async spaghetti).
+- **Offline and sync needs:** if the app is local-first, the database *is* your state layer. Don't mirror it into Redux.
+- **Performance:** selector-based subscriptions (Zustand, Redux `useSelector`, Jotai atoms, Legend-State observables) avoid the Context re-render cascade. React Context is fine for low-frequency values (theme, locale), not for high-frequency updates.
+- **Devtools and debugging:** Redux DevTools and TanStack Query DevTools plugins work with React Native DevTools and Expo dev tools.
+- **Existing investment:** a working Redux codebase doesn't need a rewrite. Introduce RTK Query or TanStack Query for new server data and let the old slices shrink.
+
+> [!INTERVIEW]
+> What a senior answer includes: the state taxonomy, "server state is a cache, not app state", concrete criteria, and a migration path rather than a rewrite. Red flags: one giant global store for everything, manual `isLoading`/`error` flags for every request, Context for rapidly changing values, or "Redux is dead" without nuance. Likely follow-ups: "How do you keep optimistic updates consistent across screens?" (normalised cache or `setQueriesData`), "Where do WebSocket updates go?" (write into the query cache or the local DB, never directly into components).
+
+### Expo or bare React Native in 2026: how do you decide?
+
+**Short answer:** Expo is the default. The React Native team recommends starting with a framework, and with Continuous Native Generation, config plugins, development builds and the Expo Modules API, almost any native requirement can be met without hand-maintaining `ios/` and `android/`. I'd choose a bare workflow (committing native folders) for brownfield integration into existing native apps, heavy native build customisation that config plugins can't express cleanly, or organisational constraints. Even then, Expo modules and EAS remain usable, so it isn't all-or-nothing.
+
+#### Clearing up misconceptions
+
+| Myth | Reality |
+|---|---|
+| "Expo means no native code" | Write Swift/Kotlin with the Expo Modules API, add any library with native code, and customise native projects with config plugins |
+| "Expo means Expo Go" | Production apps use development builds (`expo-dev-client`). Expo Go is for prototyping |
+| "Expo means paying for EAS" | EAS is optional. `npx expo prebuild` + Xcode/Gradle on your own CI, or `eas build --local` |
+| "Bare means no Expo" | Any RN app can install Expo modules (`npx install-expo-modules`) and use EAS Update |
+
+#### Decision framework
+
+| Factor | Favours Expo (CNG) | Favours bare |
+|---|---|---|
+| Greenfield app | Yes | |
+| Upgrades | SDK upgrades regenerate native projects, far fewer merge conflicts | You apply native template diffs by hand (Upgrade Helper) |
+| Native customisation | Expressible as config plugins (local plugins are easy to write) | Deep, frequently changing native edits, custom build systems (Bazel/Buck) |
+| RN embedded in an existing native app (brownfield) | | Usually bare integration into the host app |
+| Team skills | JS-heavy team | Strong dedicated iOS/Android engineers who own the native projects |
+| Routing and deep links | Expo Router gives file-based routes and automatic deep links | React Navigation works in both |
+| OTA | EAS Update integrated, runtime versions via fingerprint | Self-hosted CodePush server, hot-updater, EAS Update also works |
+
+**Migration path (bare to CNG):** run `npx expo prebuild --clean` on a branch, diff against your committed native projects, move each difference into `app.config.ts` or a local config plugin, then add `ios/` and `android/` to `.gitignore`. Anything you can't express yet can stay as a small custom plugin with a comment explaining why.
+
+> [!INTERVIEW]
+> What a senior answer includes: an up-to-date picture (New Architecture everywhere, CNG, dev builds, Expo Modules), concrete criteria rather than tribalism, and awareness that the choice is reversible and hybrid. Red flags: 2019-era arguments ("Expo can't use native modules"), or treating EAS pricing as the deciding factor. Likely follow-up: "What would make you regret choosing Expo?" (a vendor SDK needing invasive native setup that fights prebuild, which you mitigate with a well-tested config plugin).
+
+### When do you write native code, and how do you manage third-party dependency risk?
+
+**Short answer:** Write native code when you need a platform API with no well-maintained library, performance-critical work (media, crypto, on-device ML, heavy parsing), long-running background work, app extensions (widgets, Live Activities, share and notification extensions, watch apps), or a vendor SDK integration. Use the Expo Modules API, Turbo Modules with Codegen, or Nitro Modules. For dependencies, evaluate maintenance, New Architecture support, licence and native footprint before adopting, wrap them behind your own interfaces, and keep a patch/fork/replace plan for each critical one.
+
+#### Choosing a native-module approach
+
+| Approach | Best for |
+|---|---|
+| Expo Modules API (Swift/Kotlin DSL) | Most app-level modules and views, good ergonomics, works in any RN app with Expo modules installed |
+| Turbo Native Modules + Codegen | Core-style modules with typed specs, no Expo dependency |
+| Nitro Modules | Very high-frequency calls and performance-sensitive APIs, typed C++/Swift/Kotlin bindings |
+| Fabric native components | Custom native views with synchronous layout |
+
+**Costs to name honestly:** two more languages to maintain, platform parity work, native build times in CI, crash triage in native stack traces (upload dSYMs and mapping files), and upgrade maintenance. Every native module needs an owner.
+
+#### Dependency evaluation checklist
+
+| Check | Why |
+|---|---|
+| Recent releases, issue response, bus factor | Abandoned libraries block RN upgrades |
+| New Architecture support (check reactnative.directory) | RN 0.82+ runs only on the New Architecture, and interop layers are transitional |
+| Licence (MIT/Apache vs GPL/commercial) | Legal exposure, commercial licences for release builds |
+| Native footprint and binary size | Download size, 16 KB page alignment on Android, privacy manifest requirements |
+| Transitive dependencies and install scripts | Supply-chain risk |
+| Could we write it in about a week? | Small wrappers are often cheaper to own than to depend on |
+
+#### Mitigations
+
+- **Adapters:** features call `analytics.track()` or `storage.get()`, never the vendor SDK directly, so replacing a library is a one-module change.
+- **Patching:** `patch-package` or `yarn patch` for urgent fixes, upstream PRs to retire patches, and forks under your org when upstream is dead.
+- **Supply chain:** lockfiles committed, automated update PRs (Renovate/Dependabot) with CI, audit tooling (npm audit, Socket, Snyk), and review of new dependencies in PRs.
+- **Upgrade readiness:** run `npx expo install --check` / `expo-doctor` (Expo) regularly and keep a dependency inventory with owners.
+
+> [!INTERVIEW]
+> What a senior answer includes: clear triggers for native work, awareness of Expo Modules/Turbo/Nitro trade-offs, the ongoing cost of native code, and a structured way to assess and contain dependency risk. Red flags: "we'll just find a library for everything", or writing native code for things JS does fine. Likely follow-up: "A critical library is abandoned and blocks your RN upgrade, what do you do?" (fork and patch for New Architecture, contribute upstream, or replace behind the adapter, and put it in the upgrade plan).
+
+## Release engineering & quality
+
+### How do you run release trains, branching and hotfixes for a mobile app?
+
+**Short answer:** Trunk-based development with short-lived branches and feature flags keeps `main` always releasable. On a fixed cadence (weekly or every two weeks) we cut a release branch, stabilise it with fixes only, submit, and roll out in stages behind health gates. The train leaves on time, and unfinished features stay dark behind flags. Hotfixes land on `main` first and are cherry-picked to the release branch, so the next release can't regress.
+
+```mermaid
+flowchart TD
+    Main["main (trunk)<br/>always releasable, flags off"] -->|"cut every 2 weeks"| RB["release/5.12<br/>stabilise, fixes only"]
+    RB --> QA["Regression<br/>E2E suite and manual smoke"]
+    QA --> Submit["Submit to App Store and Play"]
+    Submit --> Stage["Staged rollout<br/>1 to 100 percent"]
+    Stage --> Gate{"Health gates pass?"}
+    Gate -->|"yes"| Full["Full rollout<br/>tag v5.12.0"]
+    Gate -->|"no"| Halt["Pause or halt rollout"]
+    Halt --> Fix["Fix on main first"]
+    Fix -->|"cherry-pick"| RB
+    Full -.->|"critical bug found later"| Hot["Hotfix 5.12.1<br/>from release branch"]
+    Main -.->|"cherry-pick fix"| Hot
+```
+*Figure: A release train with trunk-based development, release branches and the hotfix path.*
+
+#### Mechanics
+
+- **Why trains:** mobile releases are expensive (store review, user update lag), so predictability beats "ship when ready". Product plans around the calendar, and a feature that misses the train waits two weeks, not forever.
+- **Release captain:** a rotating engineer owns the cut, the regression pass, submission, rollout monitoring and stakeholder comms, with a runbook.
+- **Versioning:** a marketing version (`5.12.0`) plus an auto-incremented build number from CI (EAS `autoIncrement`, fastlane). Tag every shipped build. Changelogs come from PR labels or conventional commits.
+- **Branch hygiene:** only bug fixes enter the release branch, each one reviewed by the captain. The branch is deleted or frozen once the next train ships.
+- **Internal distribution:** TestFlight and Play internal testing for every release candidate, dogfooded by the company for a few days.
+
+#### Hotfix process
+
+1. **Triage severity:** crash spike, data loss, payment or security issue qualifies. Cosmetic issues wait for the train.
+2. **Fastest safe channel:** if the fix is JS-only and within OTA policy, ship an OTA update to the affected runtime (see the next questions). Otherwise make a hotfix binary from the release branch.
+3. **Fix on `main` first, then cherry-pick.** If `main` has diverged too far, fix on the release branch and forward-port immediately, with a ticket to verify.
+4. **Expedited review:** Apple allows requesting an expedited review for critical fixes. Use it sparingly.
+5. **Post-incident:** blameless review, and add the missing test or gate.
+
+> [!INTERVIEW]
+> What a senior answer includes: trunk-based development plus flags, a fixed cadence, clear ownership, and a hotfix path that prevents regressions. Red flags: long-lived feature branches merged at release time, "we release when QA is done", fixing only on the release branch and forgetting `main`. Likely follow-up: "A feature is 90% done at branch cut and the PM wants it in?" (it ships dark behind a flag, or waits for the next train. The train doesn't wait).
+
+### How do you de-risk releases with feature flags, kill switches, staged rollouts and release health gates?
+
+**Short answer:** Flags separate deploying code from releasing features. Kill switches let us turn off a broken feature remotely without a new binary. Staged rollouts (App Store phased release, Play staged rollout, percentage-based OTA) limit how many users see a bad build. Health gates, meaning crash-free SLOs, ANR rates and key business metrics per release, decide whether a rollout advances, pauses or halts. You can't roll back a binary, only halt it and roll forward, so these layers are the safety net.
+
+#### Flag types
+
+| Type | Purpose | Lifetime |
+|---|---|---|
+| Release toggle | Ship dark, turn on gradually | Days to weeks, then delete |
+| Experiment toggle | A/B test variants | Duration of the experiment |
+| Ops toggle / kill switch | Disable a feature or dependency under incident | Long-lived, tested regularly |
+| Permission toggle | Enable for staff, beta users, regions or brands | Long-lived |
+
+**Design rules:** compiled-in safe defaults, a cached snapshot so evaluation is synchronous at startup, a background refresh, changes applied at safe points (next screen or next launch), consistent values within a session, and a **fail-safe default** if the flag service is down. Every flag has an owner and an expiry date, and stale flags are flagged by lint or a scheduled report, because flag debt is real debt.
+
+**Minimum-version gate:** a remote config value (or API error) that triggers a soft "update available" prompt or a hard block for versions with critical security or data bugs. Build it before you need it: you can't add it to versions already in the field.
+
+#### Staged rollouts per platform
+
+| | App Store phased release | Google Play staged rollout | OTA (for example EAS Update) |
+|---|---|---|---|
+| Schedule | Fixed 7 days: 1%, 2%, 5%, 10%, 20%, 50%, 100% of automatic updaters | Any percentage you choose, raise manually | Percentage rollouts per update |
+| Pause/halt | Pause (limited total pause time) or release to all | Halt. Users who already have it keep it | Roll back to a previous update or republish |
+| Caveat | Users can still update manually from the store | Can target countries | Only JS/assets, same runtime version |
+
+#### Health gates
+
+| Signal | Example gate to advance |
+|---|---|
+| Crash-free users (Sentry/Crashlytics release health) | At least 99.8% and not worse than the previous release |
+| Crash-free sessions | At least 99.95% |
+| Android vitals | User-perceived crash and ANR rates well under Play's bad-behaviour thresholds (about 1.09% and 0.47% overall at the time of writing, so verify current values) |
+| Startup time | p90 cold start within 10% of baseline |
+| Business guardrails | Login success, checkout conversion, API error rate within noise |
+| New feature errors | Handled error rate for flagged features below the threshold |
+
+Gates are automated where possible (a bot posts rollout health to the release channel and recommends advance or halt). A human decides, and the criteria are written down *before* the release.
+
+#### Crash-free SLOs
+
+Set an SLO such as "99.8% crash-free users per release by day 3", with an error budget. Burning the budget freezes feature rollouts and redirects effort to stability. Break the numbers down by OS version, device model and app version. A healthy global number can hide a 5% crash rate on one popular Android model.
+
+> [!INTERVIEW]
+> What a senior answer includes: flag taxonomy and flag hygiene, fail-safe defaults, the minimum-version gate, platform differences in staged rollouts, and quantitative, pre-agreed gates. Red flags: "we'll roll back the release" (you can't for binaries), flags that default to *on* when the service fails, no owner or expiry for flags. Likely follow-up: "The 10% rollout shows a crash on Android 12 Samsung devices only. What now?" (halt, check if a kill switch covers it, reproduce on device farm, decide between OTA fix, hotfix binary or targeted flag).
+
+### What is your OTA update policy: what may ship over the air, and how do you do it safely?
+
+**Short answer:** OTA can only change JavaScript and assets for binaries with a compatible runtime version, never native code. My policy ships bug fixes, copy changes and small low-risk tweaks OTA. It never uses OTA for native changes, new permissions, or anything that changes the app's purpose or skips review for a significant new feature, which both stores' policies restrict. Every OTA goes through the same PR review and QA as a store build, is signed, rolls out in stages with crash monitoring, and has a rollback plan. See the [OTA Updates guide](../guides/ota-updates.html).
+
+```mermaid
+flowchart TD
+    Change["Change ready to ship"] --> Native{"Touches native code, native deps,<br/>permissions or entitlements?"}
+    Native -->|"yes"| Store["Store release<br/>new runtime version"]
+    Native -->|"no"| Purpose{"Major new feature or<br/>change of app purpose?"}
+    Purpose -->|"yes"| Store
+    Purpose -->|"no"| Compat{"Compatible with every binary<br/>on this runtime version?"}
+    Compat -->|"no"| Store
+    Compat -->|"yes"| Sev{"Bug fix or pre-approved<br/>low-risk change?"}
+    Sev -->|"no"| Train["Wait for next store train"]
+    Sev -->|"yes"| OTA["OTA staged rollout<br/>5 then 25 then 100 percent"]
+    OTA --> Watch{"Crash or error rate regressed?"}
+    Watch -->|"yes"| Rollback["Roll back to previous update"]
+    Watch -->|"no"| Promote["Promote to 100 percent"]
+```
+*Figure: OTA decision flow. When in doubt, it goes in a store release.*
+
+#### What may ship OTA
+
+| Allowed OTA | Store release required |
+|---|---|
+| JS bug fixes, crash fixes in JS | Any native code, new native dependency or native version bump |
+| Copy, translations, images, config defaults | New permissions, entitlements, `Info.plist`/manifest changes |
+| Small UX tweaks, flag-gated feature polish | Significant new features or changes to the app's purpose |
+| Hotfixes for a live incident (JS-only) | Anything that needs a newer runtime version |
+
+**Store policy context:** Apple permits downloaded interpreted code only when it doesn't change the app's primary purpose or bypass review for new functionality (App Review Guideline 2.5.2 and the Developer Program License Agreement). Google Play's Device and Network Abuse policy restricts self-updating executable code, with allowances for code running in a VM or interpreter. Read the current wording, and never use OTA to smuggle features past review.
+
+#### Safety mechanics
+
+- **Runtime versions:** with EAS Update use the `fingerprint` runtime version policy, so any native change automatically produces a new runtime and old binaries never receive incompatible JS. Manual version strings are the #1 source of OTA-induced crashes.
+- **Channels:** production, staging and preview channels map to build profiles. Test the exact update on the preview channel against the production binary before promoting.
+- **Staged rollout and rollback:** percentage rollouts, watch crash-free sessions *for that update ID*, and roll back or republish the previous update if it regresses.
+- **Code signing:** sign updates (EAS Update supports end-to-end code signing, and self-hosted solutions should too) so a compromised CDN can't push code.
+- **Apply strategy:** download in the background and apply on the next cold start by default. For critical fixes, prompt the user to restart (`Updates.reloadAsync()`) at a safe moment, never mid-checkout.
+- **Tooling after App Center:** App Center (and hosted CodePush) retired on March 31, 2025. Options are EAS Update, a self-hosted CodePush server (open-sourced by Microsoft), or community tools such as hot-updater, Revopush and Stallion.
+
+> [!INTERVIEW]
+> What a senior answer includes: the JS-only boundary, runtime version compatibility, store policy awareness, staged OTA rollouts with monitoring, and code signing. Red flags: "we ship features OTA to skip review", manual runtime versions with no process, force-reloading the app mid-session. Likely follow-up: "An OTA crashed users on an older binary. How?" (a JS change depended on a native module absent in that runtime, which fingerprint-based runtime versions prevent).
+
+### How do you handle App Store and Play rejections, and prevent them?
+
+**Short answer:** Read the exact guideline cited, reproduce what the reviewer saw, and decide whether it's a misunderstanding (reply in App Store Connect with explanation, demo credentials or a screen recording), a metadata fix (no new binary needed) or a real issue (fix and resubmit). Appeal to the App Review Board only when you're confident you comply. Prevention is a pre-submission checklist built from past rejections, good review notes, and policy owners who track guideline changes.
+
+#### Common rejection causes
+
+| Guideline area | Typical trigger | Fix |
+|---|---|---|
+| 2.1 App Completeness | Crash on reviewer's device, broken login, missing demo account | Test on the current iOS release, provide working demo credentials in review notes |
+| 2.3 Metadata | Screenshots not matching the app, placeholder text | Update metadata (no new build needed) |
+| 3.1.1 In-App Purchase | Digital goods sold via external payment where not permitted | Use IAP or a region-permitted link-out per current rules |
+| 4.8 Sign in with Apple | Third-party social login without a compliant alternative | Add Sign in with Apple or a login option meeting Apple's privacy criteria |
+| 5.1.1 Data collection | Vague permission purpose strings, no account deletion, privacy policy missing | Specific `NS*UsageDescription` strings, in-app account deletion |
+| 4.2 / 4.3 | Thin web wrapper, template or duplicate apps | Add native value, consolidate apps |
+| Privacy manifest | Required-reason APIs undeclared in the app or SDKs | Update `PrivacyInfo.xcprivacy` and SDK versions |
+
+**Google Play** rejections usually come from policy declarations: background location, photo and video permissions (use the system photo picker unless media access is core), Data safety form mismatches, missing account deletion link, target API level. Appeals go through Play Console's policy status page.
+
+#### Process
+
+1. The release captain triages within hours and posts the exact message to the team channel.
+2. Classify: misunderstanding, metadata, or code.
+3. Reply in the Resolution Center politely and specifically. Attach a video showing the flow if hardware or location is involved.
+4. Update stakeholders on date impact, and slip the marketing date rather than ship a risky workaround.
+5. Add the cause to the pre-submission checklist.
+
+**Prevention checklist items:** demo account valid and not 2FA-locked, review notes explaining non-obvious features, purpose strings reviewed, privacy manifest and Data safety updated for new SDKs, account deletion reachable, IAP rules checked for any new monetisation, and a smoke test on the latest OS release.
+
+> [!INTERVIEW]
+> What a senior answer includes: calm triage, knowing that metadata rejections don't need a new binary, specific reviewer communication, and systemic prevention. Red flags: resubmitting unchanged hoping for a different reviewer, or arguing tone in replies. Likely follow-up: "Your launch is tomorrow and you got rejected for 4.8?" (fastest compliant path: add Sign in with Apple, request expedited review, align marketing on a new date).
+
+### What testing strategy would you set up for a React Native team?
+
+**Short answer:** A layered strategy weighted toward fast, reliable tests. Static analysis (strict TypeScript, ESLint) catches whole bug classes. Unit tests cover pure logic. Component and integration tests with React Native Testing Library and MSW cover most behaviour. A small set of E2E tests (Maestro or Detox) guards critical journeys on real builds. Device-farm runs, performance regression checks and short manual exploratory passes round it out. Every layer has an owner, a CI stage and a time budget, and flaky tests are quarantined quickly. Details in the [Testing Strategy guide](../guides/testing.html).
+
+| Layer | What it covers | Tools | When it runs |
+|---|---|---|---|
+| Static | Types, lint, dead code, boundaries | TypeScript strict, ESLint, knip | Every commit (pre-commit + PR) |
+| Unit | Reducers, formatters, domain rules, hooks | Jest | PR, seconds |
+| Component/integration | Screens with real navigation and mocked network | RNTL (user-event API), MSW | PR, a few minutes |
+| Contract | API shape compatibility | OpenAPI schema checks, Pact, zod fixtures | PR on both client and backend |
+| E2E | 10–30 critical journeys: login, purchase, onboarding | Maestro, Detox | On merge to main (smoke), nightly (full) |
+| Device matrix | OS versions, low-end devices, tablets | Firebase Test Lab, BrowserStack, AWS Device Farm | Nightly, release candidates |
+| Performance | Render regressions, startup, FPS | Reassure, Flashlight, Sentry performance | PR (Reassure), release candidate |
+| Manual | Exploratory, a11y with VoiceOver/TalkBack, new features | Checklists, bug bash | Each release candidate |
+
+#### Principles
+
+- **Test behaviour, not implementation:** query by role and text, interact via user-event, assert what the user sees. Snapshot tests of whole screens are low value.
+- **Mock at the network edge (MSW), not every module.** Tests then survive refactors of the data layer.
+- **Keep E2E small and stable:** stable test IDs, seeded backends or dedicated test accounts, and no sleeps (Maestro waits automatically, Detox synchronises with the app).
+- **Flake policy:** a flaky test is quarantined within a day with a ticket and an owner, and flakiness rates are reviewed weekly.
+- **Coverage is a signal, not a target.** Track it for domain code, but don't gate on a global percentage.
+- **Shift quality left:** PR template with iOS and Android screenshots or videos, and a definition of done that includes tests, a11y and analytics events.
+
+> [!INTERVIEW]
+> What a senior answer includes: a pyramid or trophy tailored to mobile, a clear role for each layer, CI placement with time budgets, flake management, and mobile-specific layers (device matrix, performance). Red flags: "100% coverage", E2E for everything, or no tests for the data layer. Likely follow-up: "Detox or Maestro?" (Maestro: fast to write, YAML, black-box, great for smoke and screenshots. Detox: gray-box synchronisation and JS-level control, more setup. Many teams use Maestro for breadth).
+
+### How do you upgrade React Native across a large codebase?
+
+**Short answer:** Treat upgrades as a continuous, owned process rather than a heroic project. Stay at most one or two minors behind, upgrade dependencies ahead of time, and use the Upgrade Helper (bare) or Expo SDK upgrade tooling. Work on a branch with CI and a full E2E pass, measure performance against a baseline, dogfood internally, then ship through a staged rollout. The big one right now is the New Architecture: RN 0.82+ has no legacy mode, so every native dependency must be New Architecture compatible before you cross that line.
+
+#### Process
+
+1. **Prepare continuously:** track RN and Expo release notes, keep a dependency inventory with New Architecture status, and upgrade libraries that support both old and new RN versions ahead of the RN bump.
+2. **Plan:** read the changelog and blog post for each version you cross. For Expo, one SDK at a time (`npx expo install expo@^<next>` then `npx expo install --fix` and `npx expo-doctor`). For bare, apply the Upgrade Helper diff for native template files.
+3. **Spike first:** a time-boxed spike to find blockers (abandoned libraries, custom native modules, build configuration), then estimate.
+4. **Execute:** one branch with frequent rebases, codemods for API changes, and native build fixes. Keep feature work flowing on `main` so the upgrade branch lives only days.
+5. **Verify:** full E2E, device matrix, manual smoke on the oldest supported OS versions, performance comparison (startup, memory, FPS) against the previous release.
+6. **Roll out:** internal builds, then a staged store rollout with tighter health gates. Remember the runtime version changes, so previously published OTA updates won't apply to the new binary and vice versa.
+
+#### Typical breakages
+
+| Area | Example |
+|---|---|
+| Native build | Gradle/AGP/Kotlin versions, CocoaPods changes, minimum iOS/Android versions, 16 KB page size alignment |
+| Libraries | No New Architecture support, deprecated APIs removed |
+| JS | Removed or deprecated core APIs (for example core `SafeAreaView` in favour of `react-native-safe-area-context`), React version changes |
+| Tooling | Metro config, Babel presets, Jest presets, debugger changes |
+| Behaviour | Layout differences, edge-to-edge enforcement on newer Android targets |
+
+**Ownership:** a rotating "platform" duty or a dedicated platform team, with upgrades on the roadmap every quarter. Skipping upgrades compounds: store SDK requirements (Xcode versions each spring, Play target API each August) eventually force a rushed multi-version jump.
+
+> [!INTERVIEW]
+> What a senior answer includes: continuous cadence, dependency preparation, the New Architecture cutoff, verification with performance baselines, staged rollout, and OTA runtime implications. Red flags: "we upgrade every two years", or upgrading RN and ten major libraries in one untested jump. Likely follow-up: "A key library doesn't support the New Architecture yet?" (check interop layer behaviour, patch or fork, replace behind an adapter, or contribute upstream, and block the upgrade until it's resolved).
+
+## Cross-cutting concerns
+
+### How would you set up an accessibility programme for a React Native app?
+
+**Short answer:** Make accessibility a property of the system, not a clean-up project. Set a target (WCAG 2.2 AA mapped to mobile), bake roles, labels, focus handling, touch targets, contrast and font scaling into the design-system components, add automated checks in CI, and include screen-reader testing in the definition of done and release regression. Train the team, name a11y champions, and audit periodically, including with disabled users. Regulation such as the European Accessibility Act (applying since June 2025) makes this a legal requirement for many products, not just good practice.
+
+#### Programme building blocks
+
+| Area | What we do |
+|---|---|
+| Standards | WCAG 2.2 AA as the target, platform guidance (Apple HIG, Material) for conventions |
+| Components | `Button`, `TextField`, list rows ship with `role`, labels, states, hit slop, and focus styles by default |
+| Text | Support Dynamic Type/font scaling (cap with `maxFontSizeMultiplier` only where layout truly breaks), test at the largest sizes |
+| Motion | Respect reduce motion (`AccessibilityInfo.isReduceMotionEnabled`, Reanimated's `useReducedMotion`) |
+| Focus | Move screen-reader focus to the new screen title or error message after navigation and validation failures |
+| Automation | `eslint-plugin-react-native-a11y`, RNTL queries by role (a test that can't find the button by role is a bug), accessibility scanners in E2E |
+| Manual | VoiceOver and TalkBack passes on key flows every release, Xcode Accessibility Inspector, Android Accessibility Scanner |
+| Process | a11y acceptance criteria in tickets, design reviews check contrast and target sizes, bugs triaged with severity like any other |
+
+```tsx title="shared/design-system/IconButton.tsx"
+import { Pressable, type PressableProps } from 'react-native';
+import { Icon, type IconName } from './Icon';
+
+type Props = Omit<PressableProps, 'children'> & {
+  icon: IconName;
+  label: string; // required: icon-only buttons are invisible to screen readers without it
+  selected?: boolean;
+};
+
+export function IconButton({ icon, label, selected, disabled, ...rest }: Props) {
+  return (
+    <Pressable
+      role="button"
+      accessibilityLabel={label}
+      accessibilityState={{ selected, disabled: !!disabled }}
+      hitSlop={8}
+      disabled={disabled}
+      style={{ minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center' }}
+      {...rest}
+    >
+      <Icon name={icon} />
+    </Pressable>
+  );
+}
+```
+
+Making `label` a required prop is the kind of leverage a senior engineer adds: the type system enforces accessibility for every future use.
+
+> [!INTERVIEW]
+> What a senior answer includes: accessibility built into components, automated plus manual testing, process integration, and awareness of legal drivers. Red flags: "we add labels before launch", testing only with automated tools, disabling font scaling globally. Likely follow-up: "How do you prioritise a backlog of 200 a11y issues?" (by user impact on critical flows first: login, checkout, core task, then by frequency).
+
+### How do you handle internationalisation and RTL at scale?
+
+**Short answer:** Externalise every string with keys and ICU-style plurals (i18next or FormatJS), format numbers, dates and currencies with `Intl`, and run a translation pipeline through a TMS with CI checks for missing keys. Pseudo-localise to catch truncation and hard-coded strings. For RTL, use logical style properties (`start`/`end`), mirror directional icons, and remember that switching layout direction requires an app restart. Test real RTL locales, not just a flipped layout.
+
+#### Pipeline
+
+1. **Authoring:** developers add keys in the source locale only (`checkout.total`), with context comments for translators.
+2. **Sync:** CI pushes new keys to a TMS (Lokalise, Crowdin, Phrase), and translations come back as PRs or are pulled at build time.
+3. **Checks:** fail CI on missing keys in shipped locales, unused keys, or invalid ICU syntax. A pseudo-locale (accented, 30–40% longer strings) surfaces hard-coded text and truncation.
+4. **Delivery:** bundle translations with the app. Optionally OTA-update copy (it's JS/assets), but keep a bundled fallback.
+
+```ts title="src/shared/i18n/locales/en.ts"
+export const en = {
+  cart: {
+    items_one: '{{count}} item',
+    items_other: '{{count}} items', // i18next picks the form via Intl.PluralRules
+  },
+  checkout: {
+    total: 'Total: {{amount}}', // amount pre-formatted with Intl.NumberFormat for the user's currency
+  },
+};
+```
+
+#### Pitfalls
+
+| Pitfall | Fix |
+|---|---|
+| String concatenation (`'Hello ' + name`) | Interpolated messages, since word order differs by language |
+| Hard-coded plural logic (`count === 1`) | Plural categories (Arabic has six forms, Japanese has one) |
+| `marginLeft`/`paddingRight` | `marginStart`/`paddingEnd`, and `flexDirection: 'row'` flips automatically in RTL |
+| Directional icons not mirrored | Mirror back arrows and progress chevrons, but not media controls or logos |
+| Assuming `I18nManager.forceRTL` applies instantly | It requires a reload/restart. Prompt the user or apply at next launch |
+| Fonts lacking glyphs | Test Arabic, Hebrew, Thai, CJK scripts, and allow taller line heights |
+| Dates formatted manually | `Intl.DateTimeFormat` with the user's locale and time zone |
+
+**Platform notes:** Hermes ships the core `Intl` APIs, but verify coverage for less common ones and polyfill if needed. Android 13+ and recent iOS support per-app language settings. Declare supported locales (Android `localeConfig`, iOS localisations) so the system settings list your languages. `expo-localization` or `react-native-localize` read device locale preferences.
+
+> [!INTERVIEW]
+> What a senior answer includes: an automated pipeline, ICU plurals, `Intl` formatting, pseudo-localisation, and RTL specifics including the restart requirement. Red flags: translating by string concatenation, "we'll add RTL later" with `left`/`right` styles everywhere. Likely follow-up: "How do you handle server-provided content?" (the backend localises using `Accept-Language`, and the client sends the app's chosen locale, not just the device's).
+
+### How do you design an analytics taxonomy that stays privacy-compliant (GDPR, Apple privacy manifests, Play Data safety)?
+
+**Short answer:** Define a tracking plan as code: a small set of consistently named events (`object_action`, such as `product_viewed`, `checkout_started`) with typed, documented properties and owners, exposed through a generated, type-safe `track()` API. Validate events in CI and at runtime in dev builds. On the privacy side, keep a data inventory mapping every SDK and event to data types and purposes. Gate non-essential tracking behind consent (and ATT on iOS for cross-app tracking), and keep App Store privacy labels, `PrivacyInfo.xcprivacy` and the Play Data safety form in sync with that inventory on every SDK change.
+
+#### Taxonomy rules
+
+- **Naming:** one convention (`snake_case` `object_action`, past tense), a fixed verb list (`viewed`, `tapped`, `started`, `completed`, `failed`), no screen-specific one-offs like `blue_button_clicked_v2`.
+- **Properties:** typed and bounded (enums, not free text). Global context attached automatically: app version, platform, brand, locale, experiment variants, network type.
+- **Identity:** anonymous ID before login, aliased to the user ID after login, reset on logout.
+- **Governance:** the plan lives in the repo, and changes are reviewed by analytics and engineering. Each event has an owner and a purpose, and unused events get removed.
+- **Delivery:** batch and persist events offline, flush on background and on a timer, sample high-volume diagnostic events.
+
+```ts title="src/shared/analytics/events.ts"
+import { consent } from '../privacy/consent';
+import { analyticsQueue } from './queue';
+import { getGlobalContext } from './context';
+
+type Events = {
+  product_viewed: { product_id: string; source: 'search' | 'category' | 'deeplink' | 'home' };
+  add_to_cart_tapped: { product_id: string; quantity: number };
+  checkout_completed: { order_id: string; value_minor: number; currency: string };
+};
+
+export function track<E extends keyof Events>(name: E, props: Events[E]): void {
+  if (!consent.allows('analytics')) return; // consent gate at a single choke point
+  analyticsQueue.enqueue({ name, props, ts: Date.now(), context: getGlobalContext() });
+}
+```
+
+#### Privacy compliance checklist
+
+| Requirement | What it means for the app |
+|---|---|
+| GDPR/UK GDPR (and similar laws such as CCPA/CPRA) | Lawful basis per purpose, consent for non-essential tracking in the EEA/UK, data minimisation, access/erasure requests, DPAs with vendors |
+| Apple App Tracking Transparency | Prompt before tracking across other companies' apps/sites (IDFA). No tracking if denied |
+| Apple privacy manifest | `PrivacyInfo.xcprivacy` declaring collected data and required-reason APIs (for example UserDefaults, file timestamps, disk space). Expo supports `ios.privacyManifests` in app config. Third-party SDKs must ship their own manifests |
+| App Store privacy labels | Nutrition labels in App Store Connect that must match actual collection, including SDKs |
+| Google Play Data safety | Form declaring collection, sharing, encryption and deletion. Must match app and SDK behaviour |
+| Account deletion | Both stores require in-app account deletion for apps with account creation (Google also requires a web link) |
+| Consent mode | For Google tools in the EEA, pass consent state (Consent Mode) so tags behave accordingly |
+
+**Process:** every PR adding an SDK or new data type triggers a privacy review. The data inventory is updated, then the store declarations and privacy policy. Analytics payloads never contain raw PII (emails, precise location, free-text), and user IDs are pseudonymous.
+
+> [!INTERVIEW]
+> What a senior answer includes: a tracking plan as code with type safety, governance and ownership, consent at a single choke point, and treating store privacy declarations as outputs of a maintained data inventory. Red flags: free-form event names chosen per developer, sending emails as analytics properties, filling Data safety once and never revisiting it. Likely follow-up: "Marketing wants a new attribution SDK next week?" (privacy and security review, check ATT implications, update manifests and declarations, and put it behind consent).
+
+### What does a security review process look like for a mobile team?
+
+**Short answer:** Security is built into the lifecycle. Threat modelling happens at the RFC stage for features touching auth, payments, personal data or new SDKs. OWASP MASVS is the baseline checklist. Automated checks in CI cover dependency and secret scanning, SAST and lint rules for insecure patterns. Security-focused code review applies to sensitive areas (CODEOWNERS). Periodic penetration tests run before major launches, and there's a clear incident response path. We're honest about the fact that the client is untrusted: anything in the app can be extracted and modified.
+
+#### The process
+
+| Stage | Activity |
+|---|---|
+| Design (RFC) | Threat model (assets, entry points, attackers, STRIDE-style prompts), data classification, abuse cases |
+| Implementation | Secure storage (Keychain/Keystore via `react-native-keychain`/`expo-secure-store`), no secrets in the bundle, TLS only, input validation, safe deep link handling |
+| CI | Dependency audit (npm audit, Snyk/Socket), secret scanning (gitleaks), SAST (Semgrep rules for `eval`, insecure WebView settings, logging tokens) |
+| Review | Security champion or AppSec review for auth, payments, crypto, WebViews, deep links, new native modules |
+| Pre-release | MASVS-based checklist, penetration test for major releases, verify release builds strip debug menus and logs |
+| Runtime | App Attest/Play Integrity for sensitive APIs, anomaly detection server-side, certificate pinning only with backup pins and rotation plan |
+| Incident | Kill switches, forced-upgrade gate, key rotation runbooks, disclosure policy or bug bounty |
+
+#### Mobile-specific realities
+
+- **The JS bundle is readable.** API keys in it are public, so use server-side proxies and scoped, restricted keys.
+- **Root/jailbreak detection** raises the bar slightly but is bypassable. Use it as a signal, not as a security boundary.
+- **Deep links are untrusted input:** validate parameters, and never perform sensitive actions straight from a link without confirmation.
+- **WebViews:** restrict origins, disable file access where possible, and treat `postMessage` data as untrusted.
+- **Logs and crash reports** must scrub tokens and PII before they leave the device.
+
+See the [Security guide](../guides/security.html) for implementation detail.
+
+> [!INTERVIEW]
+> What a senior answer includes: security across the lifecycle, MASVS as a shared vocabulary, automation plus human review, and a realistic threat model for client code. Red flags: "we obfuscate so it's secure", secrets in `.env` files bundled into the app, pinning without a rotation plan. Likely follow-up: "How do you protect an API from being called by a scripted client?" (attestation tokens, rate limiting, behavioural detection, since you can't fully prevent it).
+
+### How do you define and enforce performance budgets?
+
+**Short answer:** Pick a few user-centric metrics (cold start time to interactive, screen time to content, frame quality, memory, app size, crash and ANR rates) and set budgets per device tier. Measure them in CI where possible (bundle size, Reassure render benchmarks, Flashlight scores on a reference Android device) and in production (Sentry/Firebase performance, Android vitals, Xcode Organizer/MetricKit). Treat a budget breach like a failing test: it blocks the merge or triggers a regression ticket with an owner.
+
+| Metric | Example budget | Where measured |
+|---|---|---|
+| Cold start to interactive | p50 under 2 s, p90 under 3.5 s on a mid-tier Android device | Production tracing, startup spans |
+| Screen time to content (key screens) | Under 1 s from cache, under 2.5 s from network | Custom spans |
+| Slow/frozen frames | Frozen frames under 0.1% of frames on feed screens | Sentry/Firebase, Flashlight |
+| JS bundle size | No more than +50 KB per PR without approval | CI size diff comment |
+| Download size | Under 60 MB (iOS) / under 40 MB (Android AAB split) | Store tooling, size analysis in CI |
+| Memory | No growth over a 10-minute scripted scroll session | E2E + profiler |
+| ANR rate | Well below Play's bad-behaviour threshold | Android vitals |
+
+#### Making budgets stick
+
+- **Device tiers:** define "low-end reference device" explicitly (for example a 3–4 GB RAM Android phone a few years old) and test there. Flagship phones hide everything.
+- **Automate the boring parts:** a PR bot posts bundle and binary size deltas and Reassure results. Nightly Flashlight or E2E perf runs chart trends.
+- **Ownership:** each budget has an owner, and regressions get tickets tied to the PR that caused them.
+- **Trade-offs are explicit:** a new SDK that adds 300 ms to startup needs a product decision, not a silent merge.
+- **Common wins:** lazy-load screens and heavy modules, defer SDK initialisation until after first render, FlashList for long lists, image variants, avoid synchronous storage of large blobs at startup, and the React Compiler for memoisation.
+
+See the [Performance guide](../guides/performance.html) and [Monitoring guide](../guides/monitoring.html).
+
+> [!INTERVIEW]
+> What a senior answer includes: user-centric metrics, budgets per device tier, lab plus field measurement, automation in CI, and ownership. Red flags: "we optimise when users complain", measuring only on simulators or flagships, or averages instead of percentiles. Likely follow-up: "Startup regressed 20% in the last release, how do you find it?" (compare startup traces between versions, bisect by build, check new SDK inits and module evaluation at import time).
+
+## Leadership & collaboration
+
+### What code review standards do you set for a React Native team?
+
+**Short answer:** Reviews exist to catch defects, spread knowledge and keep the codebase coherent, not to enforce personal taste. Automation handles formatting, lint, types and tests, so humans focus on correctness, design, tests, accessibility, performance, security and platform parity. PRs are small, described well (with iOS and Android screenshots or videos for UI), reviewed within an agreed SLA, and comments are labelled by severity so authors know what blocks the merge.
+
+#### The standard
+
+| Area | Reviewer asks |
+|---|---|
+| Correctness | Edge cases, error and loading states, offline, race conditions, cleanup of subscriptions |
+| Design | Right layer and feature? Public API sensible? Duplicates something that exists? |
+| Tests | Behaviour covered at the right level? Would this test catch the bug it claims to? |
+| Mobile specifics | Works on both platforms, small screens, large font sizes, dark mode, RTL, low-end devices |
+| Performance | Re-render hotspots, list rendering, work on the JS thread during animations, startup impact |
+| Security and privacy | Tokens, PII in logs, deep link input, new SDK data collection |
+| Operability | Analytics events, error reporting, feature flag, rollback plan |
+
+#### Mechanics
+
+- **PR size:** aim for under ~400 changed lines. Stack PRs for larger work.
+- **Template:** what and why, screenshots and videos per platform, test plan, flags involved, risk and rollback.
+- **Comment labels** (Conventional Comments style): `blocking:`, `suggestion:`, `nit:`, `question:`. Nits never block.
+- **SLA:** first review within one working day. Reviewer load is balanced, and CODEOWNERS routes sensitive areas.
+- **Automation:** lint, typecheck, tests, bundle size and Danger-style checks (missing changelog label, missing screenshots) run before a human looks.
+- **Tone:** critique the code, ask questions, praise good solutions, and move long debates to a call or an RFC.
+
+> [!INTERVIEW]
+> What a senior answer includes: purpose-driven reviews, automation of the mechanical parts, mobile-specific checks, severity labels, and turnaround expectations. Red flags: gatekeeping on style, 2,000-line PRs as normal, or reviews that take a week. Likely follow-up: "How do you review a junior's PR that needs a total rewrite?" (talk synchronously first, explain the design issue, pair on the direction, and don't leave 60 comments).
+
+### How do you use RFCs and ADRs to make and record technical decisions?
+
+**Short answer:** An RFC is for proposing and debating a significant or hard-to-reverse decision before building: state management, navigation library, offline sync, a New Architecture migration, monorepo adoption. An ADR is the short, permanent record of what was decided and why, stored in the repo next to the code. RFCs get a named decider, a comment deadline and explicit alternatives. ADRs are immutable: when a decision changes, you write a new ADR that supersedes the old one.
+
+#### RFC template (what I expect in one)
+
+1. Context and problem, with data (crash rates, build times, incidents).
+2. Goals and non-goals.
+3. Options considered, including "do nothing", with honest pros and cons.
+4. Proposal: design, API sketches, diagrams.
+5. Rollout and migration plan, flags, and how to roll back.
+6. Risks, open questions, cost (people and weeks).
+7. Decider and comment deadline.
+
+#### ADR example
+
+```plaintext
+docs/adr/0012-use-tanstack-query-for-server-state.md
+
+Title: Use TanStack Query for server state
+Status: Accepted (2026-03-04). Supersedes ADR-0005.
+Context: Server data lives in Redux slices with hand-written loading/error flags.
+  Stale data and duplicated fetch logic cause bugs. 14 screens refetch on every focus.
+Decision: New server data uses TanStack Query. Existing slices migrate opportunistically.
+  Client-only state stays in Redux Toolkit.
+Consequences: Two patterns coexist for about 2 quarters. Lint rule blocks new
+  createAsyncThunk usage. Query keys follow the conventions in docs/query-keys.md.
+```
+
+**Why it matters for seniors:** decisions outlive the people who made them. Six months later, "why do we use X?" has an answer, new joiners understand context, and you avoid re-litigating settled questions unless the context has actually changed.
+
+> [!INTERVIEW]
+> What a senior answer includes: when an RFC is warranted (and when it's overkill), a decider and deadline, real alternatives, and ADRs as lightweight, immutable history. Red flags: design-by-committee with no decider, RFCs written after the code ships, or a wiki nobody can find. Likely follow-up: "An RFC has been open for three weeks with no consensus?" (the decider decides, records dissent in the ADR, and sets a review point).
+
+### How do you onboard engineers onto a large React Native codebase, and how do you mentor them?
+
+**Short answer:** Make the first week productive and the first month confident. That means a one-command setup, downloadable dev builds, an architecture tour, ADRs to read, a buddy, a starter task that ships to production in week one, and a 30/60/90-day plan. Mentoring then shifts from answering questions to growing judgement: pairing, stretch ownership, deliberate feedback, and gradually handing over decisions. I measure onboarding with time to first PR and time to first independent feature.
+
+#### Onboarding kit
+
+- **Setup:** a `bootstrap` script plus doctor checks (Node version, Xcode, Android SDK, JDK, CocoaPods), prebuilt development builds from CI so JS-only work needs no native toolchain on day one, and seeded test accounts.
+- **Knowledge:** architecture overview with diagrams, feature ownership map, ADR index, glossary of domain terms, a "how we release" doc, and recorded walkthroughs of the sync engine or other tricky subsystems.
+- **Work:** curated starter issues across layers (UI fix, data-layer change, test), a first on-call shadow shift, and one release-captain shadow.
+- **People:** a buddy for daily questions, and introductions to the design, backend and native counterparts.
+
+#### Mentoring approach
+
+| Stage | What I do |
+|---|---|
+| New to RN (for example from web) | Pair on platform concepts: threading, native builds, lifecycle, store releases. Review with explanations |
+| Productive | Give ownership of a feature end to end, including analytics, rollout and monitoring |
+| Growing to senior | Hand over design decisions (they write the RFC, I review), include them in incident leadership, and let them mentor someone else |
+
+I use regular 1:1s with explicit growth goals, specific feedback tied to situations (what happened, impact, what to try), and I resist taking the keyboard.
+
+> [!INTERVIEW]
+> What a senior answer includes: concrete artefacts (setup automation, docs, starter tasks), metrics for onboarding, and mentoring that builds autonomy rather than dependence. Red flags: "they read the code", or mentoring that means solving their problems for them. Likely follow-up: "How did you help someone who was struggling?" (use the STAR mentoring template below).
+
+### How do you estimate large pieces of work and prioritise tech debt against feature work?
+
+**Short answer:** Estimate in ranges with stated confidence: break work down, spike the unknowns, include the mobile-specific overhead (both platforms, store review, QA, accessibility, analytics, localisation, rollout), and re-estimate as uncertainty shrinks. For tech debt, make it visible and quantified in business terms (incidents, crash rate, build minutes, lead time, blocked features), then fund it through a standing capacity allocation plus targeted investments tied to roadmap goals. "Refactor because it's ugly" doesn't compete with features. "This cuts checkout crashes by half and unblocks the redesign" does.
+
+#### Estimation practice
+
+- **Decompose** to tasks of one to three days. Anything bigger hides unknowns.
+- **Spike unknowns** with a time box (for example "2 days to prove background upload on Android 14+").
+- **Give ranges:** "4–6 weeks, 70% confident, assuming the payments API is ready by week 2". Communicate the assumptions as loudly as the number.
+- **Checklist of forgotten work:** iOS and Android parity, tablets, dark mode, a11y, i18n, analytics events, feature flag and kill switch, error states, E2E tests, store assets and review time, staged rollout and monitoring.
+- **Track actuals** against estimates and calibrate. Throughput-based forecasting works well for teams with steady-sized tickets.
+
+#### Tech debt prioritisation
+
+| Step | Practice |
+|---|---|
+| Visibility | A debt register: item, impact, affected area, cost of delay, owner |
+| Quantify | Crash rate, incident count, CI minutes, flaky test rate, PR cycle time, onboarding time |
+| Frame as interest | "Every feature touching the cart costs about 30% more because of X" |
+| Fund | 15–20% standing capacity for platform health, plus larger items pitched with the roadmap |
+| Tie to goals | Bundle debt paydown with features in the same area (strangler pattern) |
+| Guard | Boy-scout rule, lint rules so new code doesn't add the same debt |
+
+> [!INTERVIEW]
+> What a senior answer includes: ranges and assumptions, mobile-specific hidden work, and tech debt framed in measurable business impact with a sustainable funding model. Red flags: single-point estimates given on the spot, "we need a quarter to rewrite everything", debt with no data. Likely follow-up: "Your estimate is 8 weeks, product needs 4?" (negotiate scope, not quality: an MVP cut, feature-flagged phases, or more people only if the work parallelises).
+
+### How do you handle disagreements with product or design, and how do you work with native iOS/Android and backend teams?
+
+**Short answer:** Disagree early, with data and options, not with a flat "no". Explain the cost, risk or user impact, offer alternatives (a cheaper version, a phased rollout, an experiment), and once a decision is made, commit to it. With native and backend teams, success comes from clear contracts and shared ownership: API schemas agreed before building, mobile needs (pagination, payload size, backward compatibility) represented in API design, native module ownership defined, and regular syncs instead of surprises.
+
+#### With product and design
+
+- **Understand the goal behind the ask.** Often the goal can be met more cheaply.
+- **Make trade-offs concrete:** "the custom animation costs about 1.5 weeks and risks jank on low-end Android. The platform transition ships this sprint".
+- **Use platform conventions as a shared reference:** iOS and Android users expect different navigation patterns, date pickers and share sheets.
+- **Prototype when words fail:** a one-day prototype on a real device resolves more debates than a meeting.
+- **Disagree and commit,** and document the decision and the risk. Escalate only for user harm, legal or security issues.
+
+#### With native iOS/Android teams
+
+- Agree who owns shared native modules, bridging contracts and native crash triage.
+- In brownfield apps, define the integration boundary (entry points, navigation hand-off, shared auth state) and a release coordination process.
+- Respect their expertise: involve them in RFCs that touch native code, and learn enough Swift/Kotlin to read and review.
+
+#### With backend teams
+
+- **Contract first:** OpenAPI or GraphQL schema reviewed by mobile before implementation, and mock servers so both sides work in parallel.
+- **Mobile constraints in API design:** cursor pagination, compact payloads, idempotency keys, field-level nullability, and error codes the client can act on.
+- **Backward compatibility:** old app versions live for years, so changes are additive, deprecations are announced with version telemetry, and a minimum-version gate exists.
+- **Shared observability:** request IDs that link client errors to backend traces, and joint incident reviews.
+
+> [!INTERVIEW]
+> What a senior answer includes: disagreement framed as options and trade-offs, commitment after decisions, explicit contracts with other teams, and backward compatibility as a mobile-specific concern. Red flags: "engineering should decide", blaming other teams, or silently building something you disagree with. Likely follow-up: "The backend team wants to ship a breaking API change next week?" (versioned endpoint or additive fields, telemetry on which app versions call the old shape, minimum-version gate as last resort).
+
+## Behavioral (STAR)
+
+### What is the hardest production bug you've dealt with?
+
+**Short answer:** *(Template: adapt with your own real story and numbers.)* After a release, a few percent of users were being randomly logged out. I traced it to a race between parallel token refreshes and the backend's refresh-token rotation, fixed it with a single-flight refresh and a cross-context lock, and logout-related support tickets dropped by about 90%.
+
+> [!NOTE] How to use these templates
+> These are model answers showing structure, depth and tone. Never recite them. Replace every detail with your own experience, keep real numbers (approximate is fine, invented is not), and aim for 2–3 minutes spoken. Spend about 10% on Situation, 10% on Task, 60% on Action and 20% on Result and lessons.
+
+- **Situation:** a fintech app with ~400k MAU. Two weeks after a release, support tickets about "being logged out randomly" tripled. Crash-free rates were fine, so nothing showed up in Crashlytics.
+- **Task:** as the senior engineer on the platform team, I owned finding the root cause and a fix without forcing everyone to log in again.
+- **Action:**
+  - Added structured breadcrumbs around auth events (refresh start and end, 401s, which JS context triggered them) and shipped them via an OTA update to the affected runtime.
+  - Correlated client logs with backend auth logs by request ID. The backend had enabled refresh-token *reuse detection* in the same window. When two refreshes raced with the same token, the second was treated as theft and the whole token family was revoked.
+  - Found two sources of parallel refreshes: concurrent 401s in the API client, and a background fetch task running its own refresh in a separate JS context.
+  - Implemented a single-flight refresh promise in the client, plus a native-backed mutex shared with the background task. Added an MSW-based integration test that fires ten parallel requests with an expired token and asserts exactly one refresh.
+  - Agreed with the backend team on a short reuse grace window as defence in depth.
+- **Result:** logout tickets fell about 90% within a week of rollout. The test now guards the behaviour, and auth events became a standard dashboard.
+- **Lesson:** client and server changes that are each correct can combine into a bug. Since then I insist on cross-team release notes for auth changes.
+
+> [!INTERVIEW]
+> What evaluators look for: a systematic method (instrument, correlate, hypothesise, verify), ownership, collaboration with other teams, a durable fix (a test, a dashboard), and a lesson that changed how you work. Red flags: a hero story with no process, blaming others, or no measurable outcome. Likely follow-ups: "How did you prioritise this against the roadmap?", "What would you do differently?"
+
+### Describe a performance improvement you led. What were the numbers?
+
+**Short answer:** *(Template: adapt with your own real story and numbers.)* I led a cold-start effort on low-end Android that took p50 time-to-interactive from about 4.8 s to 2.1 s through deferred SDK initialisation, lazy-loaded screens, removal of a synchronous startup storage read and a lighter home screen. Day-1 retention on those devices rose by roughly 3 points.
+
+- **Situation:** an e-commerce app where 45% of users were on mid- and low-end Android devices. Android vitals flagged slow cold starts, and product analytics showed a sharp drop-off during launch on those devices.
+- **Task:** I proposed and led a six-week performance initiative with two engineers, with a target of p50 cold start under 2.5 s on our reference low-end device.
+- **Action:**
+  - **Measured first:** added startup spans (native init, JS bundle load, first render, home content) with Sentry performance, plus reproducible lab runs with Flashlight on a reference device.
+  - **Found the costs:** eleven SDKs initialised eagerly at startup, a 1.2 MB JSON blob read synchronously from storage before first render, every screen imported eagerly through barrel files, and a home screen rendering 40 carousel items at once.
+  - **Fixes:** deferred non-critical SDKs until after first interaction, moved the blob to lazy SQLite queries, enabled `inlineRequires` and lazy-loaded screens, switched carousels to FlashList with image variants, and cached the first home response for instant render.
+  - **Guarded it:** added a CI budget (bundle size diff and a nightly Flashlight startup run) and a release-health gate on p90 cold start.
+- **Result:** p50 time-to-interactive fell from ~4.8 s to ~2.1 s and p90 from ~7.5 s to ~3.6 s on the reference device. Android vitals no longer flagged slow starts, and day-1 retention on low-end devices rose about 3 points in the following cohort.
+- **Lesson:** measurement and guardrails mattered more than any single optimisation. Without the budget, startup would have regressed within two releases.
+
+> [!INTERVIEW]
+> What evaluators look for: baseline measurements, a method for finding bottlenecks, prioritised fixes, a business metric, and regression prevention. Red flags: "the app felt faster", or optimisations picked from a blog post without measurement. Likely follow-up: "Which change had the biggest impact, and how do you know?" (have per-change measurements ready).
+
+### Can you walk me through a large migration you led, such as adopting the New Architecture or moving to Expo?
+
+**Short answer:** *(Template: adapt with your own real story and numbers.)* I led our move to the New Architecture ahead of the React Native version that dropped the legacy architecture. We audited about 80 native dependencies, replaced six, rewrote two in-house modules as Turbo/Expo modules, and shipped behind a staged rollout with no crash-rate regression, which also unblocked Reanimated 4 and FlashList v2.
+
+- **Situation:** a large app still on the legacy architecture, with 80+ native dependencies and three in-house native modules. Upcoming RN versions would run only on the New Architecture, and newer versions of key libraries (Reanimated 4, FlashList v2) required it.
+- **Task:** plan and lead the migration without freezing feature work, as the tech lead with support from two engineers and our iOS and Android specialists.
+- **Action:**
+  - Wrote an RFC with a dependency audit: status per library (compatible, needs upgrade, works via interop, blocked), owners and replacements. Got sign-off on a two-quarter plan.
+  - Upgraded compatible libraries on `main` ahead of time, replaced six unmaintained ones behind existing adapters, and rewrote our in-house modules with the Expo Modules API and a Turbo Module with Codegen.
+  - Ran a long-lived *build variant* (New Architecture enabled) in CI from week two, so every PR was tested on both until the switch.
+  - Established performance and crash baselines, then dogfooded internally for three weeks, fixing layout differences and two native crashes.
+  - Shipped via App Store phased release and a Play staged rollout with tighter health gates and a prepared hotfix branch.
+- **Result:** rolled out to 100% over ten days with crash-free users unchanged (99.85%) and a measurable reduction in JS-thread frame drops on our heaviest screens. It unblocked Reanimated 4 and FlashList v2, and subsequent RN upgrades took days instead of weeks.
+- **Lesson:** the audit and the dual-build CI were the real work. The flip itself was uneventful because the risk had been burned down beforehand.
+
+> [!INTERVIEW]
+> What evaluators look for: planning (audit, RFC, phases), risk management (dual builds, baselines, staged rollout), keeping the business moving, and quantified outcomes. Red flags: a big-bang switch without a rollback plan, or not knowing what actually changed architecturally. Likely follow-up: "What was the hardest dependency, and how did you handle it?"
+
+### Can you describe a conflict with a colleague and how you resolved it?
+
+**Short answer:** *(Template: adapt with your own real story and numbers.)* Our iOS lead wanted to rewrite a slow React Native screen natively. I thought the problem was fixable in RN. We agreed on a time-boxed profiling spike with success criteria up front. The data showed an RN fix was enough for that screen, and we agreed native made sense for the widget work, which improved our working relationship.
+
+- **Situation:** the product detail screen had visible jank on older iPhones. Our iOS lead, a respected engineer, proposed rewriting it in Swift and embedding it. The debate turned tense in a planning meeting, with people taking sides.
+- **Task:** I owned RN performance and wanted a decision based on evidence without damaging the relationship or the team's trust in RN.
+- **Action:**
+  - Met one-on-one first to understand the concerns: user complaints, and a past RN project that had gone badly. His goals (smooth UX, maintainability) were the same as mine.
+  - Proposed a three-day spike with success criteria agreed in writing: 60 fps scroll on an iPhone 11-class device and no dropped frames on image carousel swipes. If RN couldn't hit them, we'd go native.
+  - Profiled with React Native DevTools and Instruments together. The causes were an unvirtualised list of reviews, full-resolution images and a context provider re-rendering the whole screen on every price tick.
+  - Fixed them jointly (FlashList, image variants, a selector-based store), pairing across the RN/native boundary.
+- **Result:** the screen met the criteria in the spike. The iOS lead later championed native work where it genuinely fit (home screen widgets, Live Activities), and we wrote a short ADR on "when we go native". The two of us became the go-to reviewers for cross-platform performance.
+- **Lesson:** turn opinions into shared, measurable criteria early, and separate the person from the proposal.
+
+> [!INTERVIEW]
+> What evaluators look for: empathy and curiosity about the other side, objective criteria, collaboration rather than "winning", and a relationship that ended stronger. Red flags: the other person painted as a villain, escalating to a manager first, or "I was right" as the lesson. Likely follow-up: "What if the spike had shown you were wrong?" (the answer must be: we'd go native, and that's fine).
+
+### What is a failure you've had, and what did you learn from it?
+
+**Short answer:** *(Template: adapt with your own real story and numbers.)* I shipped an OTA update that crashed on launch for users on an older binary because it depended on a native module that binary didn't have. About 8% of users were affected for 40 minutes. We rolled back, then fixed the process: fingerprint-based runtime versions, staged OTA rollouts and crash-rate alerts per update.
+
+- **Situation:** we used manually set runtime version strings for OTA updates. I was release captain and published a JS fix to production.
+- **Task:** the fix was urgent (a checkout bug), and I owned the release end to end.
+- **Action (the failure):** the fix imported a helper that, two weeks earlier, had started using a new native module shipped in the latest binary. The runtime version hadn't been bumped when that native module was added, so the update also reached users on the previous binary. They crashed on launch.
+- **Action (the response):**
+  - Crash alerts fired within minutes. I rolled back to the previous update, communicated in the incident channel and with support, and confirmed recovery (the rolled-back update applied on next launch for most users).
+  - Ran a blameless post-mortem: the root cause was a process that relied on humans remembering to bump a version.
+  - Switched to the `fingerprint` runtime version policy so native changes automatically create a new runtime. Made every OTA roll out at 5% first with a 30-minute watch on crash-free sessions for that update. Added a CI check that runs the update bundle against the oldest binary still on each runtime.
+- **Result:** about 8% of users had a broken launch for ~40 minutes, and we lost some orders during that window. Since the changes, we've shipped dozens of OTA updates without a compatibility incident.
+- **Lesson:** "urgent" is exactly when process matters most. I now design safety into tooling rather than checklists.
+
+> [!INTERVIEW]
+> What evaluators look for: a real failure with real impact (not a humble-brag), ownership without self-flagellation, a calm incident response, and systemic changes. Red flags: "my biggest failure is working too hard", blaming the tool or a colleague, or no lasting change. Likely follow-up: "How did you communicate it to leadership?"
+
+### Can you tell me about a time you mentored someone?
+
+**Short answer:** *(Template: adapt with your own real story and numbers.)* I mentored a mid-level web engineer new to React Native. Over six months, with a plan covering platform fundamentals, paired work, then full ownership of our payments module, they went from needing help on native build issues to leading the Apple Pay/Google Pay rollout and were promoted to senior a cycle later.
+
+- **Situation:** a strong React web engineer joined the mobile team. They were productive on UI but stuck on native builds, app lifecycle, store releases and debugging on devices, and were losing confidence.
+- **Task:** as their mentor, help them become independent on mobile within about two quarters, which my manager and I agreed as a goal.
+- **Action:**
+  - Agreed on explicit goals in our first 1:1: debug native build failures alone, own a feature end to end including release, and lead a design discussion.
+  - **Month 1–2:** weekly pairing on platform topics (threading and the JS/UI thread split, permissions, background behaviour, Xcode and Gradle basics), plus reviews with explanations rather than just requests.
+  - **Month 3–4:** gave them ownership of adding Apple Pay/Google Pay to checkout: native config, the Stripe integration, testing, and the rollout plan. I reviewed their RFC instead of writing it.
+  - **Month 5–6:** made them release captain for two trains, and had them run the post-release review.
+  - Gave specific, timely feedback, and deliberately stopped answering questions I knew they could solve ("what have you tried, what does the log say?").
+- **Result:** they shipped wallet payments on schedule (checkout conversion up ~4% for wallet-eligible users), became the team's go-to person for payments, started mentoring a new joiner, and were promoted a cycle later.
+- **Lesson:** mentoring worked best when I gave ownership early with a safety net, and measured progress against goals we'd agreed together.
+
+> [!INTERVIEW]
+> What evaluators look for: a plan with goals, progressively more autonomy, feedback skills, and outcomes for the mentee (not just for you). Red flags: mentoring that means "I answered their questions", taking credit for their work, or no evidence of growth. Likely follow-up: "What would you do if someone wasn't improving despite mentoring?" (revisit goals and fit, check blockers outside the work, involve their manager with specific examples).
+</script>
+<script src="../assets/js/site.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/gradle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/groovy.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/http.min.js"></script>
+<script src="../assets/js/app.js"></script>
+</body>
+</html>
